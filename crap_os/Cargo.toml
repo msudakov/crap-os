@@ -1,0 +1,12 @@
+[package]
+name = "crap_os"
+version = "0.1.0"
+edition = "2024"
+authors = ["Mikhail Sudakov"]
+
+[dependencies]
+
+[[bin]]
+name = "crap_os"
+test = false
+bench = false

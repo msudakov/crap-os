@@ -1,6 +1,7 @@
 #![no_std]   // This is an OS kernel; there is no standard library for now
 #![no_main]  // Not depending on a runtime, so cannot use main as entry point
 
+mod memory_manager;
 
 // Standard base address for COM1 serial port, used for serial port functions
 const COM1_PORT: u16 = 0x3F8;
@@ -117,17 +118,27 @@ enum DebugLevel {
 const DEBUG_LEVEL: DebugLevel = DebugLevel::INFO;
 
 /*
-    This is the BootInfo structure that is passed to the _start routine by the
-    bootloader when EntryPoint is called and execution is transferred to the
-    kernel. This must match the structure in the C bootloader exactly.
+    These are the BootInfo structures that are passed to the _start routine by
+    the bootloader when KernelEntry is called and execution is transferred to
+    the kernel. They must match the structures in the C bootloader exactly.
 */
+
 #[repr(C)]
-pub struct BootInfo {
+pub struct FramebufferInfo {
     framebuffer_addr: u64,
     framebuffer_width: u32,
     framebuffer_height: u32,
     framebuffer_pitch: u32,
     framebuffer_bpp: u32,
+}
+
+use crate::memory_manager::MemoryMapInfo;
+
+#[repr(C)]
+pub struct BootInfo {
+    magic: u64,
+    framebuffer_info: *const FramebufferInfo,
+    memory_map_info: *const MemoryMapInfo,
 }
 
 /// Kernel entry point routine.
@@ -154,13 +165,26 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             loop { core::arch::asm!("hlt"); }
         }
         let info = &*boot_info;  // Dereference boot_info
-        
+
+        // Sanity check for magic value
+        if info.magic != 0xDEADBEEFB007CAFE {
+            print_debug(DebugLevel::CRITICAL,
+                b"[CRITICAL] Magic value did not match\n");
+            core::arch::asm!("hlt");
+        }
+        print_debug(DebugLevel::DEBUG, b"[DEBUG] Magic value matched\n");
         print_debug(DebugLevel::DEBUG, b"[DEBUG] Got BootInfo structure\n");
-        
+
+        // Dereference framebuffer_info
+        let framebuffer = &*info.framebuffer_info;
+
+        // Dereference memory_map_info
+        let _memory_map = &*info.memory_map_info;
+
         // Get frame buffer
-        let fb_addr = info.framebuffer_addr;
-        let fb_width = info.framebuffer_width;
-        let fb_height = info.framebuffer_height;
+        let fb_addr = framebuffer.framebuffer_addr;
+        let fb_width = framebuffer.framebuffer_width;
+        let fb_height = framebuffer.framebuffer_height;
 
         print_debug(DebugLevel::DEBUG, b"[DEBUG] Framebuffer info read\n");
         
@@ -177,7 +201,6 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // Clear screen to black
         let total_pixels = fb_width * fb_height;
         for i in 0..total_pixels {
-            //framebuffer.offset(i as isize).write_volatile(0x00000033);
             framebuffer.offset(i as isize).write_volatile(0x00000000);
         }
         print_debug(DebugLevel::DEBUG, b"[DEBUG] Screen cleared\n");
@@ -431,12 +454,21 @@ fn serial_write(str: &[u8]) {
     }
 }
 
-fn print_debug(debug_level: DebugLevel, str: &[u8]) {
+/// Prints a debug message to serial port.
+/// 
+/// The message is only printed if its given level is equal to or higher than
+/// the hardcoded global variable for overall debugging level.
+///
+/// # Arguments
+///
+/// * `debug_level` - Specified debug level of the given message.
+/// * `message` - Debug message to print.
+fn print_debug(debug_level: DebugLevel, message: &[u8]) {
     if debug_level < DEBUG_LEVEL {
         return;
     }
 
-    serial_write(str);
+    serial_write(message);
 }
 
 /// Manual panic handler for when we need to crash.

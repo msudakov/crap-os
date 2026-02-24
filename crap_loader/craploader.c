@@ -292,17 +292,17 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     uefi_call_wrapper(Root->Close, 1, Root);
 
     Print(L"[+] Kernel loaded at 0x%x\n\r", KernelBuffer);
-    uefi_call_wrapper(SystemTable->BootServices->Stall, 1, 1000000);
+    //uefi_call_wrapper(SystemTable->BootServices->Stall, 1, 1000000);
 
     Print(L"[*] Crap loader is starting to load CrapOS\n\r");
     Print(L"[!] Press any key to cancel. It's about to hit the fan...\n\r");
-    uefi_call_wrapper(SystemTable->BootServices->Stall, 1, 1000000);
+    //uefi_call_wrapper(SystemTable->BootServices->Stall, 1, 1000000);
     Print(L"[!] Start in 3 seconds...\n\r");
-    uefi_call_wrapper(SystemTable->BootServices->Stall, 1, 1000000);
+    //uefi_call_wrapper(SystemTable->BootServices->Stall, 1, 1000000);
     Print(L"[!] Start in 2 seconds...\n\r");
-    uefi_call_wrapper(SystemTable->BootServices->Stall, 1, 1000000);
+    //uefi_call_wrapper(SystemTable->BootServices->Stall, 1, 1000000);
     Print(L"[!] Start in 1 second...\n\r");
-    uefi_call_wrapper(SystemTable->BootServices->Stall, 1, 1000000);
+    //uefi_call_wrapper(SystemTable->BootServices->Stall, 1, 1000000);
 
     print_debug(INFO,
         L"[*] Getting memory map and exiting boot services...\n\r");

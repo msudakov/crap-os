@@ -41,7 +41,8 @@ target = "SHARE/crap-os/crap_os/x86_64-crap_os.json"
 To build:
 ```
 cd crap_os
-rustc --edition 2021 --target x86_64-unknown-none --crate-type bin -C link-arg=-Tkernel.ld -C link-arg=--oformat=binary -C opt-level=2 src/main.rs -o target/release/kernel.bin
+make clean
+make
 ```
 
 ## Setting Up Bootloader Environment

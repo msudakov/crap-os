@@ -3,6 +3,8 @@
 
 
 #define COM1_PORT 0x3F8  // COM1 port base address
+#define KERNEL_STACK_PAGES 32  // 32 * 4096 = 128 KiB; lower it to 64 later on
+#define KERNEL_STACK_SIZE  (KERNEL_STACK_PAGES * 0x1000)
 
 // Debug message levels
 enum DebugLevel
@@ -29,6 +31,10 @@ typedef struct {
     UINT64 memory_map_size;
     UINT64 descriptor_size;
     UINT32 descriptor_ver;
+    UINT64 kernel_load_addr;
+    UINT64 kernel_image_size;
+    UINT64 stack_base_addr;
+    UINT64 stack_size;
 } MemoryMapInfo;
 
 // Boot information structure to pass to kernel
@@ -138,7 +144,7 @@ void print_debug(enum DebugLevel debug_level, CHAR16* message) {
 }
 
 /**
-  Entry point routine.
+  UEFI bootloader entry point routine.
 **/
 EFI_STATUS
 EFIAPI
@@ -152,7 +158,8 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     EFI_GRAPHICS_OUTPUT_PROTOCOL *Gop;
     UINTN KernelSize;
     EFI_PHYSICAL_ADDRESS KernelBuffer;
-    kernel_entry KernelEntry;
+    EFI_PHYSICAL_ADDRESS KernelStackBase = 0;
+    EFI_PHYSICAL_ADDRESS KernelStackTop;
     UINTN MapKey;
     UINTN DescriptorSize;
     UINT32 DescriptorVersion;
@@ -163,7 +170,7 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     BootInfo *BootInfoStruct;
     
     InitializeLib(ImageHandle, SystemTable);  // Initialize the GNU-EFI library
-    init_serial();  // // Initialize serial port for debugging
+    init_serial();  // Initialize serial port for debugging
 
     print_debug(INFO, L"[+] Hello from CrapLoader!\n\r");
     //uefi_call_wrapper(SystemTable->BootServices->Stall, 1, 1000000);
@@ -294,6 +301,40 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     Print(L"[+] Kernel loaded at 0x%x\n\r", KernelBuffer);
     //uefi_call_wrapper(SystemTable->BootServices->Stall, 1, 1000000);
 
+    // Allocate initial kernel stack
+    Status = uefi_call_wrapper(SystemTable->BootServices->AllocatePages, 4,
+        AllocateAnyPages, EfiLoaderData, KERNEL_STACK_PAGES, &KernelStackBase);
+    if (EFI_ERROR(Status)) {
+        print_debug(ERROR, L"[-] Failed to allocate kernel stack\n\r");
+        Print(L"[!FATAL!] Press any key to exit...\n\r");
+        while (uefi_call_wrapper(SystemTable->ConIn->ReadKeyStroke, 2,
+            SystemTable->ConIn, &Key) != EFI_SUCCESS);
+        return Status;
+    }
+    
+    // Zero out allocated mmory just in case
+    SetMem((void*)KernelStackBase, KERNEL_STACK_SIZE, 0);
+
+    /*
+        Stack grows downward, so RSP should start at the top of the allocation.
+        We need to subtract 8 bytes to keep the RSP 16-byte aligned on entry.
+        This is because the x86-64 ABI requires RSP % 16 == 8 just before a call
+        instruction, but since we're jumping directly rather than using CALL,
+        we want RSP % 16 == 0 at _start).
+    */
+    KernelStackTop = KernelStackBase + KERNEL_STACK_SIZE - 8;
+
+    MemoryMapInfoStruct->stack_base_addr = KernelStackBase;
+    MemoryMapInfoStruct->stack_size = KERNEL_STACK_SIZE;
+
+    print_debug(DEBUG, L"[+] Allocated kernel stack\n\r");
+    Print(L"[+] Stack: base=0x%lx  top=0x%lx  size=%d bytes\n\r",
+        KernelStackBase, KernelStackTop, KERNEL_STACK_SIZE);
+    //print_debug(DEBUG, L"[+] Successfully allocated kernel stack memory\n\r");
+
+
+
+
     Print(L"[*] Crap loader is starting to load CrapOS\n\r");
     Print(L"[!] Press any key to cancel. It's about to hit the fan...\n\r");
     //uefi_call_wrapper(SystemTable->BootServices->Stall, 1, 1000000);
@@ -328,16 +369,20 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     MemoryMapInfoStruct->descriptor_size = DescriptorSize;
     MemoryMapInfoStruct->descriptor_ver = DescriptorVersion;
     MemoryMapInfoStruct->memory_map_addr = (UINT64)MemoryMap;
+    MemoryMapInfoStruct->kernel_load_addr = KernelBuffer;
+    MemoryMapInfoStruct->kernel_image_size = KernelSize;
+
     BootInfoStruct->memory_map_info = MemoryMapInfoStruct;
+    
 
     /*
         Get memory map and exit boot services.
 
-        Before we transfer execution into the OS kernel by calling its exported
-        entry routine, we need to exit the UEFI boot services. It's important
-        to understand that once we do that, all hand-holding ends; UEFI will at
-        that point unload its helper libraries that we've been using and
-        will reclaim that memory.
+        Before we transfer execution into the OS kernel by jumping to its
+        exported entry routine, we need to exit the UEFI boot services. It's
+        important to understand that once we do that, all hand-holding ends;
+        UEFI will at that point unload its helper libraries that we've been
+        using and will reclaim that memory.
 
         For the call to ExitBootServices to succeed, the MapKey parameter must
         still be valid since the last call to GetMemoryMap. This is why these
@@ -402,15 +447,36 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     */
     serial_write("[*] Just before jumping to kernel...\n\r");
 
-    // Jump to kernel entry routine with boot info; will never return.
-    KernelEntry = (kernel_entry)KernelBuffer;
-    KernelEntry(BootInfoStruct);
-    
-    // Should never reach here
+    /*
+        Assembly stub to switch to kernel stack and jump to entry point. This
+        atomically sets RSP and RDI (the first System V argument register,
+        which receives boot_info struct) without ever using the old UEFI stack
+        again after the mov. This intentionally clobbers RSP and RDI; there will
+        be no return.
+
+        The reason we want to jmp and not call the function pointer is that
+        calling KernelEntry(BootInfoStruct) through a C function pointer still
+        uses the old UEFI stack (to push a return address). Using jmp means
+        we're fully committed to the new stack from the very first instruction
+        of the kernel.
+    */
+    __asm__ __volatile__ (
+        "mov %0, %%rsp\n\t"     // Switch to the kernel stack
+        "mov %1, %%rdi\n\t"     // First arg: boot_info pointer (System V ABI)
+        "xor %%rbp, %%rbp\n\t"  // Clear frame pointer (no caller frame to unwind to)
+        "jmp *%2\n\t"           // jump (not call) to _start; never returns
+        :
+        : "r"((UINT64)KernelStackTop),
+        "r"((UINT64)BootInfoStruct),
+        "r"((UINT64)KernelBuffer)
+        : "memory"
+    );
+
+    // Will never reach here
     while(1) {
         __asm__ __volatile__("hlt");
     }
-    
+
     // Will never reach here
     return EFI_SUCCESS;
 }

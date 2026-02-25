@@ -15,6 +15,7 @@ const HEX_CHARS_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 /// # Returns
 /// 
 /// The 18-char-wide byte array, prefixed with `0x`.
+#[allow(dead_code)]
 pub fn u64_to_hex_bytes(value: u64) -> [u8; 18] {
     let mut buffer = [b'0'; 18];
 
@@ -47,6 +48,7 @@ pub fn u64_to_hex_bytes(value: u64) -> [u8; 18] {
 /// # Returns
 /// 
 /// The 10-char-wide byte array, prefixed with `0x`.
+#[allow(dead_code)]
 pub fn u32_to_hex_bytes(value: u32) -> [u8; 10] {
     let mut buffer = [b'0'; 10];
 

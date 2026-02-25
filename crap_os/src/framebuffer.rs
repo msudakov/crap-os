@@ -391,6 +391,7 @@ impl FramebufferWriter {
     /// # Arguments
     ///
     /// * `str` - String text to print.
+    #[allow(dead_code)]
     pub fn print(&mut self, str: &str) {
         self.draw_string(str);
     }
@@ -400,6 +401,7 @@ impl FramebufferWriter {
     /// # Arguments
     ///
     /// * `str` - String text to print.
+    #[allow(dead_code)]
     pub fn println(&mut self, str: &str) {
         self.print(str);
         self.new_line();
@@ -414,6 +416,7 @@ impl FramebufferWriter {
     /// # Safety
     /// 
     /// The bytes passed to this function must all be printable characters.
+    #[allow(dead_code)]
     pub fn print_bytes(&mut self, bytes: &[u8]) {
         let byte_string: &str = unsafe {
             core::str::from_utf8_unchecked(bytes)
@@ -454,6 +457,7 @@ impl FramebufferWriter {
 /// # Safety
 /// 
 /// Performs a `write_volatile` on the frame buffer memory location.
+#[allow(dead_code)]
 fn draw_char(
     framebuffer: *mut u32,
     fb_width: u32,

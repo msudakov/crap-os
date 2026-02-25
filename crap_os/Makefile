@@ -1,5 +1,5 @@
 TARGET          = kernel.bin
-TARGET_DIR	    = "target/release"
+TARGET_DIR	    = target/release
 LINKER_SCRIPT   = kernel.ld
 
 .PHONY: all clean

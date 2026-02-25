@@ -10,12 +10,10 @@ use core::fmt::Write;
 use serial_printer::print_debug;
 use serial_printer::print;
 use serial_printer::println;
-use serial_printer::print_bytes;
 use framebuffer::FramebufferInfo;
 use framebuffer::FramebufferWriter;
 use memory_manager::MemoryMapInfo;
-use memory_manager::EfiMemoryDescriptor;
-use memory_manager::EfiMemoryType;
+use memory_manager::PhysicalMemoryManager;
 
 
 #[repr(u32)]
@@ -101,10 +99,6 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // Dereference memory_map_info
     let memory_map = unsafe { &*info.memory_map_info };
 
-    //print(b"The address of memory map is: ");
-    //serial_printer::print_addr(memory_map.memory_map_addr);
-    //println(b"");
-
     let mut writer = FramebufferWriter::new(
         framebuffer.framebuffer_addr as *mut u32,
         framebuffer.framebuffer_width,
@@ -120,6 +114,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     writer.draw_banner();
     print_debug(DebugLevel::DEBUG, "[DEBUG] Text drawn");
 
+    /*
     writer.println("Mapping available physical memory (type 0x7):\n");
     print_debug(DebugLevel::INFO, "[INFO] Mapping available physical memory (type 0x7):\n");
     writer.println(
@@ -176,6 +171,39 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     writer.println("[+] Available physical memory mapped!");
     print_debug(DebugLevel::INFO, "[INFO] Available physical memory mapped!");
+    */
+
+    print_debug(DebugLevel::INFO, "[INFO] Mapping available physical memory (type 0x7):\n");
+
+    let mut pmm = PhysicalMemoryManager::init(&framebuffer, &memory_map);
+
+    /*let cookie: u64 = 0xDEADBEEFCAFEBABE;
+    let page1 = pmm.alloc_page();
+    match page1 {
+        Some(addr) => {
+            let ptr = (addr + 0x10) as *mut u64;
+            unsafe {
+                use core::ptr;
+                ptr::write_volatile(ptr, cookie);
+            }
+            println("[OK]: Wrote to address 1");
+            pmm.free_page(addr);
+            println("[OK]: Freed page 1");
+        }
+        None => {
+            println("[ERROR]: failed to allocate 1");
+        }
+    }*/
+
+    let cr3: u64;
+    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3) };
+    let cre3_hex = crate::stdlib::u64_to_hex_bytes(cr3);
+    println("CR3 (PML4):");
+    serial_printer::print_bytes(&cre3_hex);
+    println("");
+
+    print_debug(DebugLevel::INFO, "[INFO] Available physical memory mapped!");
+    
 
     // Done for now.. loop forever and ever
     loop {

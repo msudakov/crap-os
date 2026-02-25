@@ -94,6 +94,7 @@ pub fn init_serial() {
 /// # Safety
 /// 
 /// Calls inline functions for direct assembly execution.
+#[allow(dead_code)]
 pub fn serial_write(str: &[u8]) {
     unsafe {
         for &byte in str {
@@ -112,6 +113,7 @@ pub fn serial_write(str: &[u8]) {
 /// # Arguments
 ///
 /// * `str` - String slice to print.
+#[allow(dead_code)]
 pub fn print(str: &str) {
     serial_write(str.as_bytes());
 }
@@ -122,6 +124,7 @@ pub fn print(str: &str) {
 /// # Arguments
 ///
 /// * `str` - String slice to print.
+#[allow(dead_code)]
 pub fn println(str: &str) {
     print(str);
     print("\n");
@@ -136,6 +139,7 @@ pub fn println(str: &str) {
 ///
 /// * `debug_level` - Specified debug level of the given message.
 /// * `message` - Debug message to print.
+#[allow(dead_code)]
 pub fn print_debug(debug_level: crate::DebugLevel, message: &str) {
     if debug_level < crate::DEBUG_LEVEL {
         return;
@@ -153,6 +157,7 @@ pub fn print_debug(debug_level: crate::DebugLevel, message: &str) {
 /// # Safety
 /// 
 /// The bytes passed to this function must all be printable characters.
+#[allow(dead_code)]
 pub fn print_bytes(bytes: &[u8]) {
     let byte_string: &str = unsafe {
         core::str::from_utf8_unchecked(bytes)

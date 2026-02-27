@@ -8,6 +8,22 @@
 // Standard base address for COM1 serial port, used for serial port functions
 const COM1_PORT: u16 = 0x3F8;
 
+
+
+
+//pub static WRITER: Writer = Writer {
+    //column_position: 0,
+    //color_code: ColorCode::new(Color::Yellow, Color::Black),
+    //buffer: unsafe { &mut *(0xb8000 as *mut Buffer) },
+//};
+
+//pub struct SerialWriter {
+//    pub port: u16,
+//}
+
+
+
+
 /// Reads one byte of data from a specified I/O port address.
 ///
 /// # Arguments

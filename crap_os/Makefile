@@ -9,6 +9,7 @@ all:
 		-C link-arg=-T$(LINKER_SCRIPT) \
 		-C link-arg=--oformat=binary \
 		-C opt-level=2 \
+		-C relocation-model=static \
 		src/main.rs -o $(TARGET_DIR)/$(TARGET)
 
 clean:

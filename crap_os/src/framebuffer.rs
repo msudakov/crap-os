@@ -235,10 +235,7 @@ pub struct FramebufferWriter {
     vertical_cutoff: u32,
 }
 
-/// TODO: This works with text and basic i32 numbers for concatenation, but it
-/// crashes at 0xAA020 (which is below kernel base address) for most other
-/// format strings, with exception of Exception Type - 06(#UD - Invalid Opcode).
-/// Need to debug.
+/// Rust format string implementation for FramebufferWriter.
 impl fmt::Write for FramebufferWriter {
     fn write_str(&mut self, s: &str) -> fmt::Result {
         self.draw_string(s);

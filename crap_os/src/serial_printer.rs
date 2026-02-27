@@ -164,3 +164,18 @@ pub fn print_bytes(bytes: &[u8]) {
     };
     print(byte_string);
 }
+
+/// Helper function to print an address value or another u64 value with a label.
+/// 
+/// # Arguments
+///
+/// * `label`   - String label to print before the value.
+/// * `address` - Memory address or another u64 value to print.
+#[allow(dead_code)]
+pub fn print_addr_with_label(label: &str, address: u64) {
+    let addr_hex_str = crate::stdlib::u64_to_hex_bytes(address);
+    print(label);
+    print(": ");
+    print_bytes(&addr_hex_str);
+    println("");
+}

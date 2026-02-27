@@ -9,7 +9,7 @@ mod memory_manager;
 use core::fmt::Write;
 use serial_printer::print_debug;
 use serial_printer::print;
-use serial_printer::println;
+//use serial_printer::println;
 use framebuffer::FramebufferInfo;
 use framebuffer::FramebufferWriter;
 use memory_manager::MemoryMapInfo;
@@ -22,7 +22,6 @@ pub enum ErrorCode {
     StatusOK = 0x00000000,
     BufferTooSmall = 0x00000001,
 }
-
 
 // Preset level of debugging messages sent by the kernel
 #[repr(i32)]
@@ -114,96 +113,15 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     writer.draw_banner();
     print_debug(DebugLevel::DEBUG, "[DEBUG] Text drawn");
 
-    /*
-    writer.println("Mapping available physical memory (type 0x7):\n");
-    print_debug(DebugLevel::INFO, "[INFO] Mapping available physical memory (type 0x7):\n");
-    writer.println(
-        "Type:       Physical Start:     Virtual Start:      Num Pages:          Attributes:");
-    println("Type:       Physical Start:     Virtual Start:      Num Pages:          Attributes:");
-
-    let mut descriptor_addr = memory_map.memory_map_addr;
-    let num_segments = memory_map.memory_map_size / memory_map.descriptor_size;
-
-    for _ in 0..num_segments {
-        let memory_descriptor = EfiMemoryDescriptor::new(descriptor_addr);
-        descriptor_addr += memory_map.descriptor_size;
-
-        // We'll start working only with basic available memory without
-        // recliaming boot loader and services memory for now.
-        if memory_descriptor.region_type != EfiMemoryType::EfiConventionalMemory {
-            continue;
-        }
-        let region_type = crate::stdlib::u32_to_hex_bytes(
-            memory_descriptor.region_type as u32);
-        writer.print_bytes(&region_type);
-        writer.print("  ");
-        print_bytes(&region_type);
-        print("  ");
-
-        let physical_start = crate::stdlib::u64_to_hex_bytes(
-            memory_descriptor.physical_start);
-        writer.print_bytes(&physical_start);
-        writer.print("  ");
-        print_bytes(&physical_start);
-        print("  ");
-
-        let virtual_start = crate::stdlib::u64_to_hex_bytes(
-            memory_descriptor.virtual_start);
-        writer.print_bytes(&virtual_start);
-        writer.print("  ");
-        print_bytes(&virtual_start);
-        print("  ");
-
-        let num_pages = crate::stdlib::u64_to_hex_bytes(
-            memory_descriptor.num_pages);
-        writer.print_bytes(&num_pages);
-        writer.print("  ");
-        print_bytes(&num_pages);
-        print("  ");
-
-        let attribute = crate::stdlib::u64_to_hex_bytes(
-            memory_descriptor.attribute);
-        writer.print_bytes(&attribute);
-        writer.println("");
-        print_bytes(&attribute);
-        println("");
-    }
-
-    writer.println("[+] Available physical memory mapped!");
-    print_debug(DebugLevel::INFO, "[INFO] Available physical memory mapped!");
-    */
-
-    print_debug(DebugLevel::INFO, "[INFO] Mapping available physical memory (type 0x7):\n");
-
+    print_debug(DebugLevel::INFO, "[INFO] Mapping available physical memory");
     let mut pmm = PhysicalMemoryManager::init(&framebuffer, &memory_map);
+    print_debug(DebugLevel::INFO, "[INFO] Available physical memory mapped");
 
-    /*let cookie: u64 = 0xDEADBEEFCAFEBABE;
-    let page1 = pmm.alloc_page();
-    match page1 {
-        Some(addr) => {
-            let ptr = (addr + 0x10) as *mut u64;
-            unsafe {
-                use core::ptr;
-                ptr::write_volatile(ptr, cookie);
-            }
-            println("[OK]: Wrote to address 1");
-            pmm.free_page(addr);
-            println("[OK]: Freed page 1");
-        }
-        None => {
-            println("[ERROR]: failed to allocate 1");
-        }
-    }*/
-
-    let cr3: u64;
-    unsafe { core::arch::asm!("mov {}, cr3", out(reg) cr3) };
-    let cre3_hex = crate::stdlib::u64_to_hex_bytes(cr3);
-    println("CR3 (PML4):");
-    serial_printer::print_bytes(&cre3_hex);
-    println("");
-
-    print_debug(DebugLevel::INFO, "[INFO] Available physical memory mapped!");
-    
+    print_debug(DebugLevel::INFO, "[INFO] Mapping virtual memory...");
+    let _pml4 =  memory_manager::init_page_tables(&mut pmm, &framebuffer, &memory_map);
+    print_debug(DebugLevel::INFO, "[INFO] Virtual memory mapped");
+    print_debug(DebugLevel::INFO, "[INFO] Testing virtual memory...");
+    memory_manager::test_vmm(&mut pmm);
 
     // Done for now.. loop forever and ever
     loop {

@@ -7,8 +7,8 @@
 // the lock is available. They are suitable for short critical sections in a
 // kernel context. Plain spinlocks are not safe to use in both thread and
 // interrupt context simultaneously. If an interrupt fires while the lock is
-// held on the current CPU, and the interrupt handler also tries to acquire
-// the same lock, we would deadlock.
+// held on a current CPU, and the interrupt handler also tries to acquire
+// the same lock, we would deadlock - bad news bear.
 //
 // SpinLock<T> is the core primitive here. It spins on an AtomicBool using a
 // test-and-test-and-set (TTAS) loop for cache efficiency. IrqSpinLock<T> then
@@ -49,7 +49,7 @@ use core::marker::PhantomData;
 // SpinLock<T>
 // =============================================================================
 
-/// A simple, non-reentrant spin-lock protecting a value of type T.
+/// A simple, non-reentrant spinlock protecting a value of type T.
 ///
 /// When a thread wants access to T, it atomically sets `locked` to true.
 /// If `locked` is already true, the thread busy-waits (spins) until it
@@ -138,7 +138,7 @@ impl<T> SpinLock<T> {
         self.locked
             // This is done atomically: if locked == false, set it to true and
             // return Ok(false). If it was already true, return Err(true); 
-            // someone else has it.
+            // someone else has the lock.
             .compare_exchange(false, true, Ordering::Acquire, Ordering::Relaxed)
             // On success, build the guard. The `_not_send: PhantomData` marks
             // the guard as !Send, so it cannot be moved to another thread (the
@@ -148,8 +148,8 @@ impl<T> SpinLock<T> {
             .map_err(|_| ())
     }
 
-    /// Snapshots if the lock is currently held. This is inherently racy, and
-    /// by the time we inspect the result, the state may have changed. Ths is
+    /// Spot-checks if the lock is currently held. This is inherently racy, and
+    /// by the time we inspect the result, the state may have changed. This is
     /// useful only for diagnostic and debugging purposes.
     /// 
     /// # Returns
@@ -209,7 +209,7 @@ impl<T> SpinLock<T> {
 }
 
 // =============================================================================
-// SpinLockGuard<'_, T> — Deref / DerefMut / Drop
+// SpinLockGuard<'_, T>
 // =============================================================================
 
 /// Allows writing `*guard` or `guard.field` to access the protected `T` through
@@ -238,7 +238,7 @@ impl<T> DerefMut for SpinLockGuard<'_, T> {
     }
 }
 
-/// Automatically releases the lock when the guard goes out of scope. This is
+/// Automatically releases the lock when the guard goes out of scope; this is
 /// the RAII pattern.
 impl<T> Drop for SpinLockGuard<'_, T> {
     #[inline]
@@ -253,7 +253,7 @@ impl<T> Drop for SpinLockGuard<'_, T> {
 // SpinLockGuard<'a, T>
 // =============================================================================
 
-/// RAII guard returned by `SpinLock::lock()` and `SpinLock::try_lock()`.
+/// RAII guard returned by `SpinLock::lock()` or `SpinLock::try_lock()`.
 ///
 /// Holding this guard means the lock is acquired. The lock is released
 /// automatically when this value is dropped.
@@ -271,7 +271,7 @@ pub struct SpinLockGuard<'a, T> {
 }
 
 // =============================================================================
-// StaticSpinLock<T> — safe wrapper for static globals
+// StaticSpinLock<T>
 // =============================================================================
 
 /// A wrapper around SpinLock designed for static variables. Rust requires types
@@ -282,8 +282,8 @@ pub struct SpinLockGuard<'a, T> {
 /// A `static` item never needs to be moved between threads.
 pub struct StaticSpinLock<T>(SpinLock<T>);
 
-/// `Sync` is required for statics. The lock can be safely accessed by
-/// multiple threads simultaneously, as the internal atomics make this work.
+// `Sync` is required for statics. The lock can be safely accessed by
+// multiple threads simultaneously, as the internal atomics make this work.
 unsafe impl<T: Send> Sync for StaticSpinLock<T> {}
 
 #[allow(dead_code)]
@@ -319,7 +319,7 @@ impl<T> StaticSpinLock<T> {
 // IrqSpinLock<T>
 // =============================================================================
 
-/// A spin-lock that additionally disables CPU hardware interrupts while held.
+/// A spinlock that additionally disables CPU hardware interrupts while held.
 ///
 /// This is required when both a normal thread and an interrupt service routine
 /// (ISR) can both try to acquire the same lock. If a thread holds the lock and
@@ -333,11 +333,6 @@ pub struct IrqSpinLock<T>(SpinLock<T>);
 // long as `T: Send``.
 unsafe impl<T: Send> Send for IrqSpinLock<T> {}
 unsafe impl<T: Send> Sync for IrqSpinLock<T> {}
-
-
-
-
-
 
 #[allow(dead_code)]
 impl<T> IrqSpinLock<T> {
@@ -353,9 +348,9 @@ impl<T> IrqSpinLock<T> {
         Self(SpinLock::new(data))
     }
 
-    /// Disables hardware interrupts, then acquires the inner spin-lock,
+    /// Disables hardware interrupts, then acquires the inner spinlock,
     /// spinning until it is available.
-    ///
+    /// 
     /// # Returns
     /// 
     /// Returns an IrqSpinLockGuard that, when dropped, releases the
@@ -363,9 +358,6 @@ impl<T> IrqSpinLock<T> {
     /// before this call.
     #[inline]
     pub fn lock(&self) -> IrqSpinLockGuard<'_, T> {
-        // Disable interrupts BEFORE acquiring the lock, so there is no window
-        // between the two where an interrupt could sneak in and deadlock us.
-        
         // Capture current interrupt state and disable interrupts atomically.
         // `flags` holds the x86 RFLAGS value before CLI; specifically bit 9
         // (IF) tells us whether interrupts were enabled.
@@ -465,7 +457,7 @@ impl<T> DerefMut for IrqSpinLockGuard<'_, T> {
 impl<T> Drop for IrqSpinLockGuard<'_, T> {
     fn drop(&mut self) {
         // `self.guard` will be dropped automatically after this function
-        // returns Rust drops fields in declaration order, so `guard` first,
+        // returns. Rust drops fields in declaration order, so `guard` first,
         // then `flags` is just a usize and doesn't need dropping. We call
         // restore_interrupts here, which runs after the guard's own Drop impl
         // has released the lock.

@@ -9,6 +9,7 @@ use crate::spinlock::StaticIrqSpinLock;
 use crate::serial::SerialWriter;
 use crate::framebuffer::FramebufferWriter;
 use crate::DebugLevel;
+use crate::memory_manager::MemoryManager;
 
 // =============================================================================
 // Basic Globals
@@ -33,4 +34,8 @@ pub static SERIAL: StaticIrqSpinLock<Option<SerialWriter>> =
 
 // Writer singleton for framebuffer
 pub static FRAMEBUFFER: StaticIrqSpinLock<Option<FramebufferWriter>> =
+    StaticIrqSpinLock::new(None);
+
+// Memory manager singleton
+pub static MEMORY_MANAGER: StaticIrqSpinLock<Option<MemoryManager>> =
     StaticIrqSpinLock::new(None);

@@ -5,7 +5,7 @@
 // This module is responsible for all physical and virtual memory operations
 // in the system.
 
-use crate::sprintln;
+use crate::{globals, sprintln};
 
 const PRESENT: u64 = 1 << 0;  // Must be 1 for the entry to be valid
 const WRITABLE: u64 = 1 << 1; // If 1, writes are allowed; if 0, read-only
@@ -72,6 +72,10 @@ impl EfiMemoryDescriptor {
     }
 }
 
+// =============================================================================
+// Physical Memory Manager
+// =============================================================================
+//
 // The main job of the Physical Memory Manager is to allocate, free, and keep
 // track of physical memory pages in RAM. But, it has to do it really-really
 // efficiently because the entire system, including the Virtual Memory Manager,
@@ -99,7 +103,7 @@ impl EfiMemoryDescriptor {
 // next-in-line page for later allocations. It then updates the head address
 // to point to the following page and returns the requsted page to the caller.
 
-pub struct PhysicalMemoryManager {
+struct PhysicalMemoryManager {
     kernel_load_addr: u64,       // Where the bootloader mapped the kernel image
     kernel_image_size: u64,      // Size of the kernel
     kernel_stack_base_addr: u64, // Base address of the initial kernel stack
@@ -120,7 +124,7 @@ impl PhysicalMemoryManager {
     ///
     /// * `framebuffer_info` - Framebuffer info structure from the bootloader.
     /// * `memory_map` - Memory map information structure from the bootloader.
-    pub fn init(framebuffer_info: &crate::FramebufferInfo,
+    fn init(framebuffer_info: &crate::FramebufferInfo,
         memory_map: &MemoryMapInfo,
     ) -> Self {
         let fb_size = (framebuffer_info.framebuffer_height as u64) *
@@ -276,7 +280,6 @@ fn page_overlaps(page_start: u64, page_end: u64, region_start: u64,
     page_start <= region_end && page_end >= region_start
 }
 
-
 // =============================================================================
 // Virtual Memory Manager
 // =============================================================================
@@ -351,7 +354,7 @@ fn get_or_create_table(pmm: &mut PhysicalMemoryManager, table: *mut u64,
 /// # Safety
 /// 
 /// Dereferences raw pointers.
-pub fn map_page(pmm: &mut PhysicalMemoryManager, pml4_addr: *mut u64,
+fn map_page(pmm: &mut PhysicalMemoryManager, pml4_addr: *mut u64,
     virtual_addr: u64, physical_addr: u64, flags: u64
 ) {
     let pml4_index = (virtual_addr >> 39) & 0x1FF;
@@ -438,7 +441,7 @@ fn zero_out_page(address: u64) {
 /// # Safety
 /// 
 /// Uses inline assembly to write the new PML4 address to the CR3 register.
-pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
+fn init_page_tables(pmm: &mut PhysicalMemoryManager,
     framebuffer_info: &crate::FramebufferInfo, memory_map: &MemoryMapInfo
 ) -> *mut u64 {
     // Allocate and zero out the new PML4
@@ -515,26 +518,80 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
     pml4
 }
 
+// =============================================================================
+// Global Memory Manager Interface
+// =============================================================================
+//
+// This interface encapsulates the needed physical and virtual memory management
+// structures and functionality, and exports them to the rest of the system.
+// This interface is implemented with IRQ-safe spinlock in the system globals.
+
+pub struct MemoryManager {
+    pmm: PhysicalMemoryManager,
+    pml4: *mut u64,
+}
+
+#[allow(dead_code)]
+impl MemoryManager {
+    /// Instantiates and initializes physical memory manager, maps available
+    /// physical memory, and then initializes virtual page tables.
+    /// 
+    /// # Arguments
+    ///
+    /// * `framebuffer_info` - Framebuffer info structure from the bootloader.
+    /// * `memory_map` - Memory map information structure from the bootloader.
+    pub fn init(
+        framebuffer_info: &crate::FramebufferInfo,
+        memory_map: &MemoryMapInfo,
+    ) -> Self {
+        let mut pmm = PhysicalMemoryManager::init(framebuffer_info, memory_map);
+        let pml4 = init_page_tables(&mut pmm, framebuffer_info, memory_map);
+        Self { pmm, pml4 }
+    }
+
+    /// Delegates to the inner `PhysicalMemoryManager::alloc_page()` and
+    /// allocates a physical page.
+    pub fn alloc_page(&mut self) -> Option<u64> {
+        self.pmm.alloc_page()
+    }
+
+    /// Delegates to the inner `PhysicalMemoryManager::free_page()` and frees
+    /// a physical page.
+    pub fn free_page(&mut self, addr: u64) {
+        self.pmm.free_page(addr)
+    }
+
+    /// Delegates to the `map_page` and maps a physical page to a virtual page.
+    pub fn map_page(&mut self, virtual_addr: u64, physical_addr: u64, flags: u64) {
+        map_page(&mut self.pmm, self.pml4, virtual_addr, physical_addr, flags);
+    }
+
+    // TODO: implement in the future when needed
+    //pub fn unmap_page(&mut self, virtual_addr: u64) {
+    //    // future
+    //}
+}
+
+// Implements unsafe Send for spinlock management
+unsafe impl Send for MemoryManager {}
+
+
+
 // TODO: For sanity checks only. Delete later
-pub fn test_vmm(pmm: &mut PhysicalMemoryManager,) {
+pub fn test_vmm() {
     unsafe {
         let cookie: u64 = 0xDEADBEEFCAFEBABE;
-        let phys_addr = pmm.alloc_page().unwrap();
-        sprintln!("[TEST] Got physical address 0x{:016X}", phys_addr);
+        let phys_addr = globals::MEMORY_MANAGER.lock().as_mut().unwrap().alloc_page().unwrap();
+        sprintln!("\n[TEST] Got physical address 0x{:016X}", phys_addr);
         let virt_addr: u64 = 0x0000010000000000;
         sprintln!("[TEST] Chosen virtual address 0x{:016X}", virt_addr);
-
         let phys_ptr = phys_addr as *const u64;
         sprintln!("[TEST] Read from physical address 0x{:016X}", *phys_ptr);
-
         let cr3: u64;
         core::arch::asm!("mov {}, cr3", out(reg) cr3);
         sprintln!("[TEST] CR3 / PML4 address 0x{:016X}", cr3);
-        let pml4 = cr3 as *mut u64;
-
-        map_page(pmm, pml4, virt_addr, phys_addr, PRESENT | WRITABLE);
+        globals::MEMORY_MANAGER.lock().as_mut().unwrap().map_page(virt_addr, phys_addr, PRESENT | WRITABLE);
         sprintln!("[TEST] Mapped new virtual page");
-
         let ptr = virt_addr as *mut u64;
         *ptr = cookie;
         sprintln!("[TEST] Wrote cookie to virtual address");

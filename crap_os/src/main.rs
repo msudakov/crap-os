@@ -15,7 +15,7 @@ mod memory_manager;
 
 use framebuffer::FramebufferInfo;
 use memory_manager::MemoryMapInfo;
-use memory_manager::PhysicalMemoryManager;
+use globals::MEMORY_MANAGER;
 
 
 // Structure for the Global Descriptor Table
@@ -172,15 +172,19 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     globals::FRAMEBUFFER.lock().as_mut().unwrap().draw_banner();
     sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Text drawn");
 
-
-    sprint_debug!(DebugLevel::INFO, "[INFO] Mapping available physical memory");
-    let mut pmm = PhysicalMemoryManager::init(&framebuffer, &memory_map);
-    sprint_debug!(DebugLevel::INFO, "[INFO] Available physical memory mapped");
-    sprint_debug!(DebugLevel::INFO, "[INFO] Mapping virtual memory...");
-    let _pml4 =  memory_manager::init_page_tables(&mut pmm, &framebuffer, &memory_map);
-    sprint_debug!(DebugLevel::INFO, "[INFO] Virtual memory mapped");
+    sprint_debug!(
+        DebugLevel::INFO, "[INFO] Mapping physical and virtual memory...");
+    {
+        // Instantiate and initialize memory manager
+        let mut memory_manager = MEMORY_MANAGER.lock();
+        *memory_manager = Some(memory_manager::MemoryManager::init(
+            &framebuffer, &memory_map));
+    }
+    sprint_debug!(DebugLevel::INFO, "[INFO] Memory mapped!");
     sprint_debug!(DebugLevel::INFO, "[INFO] Testing virtual memory...");
-    memory_manager::test_vmm(&mut pmm);
+
+    // TODO: delete this test later
+    memory_manager::test_vmm();
 
     // Done for now.. loop forever and ever
     loop {

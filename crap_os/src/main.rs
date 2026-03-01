@@ -1,3 +1,7 @@
+// =============================================================================
+// CrapOS Main System Module
+// =============================================================================
+
 #![no_std]   // This is an OS kernel; there is no standard library for now
 #![no_main]  // Not depending on a runtime, so cannot use main as entry point
 
@@ -9,9 +13,6 @@ mod serial;
 mod framebuffer;
 mod memory_manager;
 
-use serial::print_debug;
-use serial::print;
-use serial::println;
 use framebuffer::FramebufferInfo;
 use memory_manager::MemoryMapInfo;
 use memory_manager::PhysicalMemoryManager;
@@ -61,7 +62,6 @@ pub enum DebugLevel {
     ERROR = 4,
     CRITICAL = 5
 }
-pub const DEBUG_LEVEL: DebugLevel = DebugLevel::INFO;
 
 /*
     These are the BootInfo structures that are passed to the _start routine by
@@ -116,50 +116,47 @@ fn load_gdt() {
 pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     load_gdt();  // Must be executed before anything else
 
-    unsafe {
-        // Clear the interrupt flag to disable maskable interrupts
-        core::arch::asm!("cli");
+    {
+        // Instantiate and initialize serial port writer
+        let mut writer = globals::SERIAL.lock();
+        *writer = Some(serial::SerialWriter::new(
+            globals::COM1_PORT,
+        ));
+    }
+    sprint_debug!(DebugLevel::INFO, "[INFO] Kernel started");
 
-        serial::init_serial();  // Initialize serial port for debugging
-        print_debug(DebugLevel::INFO, "[INFO] Kernel started");
-
-        if boot_info.is_null() {  // Validate boot_info pointer
-            print_debug(DebugLevel::CRITICAL, "[ERROR] boot_info is null");
-            loop { core::arch::asm!("hlt"); }
-        }
+    // Validate boot_info pointer
+    if boot_info.is_null() {
+        sprint_debug!(DebugLevel::CRITICAL, "[ERROR] boot_info is null");
+        loop { unsafe { core::arch::asm!("hlt") }};
     }
 
     let info = unsafe { &*boot_info };  // Dereference boot_info
 
     // Sanity check for magic value
     if info.magic != 0xDEADBEEFB007CAFE {
-        print_debug(DebugLevel::CRITICAL,
+        sprint_debug!(DebugLevel::CRITICAL,
             "[CRITICAL] Magic value did not match");
         unsafe { core::arch::asm!("hlt") };
     }
-    print_debug(DebugLevel::DEBUG, "[DEBUG] Magic value matched");
-    print_debug(DebugLevel::DEBUG, "[DEBUG] Got BootInfo structure");
+    sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Magic value matched");
+    sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Got BootInfo structure");
 
     // Dereference framebuffer_info
     let framebuffer = unsafe { &*info.framebuffer_info };
-    print_debug(DebugLevel::DEBUG, "[DEBUG] Framebuffer info read");
+    sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Framebuffer info read");
 
     if framebuffer.framebuffer_addr == 0 {  // Validate framebuffer address
-        print_debug(DebugLevel::ERROR, "[ERROR] framebuffer address is 0");
+        sprint_debug!(DebugLevel::ERROR, "[ERROR] framebuffer address is 0");
         loop { unsafe { core::arch::asm!("hlt") }}
     }
-    print_debug(DebugLevel::INFO, "[INFO] Validated framebuffer addr");
+    sprint_debug!(DebugLevel::INFO, "[INFO] Validated framebuffer addr");
 
     // Dereference memory_map_info
     let memory_map = unsafe { &*info.memory_map_info };
 
-    //let mut writer = FramebufferWriter::new(
-    //    framebuffer.framebuffer_addr as *mut u32,
-    //    framebuffer.framebuffer_width,
-    //    framebuffer.framebuffer_height,
-    //);
-    //writer.clear_screen();
     {
+        // Instantiate and initialize framebuffer writer
         let mut writer = globals::FRAMEBUFFER.lock();
         *writer = Some(framebuffer::FramebufferWriter::new(
             framebuffer.framebuffer_addr as *mut u32,
@@ -168,21 +165,21 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         ));
         writer.as_mut().unwrap().clear_screen();
     }
-    print_debug(DebugLevel::INFO, "[INFO] Graphics initialized successfully");
+    sprint_debug!(DebugLevel::INFO, "[INFO] Graphics initialized successfully");
     
     // Draw OS banner
     fbprintln!("Hello and {} to:\n", "welcome");
     globals::FRAMEBUFFER.lock().as_mut().unwrap().draw_banner();
-    print_debug(DebugLevel::DEBUG, "[DEBUG] Text drawn");
+    sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Text drawn");
 
 
-    print_debug(DebugLevel::INFO, "[INFO] Mapping available physical memory");
+    sprint_debug!(DebugLevel::INFO, "[INFO] Mapping available physical memory");
     let mut pmm = PhysicalMemoryManager::init(&framebuffer, &memory_map);
-    print_debug(DebugLevel::INFO, "[INFO] Available physical memory mapped");
-    print_debug(DebugLevel::INFO, "[INFO] Mapping virtual memory...");
+    sprint_debug!(DebugLevel::INFO, "[INFO] Available physical memory mapped");
+    sprint_debug!(DebugLevel::INFO, "[INFO] Mapping virtual memory...");
     let _pml4 =  memory_manager::init_page_tables(&mut pmm, &framebuffer, &memory_map);
-    print_debug(DebugLevel::INFO, "[INFO] Virtual memory mapped");
-    print_debug(DebugLevel::INFO, "[INFO] Testing virtual memory...");
+    sprint_debug!(DebugLevel::INFO, "[INFO] Virtual memory mapped");
+    sprint_debug!(DebugLevel::INFO, "[INFO] Testing virtual memory...");
     memory_manager::test_vmm(&mut pmm);
 
     // Done for now.. loop forever and ever
@@ -206,12 +203,14 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 /// Crashes the system and halts the CPU.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    print("\n!!! KERNEL PANIC !!!\n");
-    
+    sprintln!("\n!!! KERNEL PANIC !!!");
+
     if let Some(location) = info.location() {
-        print("Location: ");
-        println(location.file());
+        sprintln!("Panic occurred in file '{}' at line {}", location.file(),
+            location.line());
     }
+
+    sprintln!("Panic Message: {}", info.message());
 
     loop {
         // Halt the CPU

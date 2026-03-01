@@ -2,7 +2,7 @@
 // This file contains system helper routines
 // =============================================================================
 
-const HEX_CHARS_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+use crate::globals::HEX_CHARS_UPPER;
 
 /// Converts a u64 to a fixed-width hex byte string.
 /// 

@@ -1,3 +1,7 @@
+// =============================================================================
+// Spinlock and IRQ Safety Module
+// =============================================================================
+//
 // This module contains spinlock implementations for synchronizing critical
 // globals. These are mutual-exclusion primitives that busy-wait (spin) until
 // the lock is available. They are suitable for short critical sections in a

@@ -1,9 +1,11 @@
+// =============================================================================
 // CrapOS Memory Manager Module
-//
+// =============================================================================
+// 
 // This module is responsible for all physical and virtual memory operations
 // in the system.
 
-use crate::serial;
+use crate::sprintln;
 
 const PRESENT: u64 = 1 << 0;  // Must be 1 for the entry to be valid
 const WRITABLE: u64 = 1 << 1; // If 1, writes are allowed; if 0, read-only
@@ -509,35 +511,34 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
             options(nostack, preserves_flags)
     )};
 
-    serial::println("[INFO] Switched to new page tables");
+    sprintln!("[INFO] Switched to new page tables");
     pml4
 }
-
 
 // TODO: For sanity checks only. Delete later
 pub fn test_vmm(pmm: &mut PhysicalMemoryManager,) {
     unsafe {
         let cookie: u64 = 0xDEADBEEFCAFEBABE;
         let phys_addr = pmm.alloc_page().unwrap();
-        serial::print_addr_with_label("[TEST] Got physical address", phys_addr);
+        sprintln!("[TEST] Got physical address 0x{:016X}", phys_addr);
         let virt_addr: u64 = 0x0000010000000000;
-        serial::print_addr_with_label("[TEST] Chosen virtual address", virt_addr);
+        sprintln!("[TEST] Chosen virtual address 0x{:016X}", virt_addr);
 
         let phys_ptr = phys_addr as *const u64;
-        serial::print_addr_with_label("[TEST] Read from physical addr", *phys_ptr);
+        sprintln!("[TEST] Read from physical address 0x{:016X}", *phys_ptr);
 
         let cr3: u64;
         core::arch::asm!("mov {}, cr3", out(reg) cr3);
-        serial::print_addr_with_label("[TEST] CR3 / PML4 address", cr3);
+        sprintln!("[TEST] CR3 / PML4 address 0x{:016X}", cr3);
         let pml4 = cr3 as *mut u64;
 
         map_page(pmm, pml4, virt_addr, phys_addr, PRESENT | WRITABLE);
-        crate::serial::println("[TEST] Mapped new virtual page");
+        sprintln!("[TEST] Mapped new virtual page");
 
         let ptr = virt_addr as *mut u64;
         *ptr = cookie;
-        crate::serial::println("[TEST] Wrote cookie to virtual addr");
-        serial::print_addr_with_label("[TEST] Read cookie from virtual address", *ptr);
-        serial::print_addr_with_label("[TEST] Read cookie from physical addr", *phys_ptr);
+        sprintln!("[TEST] Wrote cookie to virtual address");
+        sprintln!("[TEST] Read cookie from virtual address 0x{:016X}", *ptr);
+        sprintln!("[TEST] Read cookie from physical address 0x{:016X}", *phys_ptr);
     }
 }

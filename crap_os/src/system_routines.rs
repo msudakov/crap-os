@@ -1,6 +1,6 @@
-/*
-    CrapOS Standard Library Module
-*/
+// =============================================================================
+// This file contains system helper routines
+// =============================================================================
 
 const HEX_CHARS_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 
@@ -68,4 +68,45 @@ pub fn u32_to_hex_bytes(value: u32) -> [u8; 10] {
     buffer[0] = b'0';
     buffer[1] = b'x';
     buffer
+}
+
+/// Saves the current CPU flags register (which includes the interrupt-enable
+/// flag `IF`) and then disables hardware interrupts by executing `CLI` (Clear
+/// Interrupt Flag).
+///
+/// # Returns
+/// 
+/// Returns the saved flags value as a `usize` so that `restore_interrupts` can
+/// later put them back, re-enabling interrupts if and only if they were enabled
+/// before this call.
+#[inline]
+pub fn disable_interrupts_save() -> usize {
+    // `flags` will receive the RFLAGS value captured before CLI
+    let flags: usize;
+    unsafe {
+        core::arch::asm!(
+            "pushfq",       // Push the 64-bit RFLAGS register onto the stack
+            "pop {flags}",  // Pop it back into our output variable
+            "cli",          // Clear the interrupt-enable flag (bit 9 of RFLAGS)
+            flags = out(reg) flags,
+            options(nomem, preserves_flags)
+        );
+    }
+    flags
+}
+
+/// Restores the CPU flags register from a previously saved value.
+///
+/// If `flags` has the interrupt-enable bit (`IF` bit 9) set, this effectively
+/// re-enables interrupts. If it was clear, interrupts stay disabled.
+#[inline]
+pub fn restore_interrupts(flags: usize) {
+    unsafe {
+        core::arch::asm!(
+            "push {flags}",        // Push saved RFLAGS value onto the stack
+            "popfq",               // Pop it back into RFLAGS (restoring IF bit)
+            flags = in(reg) flags,
+            options(nomem, preserves_flags)
+        );
+    }
 }

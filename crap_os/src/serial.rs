@@ -1,9 +1,7 @@
-/*
-    CrapOS Serial Printer Module
-
-    This module contains the needed functionality to write messages to a serial
-    port, mainly used for development and debugging.
-*/
+// CrapOS Serial Printer Module
+//
+// This module contains the needed functionality to write messages to a serial
+// port, mainly used for development and debugging.
 
 // Standard base address for COM1 serial port, used for serial port functions
 const COM1_PORT: u16 = 0x3F8;
@@ -189,7 +187,7 @@ pub fn print_bytes(bytes: &[u8]) {
 /// * `address` - Memory address or another u64 value to print.
 #[allow(dead_code)]
 pub fn print_addr_with_label(label: &str, address: u64) {
-    let addr_hex_str = crate::stdlib::u64_to_hex_bytes(address);
+    let addr_hex_str = crate::system_routines::u64_to_hex_bytes(address);
     print(label);
     print(": ");
     print_bytes(&addr_hex_str);

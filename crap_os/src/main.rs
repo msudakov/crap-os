@@ -1,17 +1,18 @@
 #![no_std]   // This is an OS kernel; there is no standard library for now
 #![no_main]  // Not depending on a runtime, so cannot use main as entry point
 
-mod stdlib;
+mod globals;
+mod spinlock;
+mod macros;
+mod system_routines;
 mod serial;
 mod framebuffer;
 mod memory_manager;
 
-use core::fmt::Write;
 use serial::print_debug;
 use serial::print;
 use serial::println;
 use framebuffer::FramebufferInfo;
-use framebuffer::FramebufferWriter;
 use memory_manager::MemoryMapInfo;
 use memory_manager::PhysicalMemoryManager;
 
@@ -152,19 +153,26 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // Dereference memory_map_info
     let memory_map = unsafe { &*info.memory_map_info };
 
-    let mut writer = FramebufferWriter::new(
-        framebuffer.framebuffer_addr as *mut u32,
-        framebuffer.framebuffer_width,
-        framebuffer.framebuffer_height,
-    );
-    writer.clear_screen();
+    //let mut writer = FramebufferWriter::new(
+    //    framebuffer.framebuffer_addr as *mut u32,
+    //    framebuffer.framebuffer_width,
+    //    framebuffer.framebuffer_height,
+    //);
+    //writer.clear_screen();
+    {
+        let mut writer = globals::FRAMEBUFFER.lock();
+        *writer = Some(framebuffer::FramebufferWriter::new(
+            framebuffer.framebuffer_addr as *mut u32,
+            framebuffer.framebuffer_width,
+            framebuffer.framebuffer_height,
+        ));
+        writer.as_mut().unwrap().clear_screen();
+    }
     print_debug(DebugLevel::INFO, "[INFO] Graphics initialized successfully");
     
-    // Writer example that allows string formatting
-    write!(writer, "Hello and {} to:\n\n", "welcome").unwrap();
-
     // Draw OS banner
-    writer.draw_banner();
+    fbprintln!("Hello and {} to:\n", "welcome");
+    globals::FRAMEBUFFER.lock().as_mut().unwrap().draw_banner();
     print_debug(DebugLevel::DEBUG, "[DEBUG] Text drawn");
 
 

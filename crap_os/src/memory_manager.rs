@@ -1,15 +1,15 @@
-/*
-    CrapOS Memory Manager Module
+// =============================================================================
+// CrapOS Memory Manager Module
+// =============================================================================
+// 
+// This module is responsible for all physical and virtual memory operations
+// in the system.
 
-    This module is responsible for all physical and virtual memory operations
-    in the system.
-*/
-
-use crate::serial_printer;
+use crate::{globals, sprintln};
 
 const PRESENT: u64 = 1 << 0;  // Must be 1 for the entry to be valid
 const WRITABLE: u64 = 1 << 1; // If 1, writes are allowed; if 0, read-only
-//const USER: u64 = 1 << 2;     // If 1, user-mode access is allowed
+// const USER: u64 = 1 << 2;     // If 1, user-mode access is allowed
 // TODO: Not implementing the NX/Execute Disabled bit (bit 63) for now
 
 // This is the structure received from the bootloader
@@ -72,35 +72,38 @@ impl EfiMemoryDescriptor {
     }
 }
 
-/*
-    The main job of the Physical Memory Manager is to allocate, free, and keep
-    track of physical memory pages in RAM. But, it has to do it really-really
-    efficiently because the entire system, including the Virtual Memory Manager,
-    depends on it for this one task. It has to be as fast as possible. 
+// =============================================================================
+// Physical Memory Manager
+// =============================================================================
+//
+// The main job of the Physical Memory Manager is to allocate, free, and keep
+// track of physical memory pages in RAM. But, it has to do it really-really
+// efficiently because the entire system, including the Virtual Memory Manager,
+// depends on it for this one task. It has to be as fast as possible. 
+//
+// There are several methods of keeping track of physical pages. For example,
+// the bitmap method is able to locate a new free page in time O(n) when
+// unoptimized and down to O(log n) with some optimizations. However, this
+// implementation uses a simpler method that is able to fetch a new page
+// in runtime of O(1), or in deterministic time.
+//
+// Specifically, it uses a stack-type (LIFO) singly-linked list.
+// Besides a counter for the number of free pages remaining in RAM, its
+// `free_list_head` member always points to the first/next free physical page
+// to be delivered when requested. In turn, each free physical page is
+// modified to have its first 8 bytes hold the address of the next page, and
+// so on.
+//
+// Each free page points to the next. Every time a page is freed and recycled
+// back to the manager, the PMM will take the current head address, place it
+// in the first 8 bytes of the newly-freed page to bump the old top page down,
+// and then update the head to point to the newly-freed page. And when a page
+// is allocated, the reverse takes place: the PMM follows the head to the
+// soon-to-be allocated page to read its first 8 bytes and find the
+// next-in-line page for later allocations. It then updates the head address
+// to point to the following page and returns the requsted page to the caller.
 
-    There are several methods of keeping track of physical pages. For example,
-    the bitmap method is able to locate a new free page in time O(n) when
-    unoptimized and down to O(log n) with some optimizations. However, this
-    implementation uses a simpler method that is able to fetch a new page
-    in runtime of O(1), or in deterministic time.
-
-    Specifically, it uses a stack-type (LIFO) singly-linked list.
-    Besides a counter for the number of free pages remaining in RAM, its
-    `free_list_head` member always points to the first/next free physical page
-    to be delivered when requested. In turn, each free physical page is
-    modified to have its first 8 bytes hold the address of the next page, and
-    so on.
-    
-    Each free page points to the next. Every time a page is freed and recycled
-    back to the manager, the PMM will take the current head address, place it
-    in the first 8 bytes of the newly-freed page to bump the old top page down,
-    and then update the head to point to the newly-freed page. And when a page
-    is allocated, the reverse takes place: the PMM follows the head to the
-    soon-to-be allocated page to read its first 8 bytes and find the
-    next-in-line page for later allocations. It then updates the head address
-    to point to the following page and returns the requsted page to the caller.
-*/
-pub struct PhysicalMemoryManager {
+struct PhysicalMemoryManager {
     kernel_load_addr: u64,       // Where the bootloader mapped the kernel image
     kernel_image_size: u64,      // Size of the kernel
     kernel_stack_base_addr: u64, // Base address of the initial kernel stack
@@ -121,7 +124,7 @@ impl PhysicalMemoryManager {
     ///
     /// * `framebuffer_info` - Framebuffer info structure from the bootloader.
     /// * `memory_map` - Memory map information structure from the bootloader.
-    pub fn init(framebuffer_info: &crate::FramebufferInfo,
+    fn init(framebuffer_info: &crate::FramebufferInfo,
         memory_map: &MemoryMapInfo,
     ) -> Self {
         let fb_size = (framebuffer_info.framebuffer_height as u64) *
@@ -162,12 +165,10 @@ impl PhysicalMemoryManager {
                 let page_start_addr = memory_descriptor.physical_start+i*0x1000;
                 let page_end_addr = page_start_addr + 0x1000 - 1;
 
-                /*
-                    Check the page address for collisions with existing
-                    allocations. This should not happen as the bootloader
-                    should have accounted for most of this, but this is
-                    needed as a sanity check.
-                */
+                // Check the page address for collisions with existing
+                // allocations. This should not happen as the bootloader
+                // should have accounted for most of this, but this is
+                // needed as a sanity check.
 
                 if page_start_addr == 0 {
                     continue;  // Skipping physical page 0 (null page)
@@ -279,32 +280,32 @@ fn page_overlaps(page_start: u64, page_end: u64, region_start: u64,
     page_start <= region_end && page_end >= region_start
 }
 
+// =============================================================================
+// Virtual Memory Manager
+// =============================================================================
 
-/*
-    Virtual Memory Manager
+// On x86-64 systems with 4-level paging, which is provided by UEFI, the
+// paging hierarchy is PML4 -> PDPT -> PD -> PT -> physical page frame, where:
+//   * PML4 - Page Map Level 4, contains 512 PML4Es
+//   * PDPT - Page Directory Pointer Table, contains 512 PDPTEs 
+//   * PD   - Page Directory, contains 512 PDEs
+//   * PT   - Page Table, contains 512 64-bit PTEs
+//
+// Each of these tables is 4KB, containing 512 entries, with each entry being
+// 8 bytes.
+//
+// This structure maps 48-bit virtual addresses to physical addresses. A
+// 48-bit virtual address is split into 9-bit indices for each mapping level,
+// plus a 12-bit page offset: 9-bit PML4 index, 9-bit PDPT index, 9-bit PD
+// index, 9-bit PT index, and 12-bit offset. A single PML4 entry (PML4E) can
+// map 512 GB of memory, making the total addressable space per PML4 table 256
+// TB, which is more than enough for our purposes here. PML5 allows for larger
+// (57-bit) virtual address spaces.
+//
+// To facilitate address translation, the Memory Management Unit (MMU), located
+// in the CPU chip package, uses the CR3 register to locate the PML4. It then
+// traverses the levels to resolve the final physical address.
 
-    On x86-64 systems with 4-level paging, which is provided by UEFI, the
-    paging hierarchy is PML4 -> PDPT -> PD -> PT -> physical page frame, where:
-      * PML4 - Page Map Level 4, contains 512 PML4Es
-      * PDPT - Page Directory Pointer Table, contains 512 PDPTEs 
-      * PD   - Page Directory, contains 512 PDEs
-      * PT   - Page Table, contains 512 64-bit PTEs
-    
-    Each of these tables is 4KB, containing 512 entries, with each entry being
-    8 bytes.
-    
-    This structure maps 48-bit virtual addresses to physical addresses. A
-    48-bit virtual address is split into 9-bit indices for each mapping level,
-    plus a 12-bit page offset: 9-bit PML4 index, 9-bit PDPT index, 9-bit PD
-    index, 9-bit PT index, and 12-bit offset. A single PML4 entry (PML4E) can
-    map 512 GB of memory, making the total addressable space per PML4 table 256
-    TB, which is more than enough for our purposes here. PML5 allows for larger
-    (57-bit) virtual address spaces.
-
-    To facilitate address translation, the Memory Management Unit (MMU), located
-    in the CPU chip package, uses the CR3 register to locate the PML4. It then
-    traverses the levels to resolve the final physical address.
-*/
 
 /// Looks up or creates a page table by its address and an index from previous
 /// level.
@@ -353,7 +354,7 @@ fn get_or_create_table(pmm: &mut PhysicalMemoryManager, table: *mut u64,
 /// # Safety
 /// 
 /// Dereferences raw pointers.
-pub fn map_page(pmm: &mut PhysicalMemoryManager, pml4_addr: *mut u64,
+fn map_page(pmm: &mut PhysicalMemoryManager, pml4_addr: *mut u64,
     virtual_addr: u64, physical_addr: u64, flags: u64
 ) {
     let pml4_index = (virtual_addr >> 39) & 0x1FF;
@@ -440,7 +441,7 @@ fn zero_out_page(address: u64) {
 /// # Safety
 /// 
 /// Uses inline assembly to write the new PML4 address to the CR3 register.
-pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
+fn init_page_tables(pmm: &mut PhysicalMemoryManager,
     framebuffer_info: &crate::FramebufferInfo, memory_map: &MemoryMapInfo
 ) -> *mut u64 {
     // Allocate and zero out the new PML4
@@ -513,34 +514,88 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
             options(nostack, preserves_flags)
     )};
 
-    serial_printer::println("[INFO] Switched to new page tables");
+    sprintln!("[INFO] Switched to new page tables");
     pml4
 }
 
+// =============================================================================
+// Global Memory Manager Interface
+// =============================================================================
+//
+// This interface encapsulates the needed physical and virtual memory management
+// structures and functionality, and exports them to the rest of the system.
+// This interface is implemented with IRQ-safe spinlock in the system globals.
+
+pub struct MemoryManager {
+    pmm: PhysicalMemoryManager,
+    pml4: *mut u64,
+}
+
+#[allow(dead_code)]
+impl MemoryManager {
+    /// Instantiates and initializes physical memory manager, maps available
+    /// physical memory, and then initializes virtual page tables.
+    /// 
+    /// # Arguments
+    ///
+    /// * `framebuffer_info` - Framebuffer info structure from the bootloader.
+    /// * `memory_map` - Memory map information structure from the bootloader.
+    pub fn init(
+        framebuffer_info: &crate::FramebufferInfo,
+        memory_map: &MemoryMapInfo,
+    ) -> Self {
+        let mut pmm = PhysicalMemoryManager::init(framebuffer_info, memory_map);
+        let pml4 = init_page_tables(&mut pmm, framebuffer_info, memory_map);
+        Self { pmm, pml4 }
+    }
+
+    /// Delegates to the inner `PhysicalMemoryManager::alloc_page()` and
+    /// allocates a physical page.
+    pub fn alloc_page(&mut self) -> Option<u64> {
+        self.pmm.alloc_page()
+    }
+
+    /// Delegates to the inner `PhysicalMemoryManager::free_page()` and frees
+    /// a physical page.
+    pub fn free_page(&mut self, addr: u64) {
+        self.pmm.free_page(addr)
+    }
+
+    /// Delegates to the `map_page` and maps a physical page to a virtual page.
+    pub fn map_page(&mut self, virtual_addr: u64, physical_addr: u64, flags: u64) {
+        map_page(&mut self.pmm, self.pml4, virtual_addr, physical_addr, flags);
+    }
+
+    // TODO: implement in the future when needed
+    //pub fn unmap_page(&mut self, virtual_addr: u64) {
+    //    // future
+    //}
+}
+
+// Implements unsafe Send for spinlock management
+unsafe impl Send for MemoryManager {}
+
+
+
 // TODO: For sanity checks only. Delete later
-pub fn test_vmm(pmm: &mut PhysicalMemoryManager,) {
+pub fn test_vmm() {
     unsafe {
         let cookie: u64 = 0xDEADBEEFCAFEBABE;
-        let phys_addr = pmm.alloc_page().unwrap();
-        serial_printer::print_addr_with_label("[TEST] Got physical address", phys_addr);
+        let phys_addr = globals::MEMORY_MANAGER.lock().as_mut().unwrap().alloc_page().unwrap();
+        sprintln!("\n[TEST] Got physical address 0x{:016X}", phys_addr);
         let virt_addr: u64 = 0x0000010000000000;
-        serial_printer::print_addr_with_label("[TEST] Chosen virtual address", virt_addr);
-
+        sprintln!("[TEST] Chosen virtual address 0x{:016X}", virt_addr);
         let phys_ptr = phys_addr as *const u64;
-        serial_printer::print_addr_with_label("[TEST] Read from physical addr", *phys_ptr);
-
+        sprintln!("[TEST] Read from physical address 0x{:016X}", *phys_ptr);
         let cr3: u64;
         core::arch::asm!("mov {}, cr3", out(reg) cr3);
-        serial_printer::print_addr_with_label("[TEST] CR3 / PML4 address", cr3);
-        let pml4 = cr3 as *mut u64;
-
-        map_page(pmm, pml4, virt_addr, phys_addr, PRESENT | WRITABLE);
-        crate::serial_printer::println("[TEST] Mapped new virtual page");
-
+        sprintln!("[TEST] CR3 / PML4 address 0x{:016X}", cr3);
+        globals::MEMORY_MANAGER.lock().as_mut().unwrap().map_page(virt_addr, phys_addr, PRESENT | WRITABLE);
+        sprintln!("[TEST] Mapped new virtual page");
         let ptr = virt_addr as *mut u64;
         *ptr = cookie;
-        crate::serial_printer::println("[TEST] Wrote cookie to virtual addr");
-        serial_printer::print_addr_with_label("[TEST] Read cookie from virtual address", *ptr);
-        serial_printer::print_addr_with_label("[TEST] Read cookie from physical addr", *phys_ptr);
+        sprintln!("[TEST] Wrote cookie to virtual address");
+        sprintln!("[TEST] Read cookie from virtual address 0x{:016X}", *ptr);
+        sprintln!("[TEST] Read cookie from physical address 0x{:016X}", *phys_ptr);
     }
 }

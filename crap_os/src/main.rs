@@ -155,6 +155,16 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // Dereference memory_map_info
     let memory_map = unsafe { &*info.memory_map_info };
 
+    sprint_debug!(
+        DebugLevel::INFO, "[INFO] Mapping physical and virtual memory...");
+    {
+        // Instantiate and initialize memory manager
+        let mut memory_manager = MEMORY_MANAGER.lock();
+        *memory_manager = Some(memory_manager::MemoryManager::init(
+            &framebuffer, &memory_map));
+    }
+    sprint_debug!(DebugLevel::INFO, "[INFO] Memory mapped!");
+    
     {
         // Instantiate and initialize framebuffer writer
         let mut writer = globals::FRAMEBUFFER.lock();
@@ -172,19 +182,12 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     globals::FRAMEBUFFER.lock().as_mut().unwrap().draw_banner();
     sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Text drawn");
 
-    sprint_debug!(
-        DebugLevel::INFO, "[INFO] Mapping physical and virtual memory...");
-    {
-        // Instantiate and initialize memory manager
-        let mut memory_manager = MEMORY_MANAGER.lock();
-        *memory_manager = Some(memory_manager::MemoryManager::init(
-            &framebuffer, &memory_map));
-    }
-    sprint_debug!(DebugLevel::INFO, "[INFO] Memory mapped!");
-    sprint_debug!(DebugLevel::INFO, "[INFO] Testing virtual memory...");
-
     // TODO: delete this test later
+    sprint_debug!(DebugLevel::INFO, "[INFO] Testing virtual memory...");
     memory_manager::test_vmm();
+    fbprintln!("[+] Memory tested!");
+    sprintln!("[+] Memory tested!");
+    
 
     // Done for now.. loop forever and ever
     loop {

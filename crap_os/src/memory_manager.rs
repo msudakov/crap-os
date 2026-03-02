@@ -12,6 +12,12 @@ const WRITABLE: u64 = 1 << 1; // If 1, writes are allowed; if 0, read-only
 // const USER: u64 = 1 << 2;     // If 1, user-mode access is allowed
 const NX: u64 = 1 << 63;
 
+// Kernel start and end tags collected from the linker.
+unsafe extern "C" {
+    static __kernel_start: u8;
+    static __kernel_end: u8;
+}
+
 // This is the structure received from the bootloader
 #[repr(C)]
 pub struct MemoryMapInfo {
@@ -103,6 +109,7 @@ impl EfiMemoryDescriptor {
 // next-in-line page for later allocations. It then updates the head address
 // to point to the following page and returns the requsted page to the caller.
 
+#[allow(dead_code)]
 struct PhysicalMemoryManager {
     kernel_load_addr: u64,       // Where the bootloader mapped the kernel image
     kernel_image_size: u64,      // Size of the kernel
@@ -127,9 +134,11 @@ impl PhysicalMemoryManager {
     fn init(framebuffer_info: &crate::FramebufferInfo,
         memory_map: &MemoryMapInfo,
     ) -> Self {
+        // Need to divide BPP by 8 because it historically represents
+        // bits-per-pixel instead of bytes.
         let fb_size = (framebuffer_info.framebuffer_height as u64) *
             (framebuffer_info.framebuffer_width as u64) *
-            (framebuffer_info.framebuffer_bpp as u64);
+            (framebuffer_info.framebuffer_bpp as u64 / 8);
 
         // Instantiate the Physical Memory Manager
         let mut pmm = PhysicalMemoryManager {
@@ -183,9 +192,11 @@ impl PhysicalMemoryManager {
                 }
                 
                 // Detect collision on the mapped kernel image memory region
+                let kernel_start = core::ptr::addr_of!(__kernel_start) as u64;
+                let kernel_end = core::ptr::addr_of!(__kernel_end) as u64;
                 if page_overlaps(page_start_addr, page_end_addr,
-                    pmm.kernel_load_addr,
-                    pmm.kernel_load_addr + pmm.kernel_image_size
+                    kernel_start,
+                    kernel_end
                 ) {
                     continue;
                 }
@@ -449,7 +460,6 @@ fn init_page_tables(pmm: &mut PhysicalMemoryManager,
     zero_out_page(new_pml4);
     let pml4 = new_pml4 as *mut u64;
 
-    // Identity map all EfiConventionalMemory regions
     let mut descriptor_addr = memory_map.memory_map_addr;
     let num_segments = memory_map.memory_map_size / memory_map.descriptor_size;
 
@@ -457,7 +467,14 @@ fn init_page_tables(pmm: &mut PhysicalMemoryManager,
         let descriptor = EfiMemoryDescriptor::new(descriptor_addr);
         descriptor_addr += memory_map.descriptor_size;
 
-        if descriptor.region_type != EfiMemoryType::EfiConventionalMemory {
+        // Identity map all EfiConventionalMemory regions, as well as UEFI
+        // code and data for the loader itself and the EBS
+        if !(descriptor.region_type == EfiMemoryType::EfiConventionalMemory ||
+            descriptor.region_type == EfiMemoryType::EfiLoaderCode ||
+            descriptor.region_type == EfiMemoryType::EfiLoaderData ||
+            descriptor.region_type == EfiMemoryType::EfiBootServicesCode ||
+            descriptor.region_type == EfiMemoryType::EfiBootServicesData
+        ) {
             continue;
         }
 
@@ -468,8 +485,8 @@ fn init_page_tables(pmm: &mut PhysicalMemoryManager,
     }
 
     // Identity map the kernel image
-    let kernel_start = memory_map.kernel_load_addr & !0xFFF;
-    let kernel_end = memory_map.kernel_load_addr + memory_map.kernel_image_size;
+    let kernel_start = core::ptr::addr_of!(__kernel_start) as u64;
+    let kernel_end = core::ptr::addr_of!(__kernel_end) as u64;
     let mut addr = kernel_start;
     while addr < kernel_end {
         map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE);
@@ -485,15 +502,17 @@ fn init_page_tables(pmm: &mut PhysicalMemoryManager,
         addr += 0x1000;
     }
 
-    // Identity map the framebuffer
+    // Identity map the framebuffer; need to divide BPP by 8 because it
+    // historically represents bits-per-pixel instead of bytes.
     let fb_size = (framebuffer_info.framebuffer_height as u64)
         * (framebuffer_info.framebuffer_width as u64)
-        * (framebuffer_info.framebuffer_bpp as u64);
+        * (framebuffer_info.framebuffer_bpp as u64 / 8);
     let fb_start = framebuffer_info.framebuffer_addr & !0xFFF;
     let fb_end = framebuffer_info.framebuffer_addr + fb_size;
+
     let mut addr = fb_start;
     while addr < fb_end {
-        map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE | NX);
+        map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE);
         addr += 0x1000;
     }
 
@@ -502,7 +521,7 @@ fn init_page_tables(pmm: &mut PhysicalMemoryManager,
     let map_end = memory_map.memory_map_addr + memory_map.memory_map_size;
     let mut addr = map_start;
     while addr < map_end {
-        map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE | NX);
+        map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE);
         addr += 0x1000;
     }
 
@@ -570,8 +589,6 @@ impl MemoryManager {
                 in("edx") high
             );
         }
-
-
 
         let mut pmm = PhysicalMemoryManager::init(framebuffer_info, memory_map);
         let pml4 = init_page_tables(&mut pmm, framebuffer_info, memory_map);

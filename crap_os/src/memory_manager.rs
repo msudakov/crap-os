@@ -10,7 +10,7 @@ use crate::{globals, sprintln};
 const PRESENT: u64 = 1 << 0;  // Must be 1 for the entry to be valid
 const WRITABLE: u64 = 1 << 1; // If 1, writes are allowed; if 0, read-only
 // const USER: u64 = 1 << 2;     // If 1, user-mode access is allowed
-// TODO: Not implementing the NX/Execute Disabled bit (bit 63) for now
+const NX: u64 = 1 << 63;
 
 // This is the structure received from the bootloader
 #[repr(C)]
@@ -481,7 +481,7 @@ fn init_page_tables(pmm: &mut PhysicalMemoryManager,
     let stack_end = memory_map.stack_base_addr + memory_map.stack_size;
     let mut addr = stack_start;
     while addr < stack_end {
-        map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE);
+        map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE | NX);
         addr += 0x1000;
     }
 
@@ -493,7 +493,7 @@ fn init_page_tables(pmm: &mut PhysicalMemoryManager,
     let fb_end = framebuffer_info.framebuffer_addr + fb_size;
     let mut addr = fb_start;
     while addr < fb_end {
-        map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE);
+        map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE | NX);
         addr += 0x1000;
     }
 
@@ -502,7 +502,7 @@ fn init_page_tables(pmm: &mut PhysicalMemoryManager,
     let map_end = memory_map.memory_map_addr + memory_map.memory_map_size;
     let mut addr = map_start;
     while addr < map_end {
-        map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE);
+        map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE | NX);
         addr += 0x1000;
     }
 
@@ -544,6 +544,35 @@ impl MemoryManager {
         framebuffer_info: &crate::FramebufferInfo,
         memory_map: &MemoryMapInfo,
     ) -> Self {
+        // First, we need to set the EFER.NXE (No-Execute Enable) bit in the
+        // IA32_EFER MSR (Model Specific Register). This allows the use of the
+        // NX bit in memory regions, which is critical for secutiry.
+        let efer_msr: u64 = 0xC0000080;
+        let mut low: u32;
+        let mut high: u32;
+        unsafe {
+            // Read the current value of the MSR
+            core::arch::asm!(
+                "rdmsr",
+                in("ecx") efer_msr,
+                out("eax") low,
+                out("edx") high
+            );
+            
+            // Set NXE bit (bit 11, which is in the low 32 bits) via bitwise OR
+            low |= 1 << 11;
+            
+            // Write the modified value back to the MSR
+            core::arch::asm!(
+                "wrmsr",
+                in("ecx") efer_msr,
+                in("eax") low,
+                in("edx") high
+            );
+        }
+
+
+
         let mut pmm = PhysicalMemoryManager::init(framebuffer_info, memory_map);
         let pml4 = init_page_tables(&mut pmm, framebuffer_info, memory_map);
         Self { pmm, pml4 }

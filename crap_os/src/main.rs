@@ -102,6 +102,77 @@ fn load_gdt() {
     )};
 }
 
+
+
+
+
+/*#[repr(C, packed)]
+#[derive(Copy, Clone)]
+struct IdtEntry {
+    offset_low:  u16,
+    selector:    u16,
+    ist:         u8,
+    attributes:  u8,
+    offset_mid:  u16,
+    offset_high: u32,
+    _reserved:   u32,
+}
+
+#[repr(C, packed)]
+struct Idtr {
+    limit: u16,
+    base:  u64,
+}
+
+// A simple handler that just halts
+unsafe extern "C" fn exception_handler() -> ! {
+    unsafe { core::arch::asm!("cli", "hlt", options(noreturn, nostack)) };
+}
+
+static mut IDT: [IdtEntry; 32] = [IdtEntry {
+    offset_low:  0,
+    selector:    0,
+    ist:         0,
+    attributes:  0,
+    offset_mid:  0,
+    offset_high: 0,
+    _reserved:   0,
+}; 32];
+
+pub fn init_idt() {
+    let handler = exception_handler as u64;
+    unsafe {
+        let idt_ptr = core::ptr::addr_of_mut!(IDT);
+        for i in 0..32 {
+            (*idt_ptr)[i] = IdtEntry {
+                offset_low:  handler as u16,
+                selector:    0x8,
+                ist:         0,
+                attributes:  0x8E,
+                offset_high: (handler >> 32) as u32,
+                offset_mid:  (handler >> 16) as u16,
+                _reserved:   0,
+            };
+        }
+
+        let idtr = Idtr {
+            limit: (core::mem::size_of::<[IdtEntry; 32]>() - 1) as u16,
+            base:  idt_ptr as u64,
+        };
+
+        core::arch::asm!(
+            "lidt [{0}]",
+            in(reg) &idtr,
+            options(nostack)
+        );
+    }
+}*/
+
+
+
+
+
+
 /// Kernel entry point routine.
 /// 
 /// Since we're not depending on a runtime or an OS in this bare-metal binary,
@@ -114,20 +185,19 @@ fn load_gdt() {
 /// * `boot_info` - Raw pointer to a `BootInfo` structure from the bootloader.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
-    load_gdt();  // Must be executed before anything else
+    // Disbale maskable hardware interrupts, until we implement IDT
+    unsafe { core::arch::asm!("cli", options(nostack, preserves_flags)) };
+    
+    load_gdt();  // Load our own Global Descriptor Table (GDT)
+    crate::serial::init(globals::COM1_PORT);  // Initialize serial port writer
 
-    {
-        // Instantiate and initialize serial port writer
-        let mut writer = globals::SERIAL.lock();
-        *writer = Some(serial::SerialWriter::new(
-            globals::COM1_PORT,
-        ));
-    }
-    sprint_debug!(DebugLevel::INFO, "[INFO] Kernel started");
+    //init_idt();  // TODO: delete later when we implement our own IDT
+
+    crate::serial::print("[INFO] CrapOS kernel started\n");
 
     // Validate boot_info pointer
     if boot_info.is_null() {
-        sprint_debug!(DebugLevel::CRITICAL, "[ERROR] boot_info is null");
+        crate::serial::print("[ERROR] boot_info is null\n");
         loop { unsafe { core::arch::asm!("hlt") }};
     }
 
@@ -135,38 +205,44 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     // Sanity check for magic value
     if info.magic != 0xDEADBEEFB007CAFE {
-        sprint_debug!(DebugLevel::CRITICAL,
-            "[CRITICAL] Magic value did not match");
+        crate::serial::print("[CRITICAL] Magic value did not match\n");
         unsafe { core::arch::asm!("hlt") };
     }
-    sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Magic value matched");
-    sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Got BootInfo structure");
 
     // Dereference framebuffer_info
     let framebuffer = unsafe { &*info.framebuffer_info };
-    sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Framebuffer info read");
-
     if framebuffer.framebuffer_addr == 0 {  // Validate framebuffer address
-        sprint_debug!(DebugLevel::ERROR, "[ERROR] framebuffer address is 0");
+        crate::serial::print("\n!!! KERNEL PANIC !!!\n");
         loop { unsafe { core::arch::asm!("hlt") }}
     }
-    sprint_debug!(DebugLevel::INFO, "[INFO] Validated framebuffer addr");
+    crate::serial::print("[INFO] Validated framebuffer address\n");
 
     // Dereference memory_map_info
     let memory_map = unsafe { &*info.memory_map_info };
 
-    sprint_debug!(
-        DebugLevel::INFO, "[INFO] Mapping physical and virtual memory...");
-    {
-        // Instantiate and initialize memory manager
-        let mut memory_manager = MEMORY_MANAGER.lock();
-        *memory_manager = Some(memory_manager::MemoryManager::init(
-            &framebuffer, &memory_map));
-    }
-    sprint_debug!(DebugLevel::INFO, "[INFO] Memory mapped!");
+    crate::serial::print("[INFO] Mapping physical and virtual memory...\n");
     
+    // Initialize PMM and page tables, then perform the higher-half jump.
+    // This must happen outside any lock because it relocates the stack.
+    let mm = memory_manager::MemoryManager::init(&framebuffer, &memory_map);
     {
-        // Instantiate and initialize framebuffer writer
+        // Now that we're stable in the higher half, store it in the global
+        let mut memory_manager = MEMORY_MANAGER.lock();
+        *memory_manager = Some(mm);
+    }
+    crate::serial::print("[INFO] Memory mapped and initialized\n");
+
+    // Instantiate serial port writer
+    {
+        let mut writer = globals::SERIAL.lock();
+        *writer = Some(serial::SerialWriter::new(
+            globals::COM1_PORT,
+        ));
+        // Can now use serial port IRQ-safe global spinlock
+    }
+
+    // Instantiate and initialize framebuffer writer
+    {
         let mut writer = globals::FRAMEBUFFER.lock();
         *writer = Some(framebuffer::FramebufferWriter::new(
             framebuffer.framebuffer_addr as *mut u32,
@@ -176,7 +252,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         writer.as_mut().unwrap().clear_screen();
     }
     sprint_debug!(DebugLevel::INFO, "[INFO] Graphics initialized successfully");
-    
+
     // Draw OS banner
     fbprintln!("Hello and {} to:\n", "welcome");
     globals::FRAMEBUFFER.lock().as_mut().unwrap().draw_banner();
@@ -185,8 +261,16 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // TODO: delete this test later
     sprint_debug!(DebugLevel::INFO, "[INFO] Testing virtual memory...");
     memory_manager::test_vmm();
-    fbprintln!("[+] Memory tested!");
     sprintln!("[+] Memory tested!");
+
+    // Testing the address pointer of framebuffer
+    {
+        let mut writer = globals::FRAMEBUFFER.lock();
+        if let Some(ref mut writer) = *writer {
+            let raw_ptr: *mut u32 = writer.framebuffer;
+            sprintln!("The framebuffer address is: 0x{:X}", raw_ptr as usize);
+        }
+    }
     
 
     // Done for now.. loop forever and ever
@@ -210,7 +294,8 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 /// Crashes the system and halts the CPU.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    sprintln!("\n!!! KERNEL PANIC !!!");
+    // Print this without acquiring the spinlock
+    crate::serial::print("\n!!! KERNEL PANIC !!!\n");
 
     if let Some(location) = info.location() {
         sprintln!("Panic occurred in file '{}' at line {}", location.file(),

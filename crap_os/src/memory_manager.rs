@@ -490,6 +490,7 @@ fn init_page_tables(pmm: &mut PhysicalMemoryManager,
     let mut addr = kernel_start;
     while addr < kernel_end {
         map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE);
+        map_page(pmm, pml4, addr + globals::KERNEL_VIRTUAL_BASE, addr, PRESENT | WRITABLE);  // Map higher kernel
         addr += 0x1000;
     }
 
@@ -499,6 +500,7 @@ fn init_page_tables(pmm: &mut PhysicalMemoryManager,
     let mut addr = stack_start;
     while addr < stack_end {
         map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE | NX);
+        map_page(pmm, pml4, addr + globals::KERNEL_VIRTUAL_BASE, addr, PRESENT | WRITABLE | NX);  // Map higher kernel
         addr += 0x1000;
     }
 
@@ -509,7 +511,6 @@ fn init_page_tables(pmm: &mut PhysicalMemoryManager,
         * (framebuffer_info.framebuffer_bpp as u64 / 8);
     let fb_start = framebuffer_info.framebuffer_addr & !0xFFF;
     let fb_end = framebuffer_info.framebuffer_addr + fb_size;
-
     let mut addr = fb_start;
     while addr < fb_end {
         map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE);
@@ -525,15 +526,21 @@ fn init_page_tables(pmm: &mut PhysicalMemoryManager,
         addr += 0x1000;
     }
 
-    // Switch CR3 to the new PML4
     unsafe {
         core::arch::asm!(
-            "mov cr3, {}",
-            in(reg) new_pml4,
-            options(nostack, preserves_flags)
-    )};
+            "mov cr3, {pml4}",        // Switch CR3 to the new PML4
+            "mov rax, rsp",           // RSP -> RAX
+            "add rax, {base}",        // Increment stack pointer by kernel base
+            "mov rsp, rax",           // RAX -> RSP updates RSP with new base
+            "lea rax, [rip + 3f]",    // Increment RIP with new base and offset
+            "add rax, {base}",        // Position jump address in RAX
+            "jmp rax",                // Jump to higher half
+            "3:",                     // Numeric label to keep compiler happy
+            pml4 = in(reg) new_pml4,
+            base = const globals::KERNEL_VIRTUAL_BASE,
+        )
+    };
 
-    sprintln!("[INFO] Switched to new page tables");
     pml4
 }
 

@@ -54,7 +54,8 @@ qemu-system-x86_64 \
     -serial stdio \
     -no-reboot \
     -no-shutdown \
-    -net none
+    -net none #\        # Uncomment this and the line below to view interrupts
+    #-d int,cpu_reset   # and CPU resets while debugging
 
 # Cleanup
 rm -f ./OVMF_VARS_temp.fd

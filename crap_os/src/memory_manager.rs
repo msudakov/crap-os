@@ -19,19 +19,18 @@
 
 use crate::globals;
 
-
 const PRESENT: u64 = 1 << 0;  // Must be 1 for the entry to be valid
 const WRITABLE: u64 = 1 << 1; // If 1, writes are allowed; if 0, read-only
 // const USER: u64 = 1 << 2;     // If 1, user-mode access is allowed
 const NX: u64 = 1 << 63;
 
-// Kernel start and end tags collected from the linker.
+// Kernel physical start and physical end tags collected from the linker.
 unsafe extern "C" {
     static __kernel_phys_start: u8;
     static __kernel_phys_end: u8;
 }
 
-// This is the structure received from the bootloader
+/// Memory map structure received from the bootloader.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct MemoryMapInfo {
@@ -63,14 +62,14 @@ pub enum EfiMemoryType {
     EfiUnusableMemory          = 0x00000008,  // Don't touch
     EfiACPIReclaimMemory       = 0x00000009,  // Reclaimable after ACPI init
     EfiACPIMemoryNVS           = 0x0000000A,  // Reserve permanently
-    EfiMemoryMappedIO          = 0x0000000B,  // MMIO — don't touch
-    EfiMemoryMappedIOPortSpace = 0x0000000C,  // MMIO — don't touch
+    EfiMemoryMappedIO          = 0x0000000B,  // MMIO - don't touch
+    EfiMemoryMappedIOPortSpace = 0x0000000C,  // MMIO - don't touch
     EfiPalCode                 = 0x0000000D,  // Processor Abstraction Layer
     EfiPersistentMemory        = 0x0000000E,  // Don't touch
     EfiMaxMemoryType           = 0x0000000F,  // Reserved
 }
 
-// Memory descriptor structure provided by the UEFI bootloader
+/// Memory descriptor structure provided by the UEFI bootloader.
 #[repr(C)]
 #[derive(Copy, Clone)]
 pub struct EfiMemoryDescriptor {
@@ -94,6 +93,30 @@ impl EfiMemoryDescriptor {
     }
 }
 
+/// GDT (Global Descriptor Table). The GDT must exist and the segment selectors
+/// loaded into the segment registers must reference valid descriptors. The
+/// `align(8)` ensures the table is 8-byte aligned, which is required by the
+/// the x86_64 architecture.
+#[repr(C, align(8))]
+struct Gdt {
+    null:    u64,  // The null descriptor
+    code64:  u64,  // Entry 1 (selector 0x08): 64-bit kernel code segment
+    data64:  u64,  // Entry 2 (selector 0x10): 64-bit kernel data segment
+}
+
+// The kernel's statically allocated GDT, stored in the `.rodata` section.
+///
+/// Using a `static` (rather than stack-allocated) ensures the table remains
+/// alive for the entire life of the kernel and is not accidentally freed.
+/// When the _start routine is invoked from the bootloader, we're still running
+/// under UEFI's GDT and CS segment. This creates our own GDT that the kernel
+/// loads at the very start of the routine.
+static GDT: Gdt = Gdt {
+    null:   0x0000000000000000,
+    code64: 0x00AF9A000000FFFF,  // 64-bit code, ring 0
+    data64: 0x00CF92000000FFFF,  // 64-bit data, ring 0
+};
+
 // =============================================================================
 // Physical Memory Manager
 // =============================================================================
@@ -106,8 +129,8 @@ impl EfiMemoryDescriptor {
 // There are several methods of keeping track of physical pages. For example,
 // the bitmap method is able to locate a new free page in time O(n) when
 // unoptimized and down to O(log n) with some optimizations. However, this
-// implementation uses a simpler method that is able to fetch a new page
-// in runtime of O(1), or in deterministic time.
+// implementation uses a simpler method that is able to fetch a new page and
+// also release a page in runtime of O(1), or in deterministic time.
 //
 // Specifically, it uses a stack-type (LIFO) singly-linked list.
 // Besides a counter for the number of free pages remaining in RAM, its
@@ -125,6 +148,7 @@ impl EfiMemoryDescriptor {
 // next-in-line page for later allocations. It then updates the head address
 // to point to the following page and returns the requsted page to the caller.
 
+/// Physical Memory Manager strcuture.
 #[allow(dead_code)]
 pub struct PhysicalMemoryManager {
     kernel_load_addr: u64,       // Where the bootloader mapped the kernel image
@@ -136,10 +160,11 @@ pub struct PhysicalMemoryManager {
     memory_map_addr: u64,        // Memory map structure address from bootloader
     memory_map_size: u64,        // Total memory map size
     memory_map_desc_size: u64,   // Size of a memory map descriptor structure
+    kernel_start: u64,           // From `__kernel_phys_start` linker tag
+    kernel_end: u64,             // From `__kernel_phys_end` linker tag
+    is_higher_half: bool,        // True if running in higher-half kernel
     free_list_head: Option<u64>, // Physical address of the next free page
     free_pages: u64,             // Total number of remaining free pages
-
-    higher_half: bool,           // True if running in higher-half kernel
 }
 
 impl PhysicalMemoryManager {
@@ -158,6 +183,9 @@ impl PhysicalMemoryManager {
             (framebuffer_info.framebuffer_width as u64) *
             (framebuffer_info.framebuffer_bpp as u64 / 8);
 
+        let kernel_start = core::ptr::addr_of!(__kernel_phys_start) as u64;
+        let kernel_end = core::ptr::addr_of!(__kernel_phys_end) as u64;
+
         // Instantiate the Physical Memory Manager
         let mut pmm = PhysicalMemoryManager {
             framebuffer_addr: framebuffer_info.framebuffer_addr,
@@ -169,12 +197,14 @@ impl PhysicalMemoryManager {
             kernel_image_size: memory_map.kernel_image_size,
             kernel_stack_base_addr: memory_map.stack_base_addr,
             kernel_stack_size: memory_map.stack_size,
-            free_list_head: None,  // Singly-linked list of free page frames
-            free_pages: 0,         // Counter of the free page frames
-            higher_half: false,
+            kernel_start: kernel_start,
+            kernel_end: kernel_end,
+            is_higher_half: false,  // Default this to false and flip later on
+            free_list_head: None,   // Singly-linked list of free page frames
+            free_pages: 0,          // Counter of the free page frames
         };
 
-        // Initialize the PMM
+        // Initialize the descriptor pointer and compute the number of segments
         let mut descriptor_addr = pmm.memory_map_addr;
         let num_segments = pmm.memory_map_size / pmm.memory_map_desc_size;
 
@@ -186,9 +216,8 @@ impl PhysicalMemoryManager {
             // Only seed the free list with conventional memory for now.
             // Boot services and loader memory are reclaimed later in
             // reclaim_boot_memory(), after page tables are fully established.
-            if memory_descriptor.region_type != EfiMemoryType::EfiConventionalMemory {
-                continue;
-            }
+            if memory_descriptor.region_type !=
+                EfiMemoryType::EfiConventionalMemory { continue; }
 
             for i in 0..memory_descriptor.num_pages {
                 let page_start_addr = memory_descriptor.physical_start+i*0x1000;
@@ -208,10 +237,7 @@ impl PhysicalMemoryManager {
                 }
                 
                 // Detect collision on the mapped kernel image memory region
-                let kernel_start = core::ptr::addr_of!(__kernel_phys_start) as u64;
-                let kernel_end = core::ptr::addr_of!(__kernel_phys_end) as u64;
-                if page_overlaps(page_start_addr, page_end_addr,
-                    kernel_start,
+                if page_overlaps(page_start_addr, page_end_addr, kernel_start,
                     kernel_end
                 ) {
                     continue;
@@ -242,6 +268,9 @@ impl PhysicalMemoryManager {
 
     /// Writes the current head into the first 8 bytes of the given page, then
     /// updates the head with the address of this page.
+    /// 
+    /// Computes the virtual address with the physical map base offset if the
+    /// kernel is running in the higher-half virtual memory space.
     ///
     /// # Arguments
     ///
@@ -250,14 +279,8 @@ impl PhysicalMemoryManager {
     /// # Safety
     /// 
     /// Dereferences a raw pointer by address value.
-    /*fn free_page(&mut self, address: u64) {
-        let ptr = address as *mut u64;
-        unsafe { *ptr =  self.free_list_head.unwrap_or(0) };
-        self.free_list_head = Some(address);
-        self.free_pages += 1;
-    }*/
     fn free_page(&mut self, address: u64) {
-        let virt = if self.higher_half {
+        let virt = if self.is_higher_half {
             address + globals::KERNEL_PHYSICAL_MAP_BASE
         } else {
             address
@@ -270,6 +293,9 @@ impl PhysicalMemoryManager {
 
     /// Fetches the next free physical page and allocates it by updating the
     /// head to the allocated page's next pointer in its first 8 bytes.
+    /// 
+    /// Computes the virtual address with the physical map base offset if the
+    /// kernel is running in the higher-half virtual memory space.
     ///
     /// # Returns
     ///
@@ -279,23 +305,9 @@ impl PhysicalMemoryManager {
     /// # Safety
     /// 
     /// Dereferences a raw pointer by address value.
-    /*fn alloc_page(&mut self) -> Option<u64> {
-        let head = self.free_list_head?;
-        let next = unsafe { *(head as *const u64) };
-
-        self.free_list_head = if next == 0 {
-            None
-        }
-        else {
-            Some(next)
-        };
-
-        self.free_pages -= 1;
-        Some(head)
-    }*/
     fn alloc_page(&mut self) -> Option<u64> {
         let head = self.free_list_head?;
-        let virt = if self.higher_half {
+        let virt = if self.is_higher_half {
             head + globals::KERNEL_PHYSICAL_MAP_BASE
         } else {
             head
@@ -333,9 +345,9 @@ fn page_overlaps(page_start: u64, page_end: u64, region_start: u64,
 // =============================================================================
 // Virtual Memory Manager
 // =============================================================================
-
-// On x86-64 systems with 4-level paging, which is provided by UEFI, the
-// paging hierarchy is PML4 -> PDPT -> PD -> PT -> physical page frame, where:
+//
+// On x86-64 systems with 4-level paging, the paging hierarchy is:
+//   PML4 -> PDPT -> PD -> PT -> physical page frame, where:
 //   * PML4 - Page Map Level 4, contains 512 PML4Es
 //   * PDPT - Page Directory Pointer Table, contains 512 PDPTEs 
 //   * PD   - Page Directory, contains 512 PDEs
@@ -437,10 +449,9 @@ fn map_page(pmm: &mut PhysicalMemoryManager, pml4_addr: *mut u64,
 fn refresh_tlb() {
     unsafe {
         core::arch::asm!(
-            "mov rax, cr3",
-            "mov cr3, rax",
-            out("rax") _,
-            options(nostack, preserves_flags)
+            "mov rax, cr3",  // Read current CR3 (PML4 address) into rax
+            "mov cr3, rax",  // Write it back; this flushes the TLB.
+            out("rax") _,    // Tell the compiler RAX is clobbered (no output).
         );
     }
 }
@@ -508,6 +519,7 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
     zero_out_page(new_pml4);
     let pml4 = new_pml4 as *mut u64;
 
+    // Initialize the descriptor pointer and compute the number of segments
     let mut descriptor_addr = memory_map.memory_map_addr;
     let num_segments = memory_map.memory_map_size / memory_map.descriptor_size;
 
@@ -519,14 +531,15 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
         // does not fault during the brief window between CR3 load and the
         // higher-half jump. These identity maps are removed in
         // init_higher_half().
-        if !(descriptor.region_type == EfiMemoryType::EfiConventionalMemory ||
-            descriptor.region_type == EfiMemoryType::EfiLoaderCode ||
-            descriptor.region_type == EfiMemoryType::EfiLoaderData ||
-            descriptor.region_type == EfiMemoryType::EfiBootServicesCode ||
-            descriptor.region_type == EfiMemoryType::EfiBootServicesData
-        ) {
-            continue;
-        }
+        let should_map = matches!(
+            descriptor.region_type,
+            EfiMemoryType::EfiConventionalMemory |
+            EfiMemoryType::EfiLoaderCode         |
+            EfiMemoryType::EfiLoaderData         |
+            EfiMemoryType::EfiBootServicesCode   |
+            EfiMemoryType::EfiBootServicesData
+        );
+        if !should_map { continue; }
 
         for i in 0..descriptor.num_pages {
             let phys = descriptor.physical_start + i * 0x1000;
@@ -535,17 +548,15 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
     }
 
     // Identity map + higher-half map: kernel image
-    let kernel_start = core::ptr::addr_of!(__kernel_phys_start) as u64;
-    let kernel_end = core::ptr::addr_of!(__kernel_phys_end) as u64;
-    let mut addr = kernel_start;
-    while addr < kernel_end {
+    let mut addr = pmm.kernel_start;
+    while addr < pmm.kernel_end {
         map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE);
         map_page(pmm, pml4, addr + globals::KERNEL_VIRTUAL_BASE, addr,
             PRESENT | WRITABLE);
         addr += 0x1000;
     }
 
-    // Identity map + higher-half map: kernel stack (NX — never execute stack)
+    // Identity map + higher-half map: kernel stack with NX bit
     let stack_start = memory_map.stack_base_addr & !0xFFF;
     let stack_end = memory_map.stack_base_addr + memory_map.stack_size;
     let mut addr = stack_start;
@@ -584,10 +595,15 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
 }
 
 // =============================================================================
-// Higher-half transition (called after init_page_tables)
+// Higher-Half Kernel Transition
+// This part is called after init_page_tables, and it handles the critical
+// transition from a "low" (identity-mapped) memory layout set up by the UEFI
+// bootloader, to a "higher-half" kernel layout where the kernel and all
+// physical memory are accessed through high virtual addresses.
 // =============================================================================
 
-/// Builds a direct map where every physical address P is accessible at
+/// Builds a direct physical map, a contiguous window of virtual address space,
+/// where every physical address P is accessible at
 /// (KERNEL_PHYSICAL_MAP_BASE + P).
 /// 
 /// This is a standard approach that lets the rest of the kernel avoid reasoning
@@ -599,24 +615,28 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
 /// 
 /// # Arguments
 ///
-/// * `pmm` - Physical memory manager.
-/// * `pml4` - PML4 table.
-/// * `memory_map` - Memory map information structure from the bootloader.
+/// * `pmm` - The physical memory manager, used to allocate page-table pages.
+/// * `pml4` - Raw pointer to the root of the current active page table (PML4).
+/// * `memory_map` - The UEFI memory map describing all physical memory regions.
 fn build_direct_map(pmm: &mut PhysicalMemoryManager, pml4: *mut u64,
-    memory_map: &MemoryMapInfo,
+    memory_map: &MemoryMapInfo
 ) {
+    // The virtual base at which physical address 0 will appear.
+    // E.g., physical 0x1000 -> virtual KERNEL_PHYSICAL_MAP_BASE + 0x1000.
     let phys_map_base = globals::KERNEL_PHYSICAL_MAP_BASE;
+
+    // Initialize the descriptor pointer and compute the number of segments
     let mut descriptor_addr = memory_map.memory_map_addr;
     let num_segments = memory_map.memory_map_size / memory_map.descriptor_size;
 
     for _ in 0..num_segments {
-        let desc = EfiMemoryDescriptor::new(descriptor_addr);
+        let descriptor = EfiMemoryDescriptor::new(descriptor_addr);
         descriptor_addr += memory_map.descriptor_size;
 
-        // MMIO and unknown types are intentionally excluded — they have
+        // MMIO and unknown types are intentionally excluded. They have
         // device-specific mapping requirements and must never be touched here.
         let should_map = matches!(
-            desc.region_type,
+            descriptor.region_type,
             EfiMemoryType::EfiConventionalMemory   |
             EfiMemoryType::EfiLoaderCode           |
             EfiMemoryType::EfiLoaderData           |
@@ -629,38 +649,59 @@ fn build_direct_map(pmm: &mut PhysicalMemoryManager, pml4: *mut u64,
         );
         if !should_map { continue; }
 
-        let flags = match desc.region_type {
+        // Choose page-table flags appropriate for this region type. Runtime
+        // services code needs to be executable so UEFI functions can run.
+        // Everything else is marked NX as a security measure.
+        let flags = match descriptor.region_type {
             EfiMemoryType::EfiRuntimeServicesCode => PRESENT | WRITABLE,
             _                                     => PRESENT | WRITABLE | NX,
         };
 
-        for i in 0..desc.num_pages {
-            let phys = desc.physical_start + i * 0x1000;
+        // Map every 4 KB page in this descriptor's physical range
+        for i in 0..descriptor.num_pages {
+            let phys = descriptor.physical_start + i * 0x1000;
             map_page(pmm, pml4, phys_map_base + phys, phys, flags);
         }
     }
 }
 
-
-
-
-
-/// Maps the framebuffer to its permanent virtual address at FB_VIRT_BASE.
-/// After this, the framebuffer driver should update its base pointer and
-/// never reference the old identity-mapped address again.
-fn map_framebuffer_higher_half(
-    pmm:             &mut PhysicalMemoryManager,
-    pml4:            *mut u64,
-    framebuffer_info: &crate::FramebufferInfo,
+/// Maps the linear GPU framebuffer to its permanent virtual address in the
+/// kernel's higher-half virtual address space.
+///
+/// After the identity maps are removed, the kernel cannot access the
+/// framebuffer through its physical address. This function creates a virtual
+/// mapping at `KERNEL_FRAMEBUFFER_VIRTUAL_BASE` so the kernel's graphics code
+/// can continue drawing to the screen.
+///
+/// # Arguments
+/// 
+/// * `pmm` - Physical memory manager (for allocating page-table pages).
+/// * `pml4` - Root of the active page table.
+/// * `framebuffer_info` - UEFI-provided information about the framebuffer.
+fn map_framebuffer_higher_half(pmm: &mut PhysicalMemoryManager, pml4: *mut u64,
+    framebuffer_info: &crate::FramebufferInfo
 ) {
+    // Calculate the total byte size of the framebuffer. Height * width gives
+    // the total number of pixels; then, multiplying by (bpp / 8) converts
+    // bits-per-pixel to bytes-per-pixel.
     let fb_size = (framebuffer_info.framebuffer_height as u64)
-        * (framebuffer_info.framebuffer_width  as u64)
-        * (framebuffer_info.framebuffer_bpp    as u64 / 8);
+        * (framebuffer_info.framebuffer_width as u64)
+        * (framebuffer_info.framebuffer_bpp as u64 / 8);
 
+    // Round the framebuffer's physical start address down to a 4 KB boundary.
+    // `& !0xFFF` clears the low 12 bits, aligning downward. This ensures we
+    // don't miss the partial first page if the framebuffer doesn't start on a
+    // page boundary.
     let fb_phys_start = framebuffer_info.framebuffer_addr & !0xFFF;
+
+    // Round the framebuffer's physical end address up to a 4 KiB boundary.
+    // Adding `0xFFF` before masking ensures we round up rather than truncating.
+    // This guarantees we don't miss the partial last page.
     let fb_phys_end   = (framebuffer_info.framebuffer_addr + fb_size + 0xFFF)
         & !0xFFF;
 
+    // Walk through every 4 KB page in the framebuffer's physical range and
+    // create a virtual mapping for each one.
     let mut phys = fb_phys_start;
     let mut virt = globals::KERNEL_FRAMEBUFFER_VIRTUAL_BASE;
     while phys < fb_phys_end {
@@ -670,71 +711,218 @@ fn map_framebuffer_higher_half(
     }
 }
 
-/// Removes all lower-half identity maps by zeroing PML4 entries 0–255, then
-/// flushes the TLB. After this point no address below 0xFFFF800000000000 is
-/// valid. This is the point of no return for identity-mapped access.
-fn remove_identity_maps(pml4_phys: u64) {
-    // PML4 entries 0–255 span the entire lower half of the canonical address
-    // space (0x0000_0000_0000_0000 – 0x0000_7FFF_FFFF_FFFF). Entries 256–511
-    // are the higher half and must be left intact.
-    
-    let pml4_virt = (pml4_phys + globals::KERNEL_PHYSICAL_MAP_BASE) as *mut u64;
-    //for i in 0..256usize {
-    for i in 0..256usize {
-        //crate::serial::print("[INFO] TEST X\n");
-        unsafe { pml4_virt.add(i).write_volatile(0u64) };
-    }
-    
-    //refresh_tlb();
-    //crate::serial::print("[INFO] TEST 4.3\n");
-    // Inline the CR3 reload here rather than calling refresh_tlb().
-    // A function call after zeroing the PML4 entries may cause the
-    // compiler to emit a stack access before the TLB is flushed,
-    // hitting a now-unmapped low address and triple faulting.
+/// Updates the GDT and IDT descriptor registers so they point to the virtual
+/// (higher-half) addresses of those tables, rather than their old physical
+/// (identity-mapped) addresses. This must be called after `build_direct_map()`
+/// and before `remove_identity_maps()`.
+///
+/// The GDT (Global Descriptor Table) and IDT (Interrupt Descriptor Table) are
+/// located in physical memory. Before the higher-half switch, the CPU's GDTR
+/// and IDTR registers contained their physical addresses (which worked because
+/// identity mapping made phys == virt).
+/// 
+/// # Safety
+/// 
+/// Uses inline assembly to store and reload GDTR and IDTR.
+fn reload_gdt_and_idt() {
+    // Buffers to hold the 10-byte (2 bytes limit + 8 bytes base) GDTR and IDTR
+    // pseudo-descriptor structures.
+    let mut gdt_desc = [0u8; 10];
+    let mut idt_desc = [0u8; 10];
+
     unsafe {
         core::arch::asm!(
-            "mov rax, cr3",
-            "mov cr3, rax",
-            out("rax") _,
-        );
-    }
-    // Nothing after this — no stack access, no function epilogue,
-    // no register restore. The caller's code resumes in higher half
-    // with a clean TLB.
+            "sgdt [{gdt}]",     // Store current GDTR into memory at gdt_desc
+            "sidt [{idt}]",     // Store current IDTR into memory at idt_desc
+            gdt = in(reg) gdt_desc.as_mut_ptr(),  // Pass pointer to gdt_desc
+            idt = in(reg) idt_desc.as_mut_ptr(),  // Pass pointer to idt_desc
+        )
+    };
+
+    // Decode the current (physical-address) descriptors by extracting the
+    // 64-bit physical base address from bytes 2–9
+    let gdt_phys = u64::from_le_bytes(gdt_desc[2..10].try_into().unwrap());
+    let idt_phys = u64::from_le_bytes(idt_desc[2..10].try_into().unwrap());
+
+    // Extract the 16-bit limit of the GDT and IDT (bytes 0–1)
+    let gdt_limit = u16::from_le_bytes(gdt_desc[0..2].try_into().unwrap());
+    let idt_limit = u16::from_le_bytes(idt_desc[0..2].try_into().unwrap());
+
+    // Compute the direct-map virtual addresses
+    let gdt_virt = gdt_phys + globals::KERNEL_PHYSICAL_MAP_BASE;
+    let idt_virt = idt_phys + globals::KERNEL_PHYSICAL_MAP_BASE;
+
+    // Build the new 10-byte pseudo-descriptors with virtual base addresses 
+    let mut new_gdt = [0u8; 10];
+    let mut new_idt = [0u8; 10];
+
+    // Write the limit (unchanged) into bytes 0–1
+    new_gdt[0..2].copy_from_slice(&gdt_limit.to_le_bytes());
+    new_idt[0..2].copy_from_slice(&idt_limit.to_le_bytes());
+
+    // Write the new virtual base address into bytes 2–9
+    new_gdt[2..10].copy_from_slice(&gdt_virt.to_le_bytes());
+    new_idt[2..10].copy_from_slice(&idt_virt.to_le_bytes());
+
+    // Load the updated descriptors into GDTR and IDTR
+    unsafe {
+            core::arch::asm!(
+            "lgdt [{gdt}]",  // Load the new GDT descriptor
+            "lidt [{idt}]",  // Load the new IDT descriptor
+            gdt = in(reg) new_gdt.as_ptr(), // Pointer to the new GDT descriptor
+            idt = in(reg) new_idt.as_ptr(), // Pointer to the new IDT descriptor
+        )
+    };
 }
 
-/// Reclaims bootloader and boot-services memory back into the PMM free list.
+/// Installs the kernel's statically defined GDT and performs a far return
+/// to reload the Code Segment (CS) register with the new 64-bit code selector.
 ///
-/// Must be called after remove_identity_maps() — by this point the CPU no
-/// longer needs those pages mapped, and we're safe to recycle them.
+/// The far return is needed because  the CS register cannot be changed with a
+/// normal `MOV` instruction. The only ways to update CS in long mode are:
+///   - A far CALL / far JMP / far RET (which load a new CS:RIP pair atomically)
+///   - An interrupt return (IRETQ)
 ///
-/// The following are intentionally NOT reclaimed here:
-///   - EfiRuntimeServicesCode/Data  (firmware reserved — do not touch)
-///   - EfiACPIMemoryNVS             (ACPI firmware tables — permanent)
+/// The trick used here is to push a fake "return address" (new CS selector +
+/// new RIP) onto the stack and execute `RETFQ` (64-bit far return), which pops
+/// CS and RIP simultaneously, effectively performing a long jump to the
+/// instruction after `RETFQ` with the new CS loaded.
+///
+/// # Safety
+/// 
+/// Uses inline assembly to load the kernel's own GDT.
+fn load_gdt() {
+    unsafe {
+        // Build a 10-byte GDTR pseudo-descriptor on the stack as a byte array
+        // to avoid any alignment or packed struct issues.
+        let mut gdtr = [0u8; 10];
+
+        // The reason for `- 1` is that the CPU adds 1 when interpreting the
+        // size of GDT structure.
+        let limit = (core::mem::size_of::<Gdt>() - 1) as u16;
+
+        // Using the virtual address of the static GDT object
+        let base  = &GDT as *const Gdt as u64;
+
+        // Pack limit (bytes 0–1) and base (bytes 2–9) in little-endian order
+        gdtr[0..2].copy_from_slice(&limit.to_le_bytes());
+        gdtr[2..10].copy_from_slice(&base.to_le_bytes());
+
+        core::arch::asm!(
+            "lgdt [{gdtr}]",  // Load the new GDT from our gdtr buffer
+            "push 0x8",       // Push the new code segment selector
+            "lea rax, [rip + 3f]",  // Compute the address of label "3:"
+            "push rax",  // Push it as the return address
+            "retfq",     // Far return: execution continues at label 3 below
+            "3:",        // Execution resumes here with the new CS loaded
+            "mov ax, 0x10",  // Reload the GDT index 2 segment register
+            "mov ds, ax",    // Reload the data segment
+            "mov es, ax",    // Reload the extra segment
+            "mov ss, ax",    // Reload the stack segment
+            "mov fs, ax",    // Reload FS
+            "mov gs, ax",    // Reload GS
+            gdtr = in(reg) gdtr.as_ptr(),  // Pointer to the GDTR buffer
+            out("rax") _,    // RAX is clobbered; discard the output
+        )
+    };
+}
+
+/// Removes the identity-mapped lower half of the virtual address space by
+/// zeroing out the lower 256 PML4 entries to unmap everything below the
+/// halfway point.
+///
+/// After modifying the page tables, CR3 must be reloaded so the CPU discards
+/// any cached translations in TLB. After this point no address below
+/// 0xFFFF800000000000 is valid. This is the point of no return for
+/// identity-mapped access. PML4 entries 0–255 span the entire lower half of
+/// the canonical address space (0x0000000000000000 – 0x00007FFFFFFFFFFF).
+/// Entries 256–511 are the higher half and must be left intact.
+///
+/// # Arguments
+/// * `pml4_phys` - The physical address of the PML4 table. We need the physical
+///   address to compute the new virtual address through the direct map.
+/// 
+/// # Safety
+/// 
+/// Uses `write_volatile` to prevent the compiler from optimising these away.
+fn remove_identity_maps(pml4_phys: u64) {
+    // Convert the physical PML4 address to a virtual address through the
+    // direct physical map that we just built.
+    let pml4_virt = (pml4_phys + globals::KERNEL_PHYSICAL_MAP_BASE) as *mut u64;
+    
+    // Zero out the first 256 PML4 entries (the lower half).
+    for i in 0..256usize {
+        unsafe { pml4_virt.add(i).write_volatile(0u64) };
+    }
+
+    // Flush the entire TLB by writing the current CR3 value back to CR3.
+    // CR3 holds the physical address of the active PML4; rewriting it forces
+    // the CPU to discard all cached page-table walks. We need to use an
+    // inline CR3 reload here rather than calling refresh_tlb(). A function call
+    // after zeroing the PML4 entries may cause the compiler to emit a stack
+    // access before the TLB is flushed, hitting a now-unmapped low address and
+    // triple faulting.
+    unsafe {
+        core::arch::asm!(
+            "mov rax, cr3",  // Read current CR3 (PML4 address) into rax
+            "mov cr3, rax",  // Write it back; this flushes the TLB.
+            out("rax") _,    // Tell the compiler RAX is clobbered (no output).
+        );
+    }
+}
+
+/// Returns all bootloader and UEFI boot-services memory to the physical memory
+/// allocator so the kernel can reuse those pages as general-purpose RAM.
+///
+/// These pages could not be freed earlier because they contained data the
+/// kernel needed during initialisation, but they are now safe to reclaim as the
+/// last step in `init_higher_half`. The following are intentionally not
+/// reclaimed here:
+///   - EfiRuntimeServicesCode/Data  (firmware reserved - do not touch)
+///   - EfiACPIMemoryNVS             (ACPI firmware tables - permanent)
 ///   - EfiACPIReclaimMemory         (reclaim separately after ACPI init)
 ///   - The memory map buffer itself (still being iterated)
 ///   - The kernel image and stack
 ///
-/// EfiConventionalMemory pages are already in the PMM from init() and must
+/// The EfiConventionalMemory pages are already in the PMM from init() and must
 /// not be double-freed.
-/*#[allow(dead_code)]
-fn reclaim_boot_memory(
-    pmm:        &mut PhysicalMemoryManager,
-    memory_map: &MemoryMapInfo,
+///
+/// # Arguments
+/// 
+/// * `pmm` - The physical memory manager to free pages back into.
+/// * `memory_map` - The UEFI memory map (now accessed through the direct map
+///   using its virtual address).
+///
+/// # Safety
+/// 
+/// This function is marked `#[inline(never)]` to ensure the compiler does not
+/// inline it into `init_higher_half`. Inlining could cause the compiler to
+/// keep local variables (like the loop counter or descriptor pointer) in
+/// registers or on the stack across the point where we free the stack pages
+/// themselves, which could be catastrophic. By keeping it a separate
+/// function call, the stack frame is set up and torn down cleanly.
+#[inline(never)]
+fn reclaim_boot_memory(pmm: &mut PhysicalMemoryManager,
+    memory_map: &MemoryMapInfo
 ) {
-    let mut descriptor_addr = memory_map.memory_map_addr;
+    // Obtain the virtual address of the first descriptor
+    let mut descriptor_addr = memory_map.memory_map_addr
+        + globals::KERNEL_PHYSICAL_MAP_BASE;
+    
+    // Number of descriptor entries in the map
     let num_segments = memory_map.memory_map_size / memory_map.descriptor_size;
 
+    // Physical address range occupied by the memory map array itself. We must
+    // not free pages that contain the map while we are iterating over it.
     let map_start    = memory_map.memory_map_addr;
     let map_end      = memory_map.memory_map_addr + memory_map.memory_map_size;
-    let kernel_start = core::ptr::addr_of!(__kernel_phys_start) as u64;
-    let kernel_end   = core::ptr::addr_of!(__kernel_phys_end)   as u64;
 
     for _ in 0..num_segments {
+        // Parse the current descriptor and advance the address for next loop
         let desc = EfiMemoryDescriptor::new(descriptor_addr);
         descriptor_addr += memory_map.descriptor_size;
 
-        // Only these types become unconditionally free after EBS
+        // We only reclaim loader and boot-services pages
         let reclaimable = matches!(
             desc.region_type,
             EfiMemoryType::EfiLoaderCode       |
@@ -744,257 +932,198 @@ fn reclaim_boot_memory(
         );
         if !reclaimable { continue; }
 
+        // Iterate over each 4 KB page within this descriptor's range
         for i in 0..desc.num_pages {
+            // Physical start and end addresses of this page (inclusive)
             let page_start = desc.physical_start + i * 0x1000;
-            let page_end   = page_start + 0x1000 - 1;
+            let page_end = page_start + 0x1000 - 1;
 
-            // Guard: never free the memory map buffer we're currently reading
+            if page_start == 0 { continue; }  // Always skip the null/zero page
+
+            // Skip pages that overlap with the UEFI memory map itself
             if page_overlaps(page_start, page_end, map_start, map_end) {
                 continue;
             }
-            // Guard: never free the kernel image
-            if page_overlaps(page_start, page_end, kernel_start, kernel_end) {
+
+            // Skip pages that overlap with the kernel image
+            if page_overlaps(page_start, page_end, pmm.kernel_start,
+                pmm.kernel_end) {
                 continue;
             }
-            // Guard: never free the kernel stack
-            if page_overlaps(
-                page_start, page_end,
-                pmm.kernel_stack_base_addr,
-                pmm.kernel_stack_base_addr + pmm.kernel_stack_size,
-            ) { continue; }
 
+            // Skip pages that overlap with the kernel stack.
+            if page_overlaps(page_start, page_end, pmm.kernel_stack_base_addr,
+                pmm.kernel_stack_base_addr + pmm.kernel_stack_size,
+            ) { 
+                continue;
+            }
+
+            // All safety checks passed; return this page to the free list
             pmm.free_page(page_start);
         }
     }
-}*/
-
-
-
-
-/// Reloads the GDTR and IDTR with their direct-map virtual addresses.
-/// Must be called after build_direct_map() and before remove_identity_maps().
-fn reload_gdt_and_idt() {
-    // Read the current physical base addresses from the GDTR and IDTR
-    let mut gdt_desc = [0u8; 10]; // 2 bytes limit + 8 bytes base
-    let mut idt_desc = [0u8; 10];
-
-    unsafe {
-        core::arch::asm!(
-        "sgdt [{gdt}]",
-        "sidt [{idt}]",
-        gdt = in(reg) gdt_desc.as_mut_ptr(),
-        idt = in(reg) idt_desc.as_mut_ptr(),
-        )
-    };
-
-    // Extract the 8-byte base address from bytes [2..10]
-    let gdt_phys = u64::from_le_bytes(gdt_desc[2..10].try_into().unwrap());
-    let idt_phys = u64::from_le_bytes(idt_desc[2..10].try_into().unwrap());
-    let gdt_limit = u16::from_le_bytes(gdt_desc[0..2].try_into().unwrap());
-    let idt_limit = u16::from_le_bytes(idt_desc[0..2].try_into().unwrap());
-
-    // Compute the direct-map virtual addresses
-    let gdt_virt = gdt_phys + globals::KERNEL_PHYSICAL_MAP_BASE;
-    let idt_virt = idt_phys + globals::KERNEL_PHYSICAL_MAP_BASE;
-
-    // Build new descriptors with the virtual base addresses and reload
-    let mut new_gdt = [0u8; 10];
-    let mut new_idt = [0u8; 10];
-
-    new_gdt[0..2].copy_from_slice(&gdt_limit.to_le_bytes());
-    new_gdt[2..10].copy_from_slice(&gdt_virt.to_le_bytes());
-    new_idt[0..2].copy_from_slice(&idt_limit.to_le_bytes());
-    new_idt[2..10].copy_from_slice(&idt_virt.to_le_bytes());
-
-    unsafe {
-        core::arch::asm!(
-        "lgdt [{gdt}]",
-        "lidt [{idt}]",
-        gdt = in(reg) new_gdt.as_ptr(),
-        idt = in(reg) new_idt.as_ptr(),
-    )
-    };
 }
-
-
-
-
-// Structure for the Global Descriptor Table
-#[repr(C, align(8))]
-struct Gdt {
-    null:    u64,
-    code64:  u64,
-    data64:  u64,
-}
-
-/*
-    When the _start routine is invoked from the bootloader, we're still
-    running under UEFI's GDT and CS segment. This creates our own GDT that the
-    kernel loads at the very start of the routine.
-*/
-static GDT: Gdt = Gdt {
-    null:   0x0000000000000000,
-    code64: 0x00AF9A000000FFFF,  // 64-bit code, ring 0
-    data64: 0x00CF92000000FFFF,  // 64-bit data, ring 0
-};
-
-/// Replaces the bootloader's GDT with the kernel's GDT.
-/// 
-/// # Safety
-/// 
-/// Uses inline assembly to load the OS kernel's own GDT.
-fn load_gdt() {
-    unsafe {
-        // Build a 10-byte GDTR directly on the stack as a byte array
-        // to avoid any alignment or packed struct issues
-        let mut gdtr = [0u8; 10];
-        let limit = (core::mem::size_of::<Gdt>() - 1) as u16;
-        let base  = &GDT as *const Gdt as u64;
-
-        gdtr[0..2].copy_from_slice(&limit.to_le_bytes());
-        gdtr[2..10].copy_from_slice(&base.to_le_bytes());
-
-        core::arch::asm!(
-            "lgdt [{gdtr}]",
-            "push 0x8",
-            "lea rax, [rip + 3f]",
-            "push rax",
-            "retfq",
-            "3:",
-            "mov ax, 0x10",
-            "mov ds, ax",
-            "mov es, ax",
-            "mov ss, ax",
-            "mov fs, ax",
-            "mov gs, ax",
-            gdtr = in(reg) gdtr.as_ptr(),
-            out("rax") _,
-        )
-    };
-}
-
-
-
-
-
 
 // =============================================================================
-// Global Memory Manager Interface
+// MemoryManager - public interface
 // =============================================================================
 //
 // This interface encapsulates the needed physical and virtual memory management
 // structures and functionality, and exports them to the rest of the system.
 // This interface is implemented with IRQ-safe spinlock in the system globals.
 
+/// The top-level Memory Manager. It owns the physical memory allocator (PMM)
+/// and the root of the page-table hierarchy (PML4).
+///
+/// After construction via [`MemoryManager::init`], the caller must invoke
+/// [`MemoryManager::init_higher_half`] to complete the transition to the
+/// higher-half kernel virtual address space.
 pub struct MemoryManager {
+    /// The physical memory manager tracks which physical pages are free/used
+    /// and services `alloc_page` / `free_page` requests.
     pmm: PhysicalMemoryManager,
-    pml4: *mut u64,  // virtual (direct-map) address, used after higher-half
-    pml4_phys: u64,  // physical address, used during early init
+
+    /// Virtual address of the PML4 page-table root. It changes after the
+    /// higher-half switch from a physical address to a virtual address through
+    /// the direct map.
+    pml4: *mut u64,
+
+    /// Physical address of the PML4 root, used during early init. It stays
+    /// constant throughout, even after the higher-half switch. It is needed
+    /// by `remove_identity_maps`.
+    pml4_phys: u64,
 }
 
 #[allow(dead_code)]
 impl MemoryManager {
-    /// Instantiates and initializes physical memory manager, maps available
-    /// physical memory, and then initializes virtual page tables.
-    /// 
-    /// # Arguments
+    /// Creates a new `MemoryManager` and enables the No-Execute (NX) bit
+    /// in the CPU's EFER (Extended Feature Enable Register) MSR (Model-Specific
+    /// Register).
     ///
-    /// * `framebuffer_info` - Framebuffer info structure from the bootloader.
-    /// * `memory_map` - Memory map information structure from the bootloader.
+    /// The NX bit (bit 11 of EFER) enables page-level execute-disable support.
+    /// When set, individual page-table entries can mark pages as non-executable
+    /// (using the NX flag in the PTE), which is a key security feature that
+    /// prevents data pages from being executed as code.
+    ///
+    /// # Arguments
+    /// 
+    /// * `pmm` - An already-initialised physical memory manager.
+    /// * `pml4_phys` - The physical address of the root PML4 table. It is
+    ///   updated to virtual address stored in `pml4` during `init_higher_half`.
+    /// 
+    /// # Safety
+    /// 
+    /// Uses inline assembly to set the NXE bit in the CPU's EFER MSR.
     pub fn init(
         pmm: PhysicalMemoryManager,
         pml4_phys: u64,
     ) -> Self {
-        // First, we need to set the EFER.NXE (No-Execute Enable) bit in the
-        // IA32_EFER MSR (Model Specific Register). This allows the use of the
-        // NX bit in memory regions, which is critical for secutiry.
+        // Fixed MSR address for the EFER, defined by the x86_64 architecture
         let efer_msr: u64 = 0xC0000080;
+
+        // Variables to hold the low (EAX) and high (EDX) 32-bit halves of the
+        // 64-bit MSR value. MSRs are accessed as two 32-bit halves on x86.
         let mut low: u32;
         let mut high: u32;
+
         unsafe {
-            // Read the current value of the MSR
+            // Read the MSR specified in ECX into EDX:EAX. After this,
+            // `low` = bits 31:0 of EFER, `high` = bits 63:32.
             core::arch::asm!(
                 "rdmsr",
-                in("ecx") efer_msr,
-                out("eax") low,
-                out("edx") high
+                in("ecx") efer_msr,  // MSR number to read
+                out("eax") low,      // Low 32 bits -> low
+                out("edx") high,     // High 32 bits -> high
             );
-            
-            // Set NXE bit (bit 11, which is in the low 32 bits) via bitwise OR
+
+            // Set bit 11 of the low half (the NXE bit)
             low |= 1 << 11;
             
             // Write the modified value back to the MSR
             core::arch::asm!(
                 "wrmsr",
-                in("ecx") efer_msr,
-                in("eax") low,
-                in("edx") high
+                in("ecx") efer_msr,  // MSR number to write
+                in("eax") low,       // Low 32 bits (with NXE now set)
+                in("edx") high,      // High 32 bits (unchanged)
             );
         }
 
         Self {
             pmm,
-            pml4: pml4_phys as *mut u64,  // starts as physical, updated below
+            // At this point identity mapping is in effect, so the physical
+            // address can be used directly as a pointer. The `pml4` starts as
+            // physical and is updated yo virtual in `init_higher_half`.
+            pml4: pml4_phys as *mut u64,
             pml4_phys,
         }
     }
 
-
-
-
-
-    /// Phase 2 — Completes the higher-half transition. Call this immediately
-    /// after `init()`, once the CPU is running with the new PML4 in CR3.
+    /// Completes the transition to the higher-half kernel layout. This function
+    /// must be called once after `init`, and it performs these steps in order:
     ///
-    /// This function:
-    ///   1. Builds the full physical direct map at PHYS_MAP_BASE
-    ///   2. Maps the framebuffer to its permanent address at FB_VIRT_BASE
-    ///   3. Removes all lower-half identity maps (point of no return)
-    ///   4. Reclaims bootloader and boot-services memory into the PMM
+    /// 1. Builds the direct physical map
+    /// 2. Updates the PMM to use virtual addresses
+    /// 3. Maps the framebuffer into the high virtual framebuffer region
+    /// 4. Updates `self.pml4` to point to the virtual address of the PML4
+    /// 5. Reloads GDT and IDT with their new virtual base addresses
+    /// 6. Loads the kernel's own minimal GDT
+    /// 7. Removes the bootloader's identity maps from the lower half
+    /// 8. Reclaims boot-time memory back to the PMM
     ///
-    /// After this returns, no low virtual address is valid. All framebuffer
-    /// writes must use FB_VIRT_BASE. Physical addresses are reachable via
-    /// phys_to_virt(). UEFI is completely gone from the address space.
-    pub fn init_higher_half(
-        &mut self,
-        framebuffer_info: &crate::FramebufferInfo,
-        memory_map:       &MemoryMapInfo,
+    /// # Arguments
+    /// 
+    /// * `framebuffer_info` - UEFI framebuffer information struct.
+    /// * `memory_map` - UEFI memory map with regions, types, page counts.
+    /// 
+    /// After this returns, no low virtual address is valid. Physical addresses
+    /// are reachable via `phys_to_virt()`. UEFI is completely gone from the
+    /// address space.
+    pub fn init_higher_half(&mut self,
+        framebuffer_info: &crate::FramebufferInfo, memory_map: &MemoryMapInfo
     ) {
+        // Step 1: Map all usable physical memory into the high virtual window.
+        // After this, every physical address P can be read/written at
+        // KERNEL_PHYSICAL_MAP_BASE + P once switched to higher-half addressing.
         build_direct_map(&mut self.pmm, self.pml4, memory_map);
-        self.pmm.higher_half = true;
 
+        // Step 2: Tell the PMM that it should now use higher-half (virtual)
+        // addresses. Future allocations will return virtual pointers rather
+        // than physical ones.
+        self.pmm.is_higher_half = true;
+
+        // Step 3: Map the GPU framebuffer into the kernel's virtual address
+        // space so the graphics subsystem can still write to it after identity
+        // maps are removed.
         map_framebuffer_higher_half(&mut self.pmm, self.pml4, framebuffer_info);
 
-        // Switch pml4 pointer to its direct-map virtual address now that
-        // the direct map exists. All subsequent page table operations use
-        // this virtual address, including remove_identity_maps.
-        self.pml4 = (self.pml4_phys + globals::KERNEL_PHYSICAL_MAP_BASE) as *mut u64;
+        // Step 4: Update `self.pml4` from a physical address pointer to a
+        // virtual address pointer through the direct map. All subsequent
+        // `map_page` calls will dereference this pointer and must use the
+        // virtual address.
+        self.pml4 = (
+            self.pml4_phys + globals::KERNEL_PHYSICAL_MAP_BASE) as *mut u64;
 
-        // Reload GDT and IDT via their direct-map virtual addresses before
-        // wiping the low identity maps. The CPU reads these on every fault
-        // and segment operation — if they're at low addresses when the
-        // identity maps are gone, any exception causes a triple fault.
+        // Step 5: Reload GDTR and IDTR so they point to the virtual
+        // (higher-half) addresses of those tables. If we skipped this step, the
+        // CPU would try to handle interrupts/faults using a now-unmapped
+        // physical address and would triple-fault.
         reload_gdt_and_idt();
 
+        // Step 6: Load the kernel's own minimal 3-entry GDT (null, code, data).
+        // Also reloads CS, DS, ES, SS, FS, and GS with the correct selectors.
         load_gdt();
-        crate::serial::print("[INFO] Loaded GDT\n");
 
-        // TODO: implement removing identify maps and reclaiming space
-
-
-        // All new mappings must be established before the identity maps are
-        // removed. Reversing this order would cause an immediate page fault.
+        // Step 7: Zero out the lower 256 PML4 entries (the identity-mapped
+        // region) and flush the TLB. After this, virtual addresses below
+        // KERNEL_PHYSICAL_MAP_BASE are unmapped.
         remove_identity_maps(self.pml4_phys);
 
-        // Boot memory reclaim must come last — we are still reading the
-        // memory map buffer throughout all of the above.
+        // Step 8: Walk the memory map again and return all loader/boot-services
+        // pages to the PMM as free pages. Those pages were previously reserved
+        // (we couldn't free them until we finished using the memory map and
+        // page tables that lived in those regions).
         reclaim_boot_memory(&mut self.pmm, memory_map);
-
     }
-
-    
-
-
 
     /// Delegates to the inner `PhysicalMemoryManager::alloc_page()` and
     /// allocates a physical page.
@@ -1009,7 +1138,9 @@ impl MemoryManager {
     }
 
     /// Delegates to the `map_page` and maps a physical page to a virtual page.
-    pub fn map_page(&mut self, virtual_addr: u64, physical_addr: u64, flags: u64) {
+    pub fn map_page(&mut self, virtual_addr: u64, physical_addr: u64,
+        flags: u64
+    ) {
         map_page(&mut self.pmm, self.pml4, virtual_addr, physical_addr, flags);
     }
 
@@ -1018,14 +1149,35 @@ impl MemoryManager {
     //    // future
     //}
 
-    /// Converts a physical address to its direct-map virtual address.
-    /// Valid for any address covered by build_direct_map().
+    /// Converts a physical address to a virtual address through the direct map.
+    ///
+    /// Valid only after `init_higher_half` has been called.
+    ///
+    /// # Arguments
+    /// 
+    /// * `phys` - A physical address.
+    /// 
+    /// # Returns
+    ///
+    /// Returns the corresponding virtual address in the kernel's direct map
+    /// window.
     #[inline(always)]
     pub fn phys_to_virt(phys: u64) -> u64 {
         phys + globals::KERNEL_PHYSICAL_MAP_BASE
     }
 
-    /// Converts a direct-map virtual address back to its physical address.
+    /// Converts a virtual address (in the direct map window) back to a physical
+    /// address.
+    ///
+    /// Valid only for addresses that lie within the direct physical map.
+    ///
+    /// # Arguments
+    /// 
+    /// * `virt` - A virtual address.
+    ///
+    /// # Returns
+    /// 
+    /// Returns the underlying physical address.
     #[inline(always)]
     pub fn virt_to_phys(virt: u64) -> u64 {
         virt - globals::KERNEL_PHYSICAL_MAP_BASE
@@ -1034,95 +1186,3 @@ impl MemoryManager {
 
 // Implements unsafe Send for spinlock management
 unsafe impl Send for MemoryManager {}
-
-
-/// Reclaims EfiACPIReclaimMemory pages. Call this after your ACPI
-    /// subsystem has finished parsing all tables it needs.
-
-    /// Reclaims bootloader and boot-services memory back into the PMM free list.
-///
-/// Must be called after remove_identity_maps() — by this point the CPU no
-/// longer needs those pages mapped, and we're safe to recycle them.
-///
-/// The following are intentionally NOT reclaimed here:
-///   - EfiRuntimeServicesCode/Data  (firmware reserved — do not touch)
-///   - EfiACPIMemoryNVS             (ACPI firmware tables — permanent)
-///   - EfiACPIReclaimMemory         (reclaim separately after ACPI init)
-///   - The memory map buffer itself (still being iterated)
-///   - The kernel image and stack
-///
-/// EfiConventionalMemory pages are already in the PMM from init() and must
-/// not be double-freed.
-    #[inline(never)]
-fn reclaim_boot_memory(
-    pmm:        &mut PhysicalMemoryManager,
-    memory_map: &MemoryMapInfo,
-    ) {
-        let mut descriptor_addr = memory_map.memory_map_addr
-            + globals::KERNEL_PHYSICAL_MAP_BASE;
-        let num_segments = memory_map.memory_map_size / memory_map.descriptor_size;
-
-        let map_start    = memory_map.memory_map_addr;
-        let map_end      = memory_map.memory_map_addr + memory_map.memory_map_size;
-        let kernel_start = core::ptr::addr_of!(__kernel_phys_start) as u64;
-        let kernel_end   = core::ptr::addr_of!(__kernel_phys_end)   as u64;
-
-        for _ in 0..num_segments {
-            let desc = EfiMemoryDescriptor::new(descriptor_addr);
-            descriptor_addr += memory_map.descriptor_size;
-
-            let reclaimable = matches!(
-                desc.region_type,
-                EfiMemoryType::EfiLoaderCode       |
-                EfiMemoryType::EfiLoaderData       |
-                EfiMemoryType::EfiBootServicesCode |
-                EfiMemoryType::EfiBootServicesData
-            );
-            if !reclaimable { continue; }
-
-            for i in 0..desc.num_pages {
-                let page_start = desc.physical_start + i * 0x1000;
-                let page_end   = page_start + 0x1000 - 1;
-
-                if page_start == 0 { continue; }
-
-                if page_overlaps(page_start, page_end, map_start, map_end) {
-                    continue;
-                }
-                if page_overlaps(page_start, page_end, kernel_start, kernel_end) {
-                    continue;
-                }
-                if page_overlaps(
-                    page_start, page_end,
-                    pmm.kernel_stack_base_addr,
-                    pmm.kernel_stack_base_addr + pmm.kernel_stack_size,
-                ) { continue; }
-
-                pmm.free_page(page_start);
-            }
-        }
-    }
-
-
-// TODO: For sanity checks only. Delete later
-/*pub fn test_vmm() {
-    unsafe {
-        let cookie: u64 = 0xDEADBEEFCAFEBABE;
-        let phys_addr = globals::MEMORY_MANAGER.lock().as_mut().unwrap().alloc_page().unwrap();
-        crate::sprintln!("\n[TEST] Got physical address 0x{:016X}", phys_addr);
-        let virt_addr: u64 = 0x0000010000000000;
-        crate::sprintln!("[TEST] Chosen virtual address 0x{:016X}", virt_addr);
-        let phys_ptr = phys_addr as *const u64;
-        crate::sprintln!("[TEST] Read from physical address 0x{:016X}", *phys_ptr);
-        let cr3: u64;
-        core::arch::asm!("mov {}, cr3", out(reg) cr3);
-        crate::sprintln!("[TEST] CR3 / PML4 address 0x{:016X}", cr3);
-        globals::MEMORY_MANAGER.lock().as_mut().unwrap().map_page(virt_addr, phys_addr, PRESENT | WRITABLE);
-        crate::sprintln!("[TEST] Mapped new virtual page");
-        let ptr = virt_addr as *mut u64;
-        *ptr = cookie;
-        crate::sprintln!("[TEST] Wrote cookie to virtual address");
-        crate::sprintln!("[TEST] Read cookie from virtual address 0x{:016X}", *ptr);
-        crate::sprintln!("[TEST] Read cookie from physical address 0x{:016X}", *phys_ptr);
-    }
-}*/

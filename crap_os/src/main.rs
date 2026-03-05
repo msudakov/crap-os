@@ -20,6 +20,7 @@ use globals::MEMORY_MANAGER;
 use crate::memory_manager::MemoryManager;
 
 
+/// System-wide error code values.
 #[repr(u32)]
 #[derive(PartialEq)]
 pub enum ErrorCode {
@@ -27,7 +28,7 @@ pub enum ErrorCode {
     BufferTooSmall = 0x00000001,
 }
 
-// Preset level of debugging messages sent by the kernel
+/// Preset level of debugging messages printed by the system.
 #[repr(i32)]
 #[allow(dead_code)]
 #[derive(PartialEq, Eq, PartialOrd)]
@@ -39,12 +40,11 @@ pub enum DebugLevel {
     CRITICAL = 5
 }
 
-/*
-    These are the BootInfo structures that are passed to the _start routine by
-    the bootloader when KernelEntry is called and execution is transferred to
-    the kernel. They must match the structures in the C bootloader exactly.
-*/
+/// The BootInfo structure passed to the _start routine by the bootloader when
+/// KernelEntry is jumped to and execution is transferred to the kernel.
+/// This must match the structure in the C bootloader exactly.
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct BootInfo {
     magic: u64,
     framebuffer_info: *const FramebufferInfo,
@@ -64,33 +64,34 @@ pub struct BootInfo {
 #[unsafe(no_mangle)]
 #[unsafe(link_section = ".text._start")]
 pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
-    // Disbale maskable hardware interrupts, until we implement IDT
+    // Disable maskable hardware interrupts, until we implement IDT
     unsafe { core::arch::asm!("cli", options(nostack, preserves_flags)) };
 
-    // Initialize serial port. This is needed here, before the memory manager
-    // initialization and the jump to higher-half kernel space, to print debug
-    // messages. These writes are not spinlocked at this early staged yet.
+    // Initialize serial port. This is needed here (before the memory manager
+    // initialization and the jump to higher-half kernel space) to print debug
+    // messages. These writes are not spinlocked at this early stage yet.
     crate::serial::init(globals::COM1_PORT);
     
-    // Validate boot_info pointer
+    // Validate boot_info pointer, then dereference boot_info
     if boot_info.is_null() {loop{unsafe{core::arch::asm!("hlt")}}}
-
-    let info = unsafe { &*boot_info };  // Dereference boot_info
+    let info = unsafe { *boot_info };  // Copy the struct instead of reference
 
     // Sanity check for magic value
     if info.magic != 0xDEADBEEFB007CAFE {loop{unsafe{core::arch::asm!("hlt")}}}
 
-    // Dereference framebuffer_info
+    // Dereference framebuffer_info by copying the struct instead of reference
     let framebuffer = unsafe { *info.framebuffer_info };
     if framebuffer.framebuffer_addr == 0 {loop{unsafe{core::arch::asm!("hlt")}}}
 
-    // Dereference memory_map_info
+    // Dereference memory_map_info by copying the struct instead of reference
     let memory_map  = unsafe { *info.memory_map_info };
 
-    // Initialize the physical memory manager
+    // Initialize the physical memory manager. This enumerates and maps physical
+    // pages to enable page tables in the next step.
     let mut pmm = PhysicalMemoryManager::init(&framebuffer, &memory_map);
 
-    // Initialize page tabes and store PML4
+    // Initialize page tabes and store PML4, which is used in the next step to
+    // replace CR3 and then inline-jump to higher-half virtual space.
     let pml4 = memory_manager::init_page_tables(&mut pmm, &framebuffer,
         &memory_map);
 
@@ -104,32 +105,40 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             "mov rsp, rax",           // RAX -> RSP updates RSP with new base
             "lea rax, [rip + 3f]",    // Increment RIP with new base and offset
             "add rax, {base}",        // Position jump address in RAX
-            "jmp rax",                // Jump to higher half
+            "jmp rax",                // Jump to higher half via RAX
             "3:",                     // Numeric label to keep compiler happy
             pml4 = in(reg) pml4,
             base = const globals::KERNEL_VIRTUAL_BASE,
         )
     };
 
-    // Re-copy these from the pre-jump variables into new stack slots
+    // At this point, our RIP and RSP are both in the higher-half space. First,
+    // we must re-copy these from the pre-jump variables into new stack slots
     // that are allocated on the post-jump higher-half stack.
     // The pre-jump variables (framebuffer and memory_map) are at physical
     // stack addresses and must not be referenced after this point.
-    let framebuffer  = framebuffer;
-    let memory_map   = memory_map;
+    let framebuffer = framebuffer;
+    let memory_map = memory_map;
 
-    // Properly initialize the memory manager from the higher-half kernel space
+    // Properly initialize the memory manager from the higher-half kernel space.
+    // This uses the physical manager passed as a struct and the PML4 address of
+    // the new page tables we created before the jump.
     let mut memory_manager = MemoryManager::init(pmm, pml4 as u64);
+
+    // Complete virtual memory initialization. This includes building direct
+    // physical map, mapping the framebuffer to the new kernel space, reloading
+    // the GDT and the IDT, removing old identity maps, and finally reclaiming
+    // boot memory.
     memory_manager.init_higher_half(&framebuffer, &memory_map);
     {
         let mut global_mm = MEMORY_MANAGER.lock();
         *global_mm = Some(memory_manager);
     }
 
-    // Can now safely print basic messages via serial port
-    crate::serial::print("[INFO] Initialized higher half kernel\n");
+    // We can now safely print basic messages via serial port
+    crate::serial::print("[INFO] Initialized higher-half kernel\n");
 
-    // Instantiate serial port writer for macros
+    // Initialize serial port writer for global macros
     {
         let mut writer = globals::SERIAL.lock();
         *writer = Some(serial::SerialWriter::new(
@@ -137,10 +146,10 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         ));
     }
 
-    // Can now use serial port IRQ-safe global spinlock macros
+    // We can now use serial port IRQ-safe global spinlock macros
     sprint_debug!(DebugLevel::INFO, "[INFO] Serial initialized successfully");
 
-    // Instantiate and initialize framebuffer writer
+    // Initialize framebuffer writer for global macros
     {
         let mut writer = globals::FRAMEBUFFER.lock();
         *writer = Some(framebuffer::FramebufferWriter::new(
@@ -153,16 +162,17 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     sprint_debug!(DebugLevel::INFO, "[INFO] Graphics initialized successfully");
 
     // Draw OS banner
-    fbprintln!("Hello and {} to:\n", "welcome");
+    fbprintln!("Hello and welcome to:\n");
     globals::FRAMEBUFFER.lock().as_mut().unwrap().draw_banner();
     sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Text drawn");
 
-    sprint_debug!(DebugLevel::INFO, "[INFO] Initialized higher half kernel");
+    sprint_debug!(DebugLevel::INFO, "[INFO] Initialized higher-half kernel");
     sprintln!("[+] Kernel higher-half virtual space initialization complete!");
     fbprintln!("[+] Kernel higher-half virtual space initialization complete!\n");
-
-    fbprintln!("  - Kernel virtual base address is: 0x{:X}\n", globals::KERNEL_VIRTUAL_BASE);
-    fbprintln!("  - Kernel physical map base address is: 0x{:X}\n", globals::KERNEL_PHYSICAL_MAP_BASE);
+    fbprintln!("  - Kernel virtual base address is: 0x{:X}\n",
+    globals::KERNEL_VIRTUAL_BASE);
+    fbprintln!("  - Kernel physical map base address is: 0x{:X}\n",
+    globals::KERNEL_PHYSICAL_MAP_BASE);
 
     // Testing the address pointer of framebuffer
     let mut fb_ptr: usize = 0;

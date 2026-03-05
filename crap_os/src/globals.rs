@@ -24,8 +24,11 @@ pub const DEBUG_LEVEL: DebugLevel = DebugLevel::INFO;
 // Upper hexadecimal character set
 pub const HEX_CHARS_UPPER: &[u8; 16] = b"0123456789ABCDEF";
 
-// Base address for the higher-half kernel mapping
-pub const KERNEL_VIRTUAL_BASE: u64 = 0xFFFFFFFF80000000;
+// Base addresses for the higher-half kernel mappings
+pub const KERNEL_VIRTUAL_BASE: u64             = 0xFFFFFFFF80000000;
+pub const KERNEL_PHYSICAL_MAP_BASE: u64        = 0xFFFF800000000000;
+pub const KERNEL_FRAMEBUFFER_VIRTUAL_BASE: u64 = 0xFFFF900000000000;
+
 
 // =============================================================================
 // Synchronized Globals

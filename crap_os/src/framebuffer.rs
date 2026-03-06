@@ -115,6 +115,7 @@ const PAD_TOP: u32 = FONT_HEIGHT;
 const PAD_BOTTOM: u32 = FONT_HEIGHT;
 
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct FramebufferInfo {
     pub framebuffer_addr: u64,
     pub framebuffer_width: u32,

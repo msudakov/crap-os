@@ -15,35 +15,12 @@ mod memory_manager;
 
 use framebuffer::FramebufferInfo;
 use memory_manager::MemoryMapInfo;
+use memory_manager::PhysicalMemoryManager;
 use globals::MEMORY_MANAGER;
+use crate::memory_manager::MemoryManager;
 
 
-// Structure for the Global Descriptor Table
-#[repr(C, align(8))]
-struct Gdt {
-    null:    u64,
-    code64:  u64,
-    data64:  u64,
-}
-
-// Structure for the GDT register
-#[repr(C, packed)]
-struct Gdtr {
-    limit: u16,
-    base:  u64,
-}
-
-/*
-    When the _start routine is invoked from the bootloader, we're still
-    running under UEFI's GDT and CS segment. This creates our own GDT that the
-    kernel loads at the very start of the routine.
-*/
-static GDT: Gdt = Gdt {
-    null:   0x0000000000000000,
-    code64: 0x00AF9A000000FFFF,  // 64-bit code, ring 0
-    data64: 0x00CF92000000FFFF,  // 64-bit data, ring 0
-};
-
+/// System-wide error code values.
 #[repr(u32)]
 #[derive(PartialEq)]
 pub enum ErrorCode {
@@ -51,7 +28,7 @@ pub enum ErrorCode {
     BufferTooSmall = 0x00000001,
 }
 
-// Preset level of debugging messages sent by the kernel
+/// Preset level of debugging messages printed by the system.
 #[repr(i32)]
 #[allow(dead_code)]
 #[derive(PartialEq, Eq, PartialOrd)]
@@ -63,43 +40,15 @@ pub enum DebugLevel {
     CRITICAL = 5
 }
 
-/*
-    These are the BootInfo structures that are passed to the _start routine by
-    the bootloader when KernelEntry is called and execution is transferred to
-    the kernel. They must match the structures in the C bootloader exactly.
-*/
+/// The BootInfo structure passed to the _start routine by the bootloader when
+/// KernelEntry is jumped to and execution is transferred to the kernel.
+/// This must match the structure in the C bootloader exactly.
 #[repr(C)]
+#[derive(Copy, Clone)]
 pub struct BootInfo {
     magic: u64,
     framebuffer_info: *const FramebufferInfo,
     memory_map_info: *const MemoryMapInfo,
-}
-
-/// Replaces the bootloader's GDT with the kernel's GDT.
-/// 
-/// # Safety
-/// 
-/// Uses inline assembly to load the OS kernel's own GDT.
-fn load_gdt() {
-    let gdtr = Gdtr {
-        limit: (core::mem::size_of::<Gdt>() - 1) as u16,
-        base:  &GDT as *const Gdt as u64,
-    };
-    unsafe {
-        core::arch::asm!(
-            "lgdt [{0}]",
-            "push 0x8",
-            "lea rax, [{1}]",
-            "push rax",
-            "retfq",
-            "mov ax, 0x10",
-            "mov ds, ax",
-            "mov es, ax",
-            "mov ss, ax",
-            in(reg) &gdtr,
-            label {()},
-            options(nostack)
-    )};
 }
 
 /// Kernel entry point routine.
@@ -113,83 +62,135 @@ fn load_gdt() {
 ///
 /// * `boot_info` - Raw pointer to a `BootInfo` structure from the bootloader.
 #[unsafe(no_mangle)]
+#[unsafe(link_section = ".text._start")]
 pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
-    load_gdt();  // Must be executed before anything else
+    // Disable maskable hardware interrupts, until we implement IDT
+    unsafe { core::arch::asm!("cli", options(nostack, preserves_flags)) };
 
+    // Initialize serial port. This is needed here (before the memory manager
+    // initialization and the jump to higher-half kernel space) to print debug
+    // messages. These writes are not spinlocked at this early stage yet.
+    crate::serial::init(globals::COM1_PORT);
+    
+    // Validate boot_info pointer, then dereference boot_info
+    if boot_info.is_null() {loop{unsafe{core::arch::asm!("hlt")}}}
+    let info = unsafe { *boot_info };  // Copy the struct instead of reference
+
+    // Sanity check for magic value
+    if info.magic != 0xDEADBEEFB007CAFE {loop{unsafe{core::arch::asm!("hlt")}}}
+
+    // Dereference framebuffer_info by copying the struct instead of reference
+    let framebuffer = unsafe { *info.framebuffer_info };
+    if framebuffer.framebuffer_addr == 0 {loop{unsafe{core::arch::asm!("hlt")}}}
+
+    // Dereference memory_map_info by copying the struct instead of reference
+    let memory_map  = unsafe { *info.memory_map_info };
+
+    // Initialize the physical memory manager. This enumerates and maps physical
+    // pages to enable page tables in the next step.
+    let mut pmm = PhysicalMemoryManager::init(&framebuffer, &memory_map);
+
+    // Initialize page tabes and store PML4, which is used in the next step to
+    // replace CR3 and then inline-jump to higher-half virtual space.
+    let pml4 = memory_manager::init_page_tables(&mut pmm, &framebuffer,
+        &memory_map);
+
+    // Inline switch the CR3 for the new PML4, then jump to higher half kernel.
+    // Execution continues at the label 3, with RSP and RIP both in higher half.
+    unsafe {
+        core::arch::asm!(
+            "mov cr3, {pml4}",        // Switch CR3 to the new PML4
+            "mov rax, rsp",           // RSP -> RAX
+            "add rax, {base}",        // Increment stack pointer by kernel base
+            "mov rsp, rax",           // RAX -> RSP updates RSP with new base
+            "lea rax, [rip + 3f]",    // Increment RIP with new base and offset
+            "add rax, {base}",        // Position jump address in RAX
+            "jmp rax",                // Jump to higher half via RAX
+            "3:",                     // Numeric label to keep compiler happy
+            pml4 = in(reg) pml4,
+            base = const globals::KERNEL_VIRTUAL_BASE,
+        )
+    };
+
+    // At this point, our RIP and RSP are both in the higher-half space. First,
+    // we must re-copy these from the pre-jump variables into new stack slots
+    // that are allocated on the post-jump higher-half stack.
+    // The pre-jump variables (framebuffer and memory_map) are at physical
+    // stack addresses and must not be referenced after this point.
+    let framebuffer = framebuffer;
+    let memory_map = memory_map;
+
+    // Properly initialize the memory manager from the higher-half kernel space.
+    // This uses the physical manager passed as a struct and the PML4 address of
+    // the new page tables we created before the jump.
+    let mut memory_manager = MemoryManager::init(pmm, pml4 as u64);
+
+    // Complete virtual memory initialization. This includes building direct
+    // physical map, mapping the framebuffer to the new kernel space, reloading
+    // the GDT and the IDT, removing old identity maps, and finally reclaiming
+    // boot memory.
+    memory_manager.init_higher_half(&framebuffer, &memory_map);
     {
-        // Instantiate and initialize serial port writer
+        let mut global_mm = MEMORY_MANAGER.lock();
+        *global_mm = Some(memory_manager);
+    }
+
+    // We can now safely print basic messages via serial port
+    crate::serial::print("[INFO] Initialized higher-half kernel\n");
+
+    // Initialize serial port writer for global macros
+    {
         let mut writer = globals::SERIAL.lock();
         *writer = Some(serial::SerialWriter::new(
             globals::COM1_PORT,
         ));
     }
-    sprint_debug!(DebugLevel::INFO, "[INFO] Kernel started");
 
-    // Validate boot_info pointer
-    if boot_info.is_null() {
-        sprint_debug!(DebugLevel::CRITICAL, "[ERROR] boot_info is null");
-        loop { unsafe { core::arch::asm!("hlt") }};
-    }
+    // We can now use serial port IRQ-safe global spinlock macros
+    sprint_debug!(DebugLevel::INFO, "[INFO] Serial initialized successfully");
 
-    let info = unsafe { &*boot_info };  // Dereference boot_info
-
-    // Sanity check for magic value
-    if info.magic != 0xDEADBEEFB007CAFE {
-        sprint_debug!(DebugLevel::CRITICAL,
-            "[CRITICAL] Magic value did not match");
-        unsafe { core::arch::asm!("hlt") };
-    }
-    sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Magic value matched");
-    sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Got BootInfo structure");
-
-    // Dereference framebuffer_info
-    let framebuffer = unsafe { &*info.framebuffer_info };
-    sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Framebuffer info read");
-
-    if framebuffer.framebuffer_addr == 0 {  // Validate framebuffer address
-        sprint_debug!(DebugLevel::ERROR, "[ERROR] framebuffer address is 0");
-        loop { unsafe { core::arch::asm!("hlt") }}
-    }
-    sprint_debug!(DebugLevel::INFO, "[INFO] Validated framebuffer addr");
-
-    // Dereference memory_map_info
-    let memory_map = unsafe { &*info.memory_map_info };
-
+    // Initialize framebuffer writer for global macros
     {
-        // Instantiate and initialize framebuffer writer
         let mut writer = globals::FRAMEBUFFER.lock();
         *writer = Some(framebuffer::FramebufferWriter::new(
-            framebuffer.framebuffer_addr as *mut u32,
+            globals::KERNEL_FRAMEBUFFER_VIRTUAL_BASE as *mut u32,
             framebuffer.framebuffer_width,
             framebuffer.framebuffer_height,
         ));
         writer.as_mut().unwrap().clear_screen();
     }
     sprint_debug!(DebugLevel::INFO, "[INFO] Graphics initialized successfully");
-    
+
     // Draw OS banner
-    fbprintln!("Hello and {} to:\n", "welcome");
+    fbprintln!("Hello and welcome to:\n");
     globals::FRAMEBUFFER.lock().as_mut().unwrap().draw_banner();
     sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Text drawn");
 
-    sprint_debug!(
-        DebugLevel::INFO, "[INFO] Mapping physical and virtual memory...");
+    sprint_debug!(DebugLevel::INFO, "[INFO] Initialized higher-half kernel");
+    sprintln!("[+] Kernel higher-half virtual space initialization complete!");
+    fbprintln!("[+] Kernel higher-half virtual space initialization complete!\n");
+    fbprintln!("  - Kernel virtual base address is: 0x{:X}\n",
+    globals::KERNEL_VIRTUAL_BASE);
+    fbprintln!("  - Kernel physical map base address is: 0x{:X}\n",
+    globals::KERNEL_PHYSICAL_MAP_BASE);
+
+    // Testing the address pointer of framebuffer
+    let mut fb_ptr: usize = 0;
     {
-        // Instantiate and initialize memory manager
-        let mut memory_manager = MEMORY_MANAGER.lock();
-        *memory_manager = Some(memory_manager::MemoryManager::init(
-            &framebuffer, &memory_map));
+        let mut writer = globals::FRAMEBUFFER.lock();
+        if let Some(ref mut writer) = *writer {
+            let raw_ptr: *mut u32 = writer.framebuffer;
+            fb_ptr = raw_ptr as usize;
+            sprintln!("Kernel framebuffer address is: 0x{:X}", fb_ptr);
+        }
     }
-    sprint_debug!(DebugLevel::INFO, "[INFO] Memory mapped!");
-    sprint_debug!(DebugLevel::INFO, "[INFO] Testing virtual memory...");
+    fbprintln!("  - Kernel framebuffer address is: 0x{:X}\n", fb_ptr);
 
-    // TODO: delete this test later
-    memory_manager::test_vmm();
-
+    
     // Done for now.. loop forever and ever
     loop {
         //core::arch::asm!("hlt");
-    }
+    } 
 }
 
 /// Manual panic handler for when we need to crash.
@@ -207,7 +208,8 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 /// Crashes the system and halts the CPU.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    sprintln!("\n!!! KERNEL PANIC !!!");
+    // Print this without acquiring the spinlock
+    crate::serial::print("\n!!! KERNEL PANIC !!!\n");
 
     if let Some(location) = info.location() {
         sprintln!("Panic occurred in file '{}' at line {}", location.file(),

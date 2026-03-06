@@ -58,6 +58,21 @@ fn outb(port: u16, value: u8) {
     }
 }
 
+/// Initialize a serial port for transmission.
+///
+/// # Arguments
+///
+/// * `port` - Serial port base address.
+pub fn init(port: u16) {
+    outb(port + 1, 0x00);  // Disable interrupts on COM1
+    outb(port + 3, 0x80);  // Enable DLAB (set baud rate divisor)
+    outb(port + 0, 0x03);  // Set divisor to 3 (38400 baud)
+    outb(port + 1, 0x00);  // Set divisor to 3 (38400 baud)
+    outb(port + 3, 0x03);  // 8 bits, no parity, one stop bit
+    outb(port + 2, 0xC7);  // Enable FIFO and clear with 14-byte threshold
+    outb(port + 4, 0x0B);  // IRQs enabled, RTS/DSR set
+}
+
 /// Rust format string implementation for SerialWriter.
 impl core::fmt::Write for SerialWriter {
     fn write_str(&mut self, s: &str) -> core::fmt::Result {
@@ -68,23 +83,12 @@ impl core::fmt::Write for SerialWriter {
 
 #[allow(dead_code)]
 impl SerialWriter {
-    /// Instantiates a new `SerialWriter` and safely initializes the serial
-    /// port. Handles disabling and restoring interrupts.
+    /// Instantiates a new `SerialWriter`.
     ///
     /// # Arguments
     ///
     /// * `port` - Serial port base address.
     pub fn new(port: u16) -> Self {
-        // Initialize serial port for transmission
-        outb(port + 1, 0x00);  // Disable interrupts on COM1
-        outb(port + 3, 0x80);  // Enable DLAB (set baud rate divisor)
-        outb(port + 0, 0x03);  // Set divisor to 3 (38400 baud)
-        outb(port + 1, 0x00);  // Set divisor to 3 (38400 baud)
-        outb(port + 3, 0x03);  // 8 bits, no parity, one stop bit
-        outb(port + 2, 0xC7);  // Enable FIFO and clear with 14-byte threshold
-        outb(port + 4, 0x0B);  // IRQs enabled, RTS/DSR set
-
-        // Instantiate and return Self.
         Self {
             port: port,
         }
@@ -126,3 +130,21 @@ impl SerialWriter {
 
 // Implements unsafe Send for spinlock management
 unsafe impl Send for SerialWriter {}
+
+/// Separate function to print using an already-initialized serial port without
+/// relying on spinlocks. This is for cases where we need to troubleshoot
+/// spinlocks themselves.
+///
+/// # Arguments
+///
+/// * `msg` - Debug message to print.
+#[allow(dead_code)]
+pub fn print(msg: &str) {
+    for char in msg.bytes() {
+        // Wait for transmit buffer to be empty
+        while (inb(crate::globals::COM1_PORT + 5) & 0x20) == 0 {}
+
+        // Send the byte
+        outb(crate::globals::COM1_PORT, char);
+    }
+}

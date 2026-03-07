@@ -62,7 +62,6 @@ pub struct BootInfo {
 ///
 /// * `boot_info` - Raw pointer to a `BootInfo` structure from the bootloader.
 #[unsafe(no_mangle)]
-#[unsafe(link_section = ".text._start")]
 pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // Disable maskable hardware interrupts, until we implement IDT
     unsafe { core::arch::asm!("cli", options(nostack, preserves_flags)) };
@@ -95,22 +94,13 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     let pml4 = memory_manager::init_page_tables(&mut pmm, &framebuffer,
         &memory_map);
 
-    // Inline switch the CR3 for the new PML4, then jump to higher half kernel.
-    // Execution continues at the label 3, with RSP and RIP both in higher half.
+    // Inline switch the CR3 for the new PML4
     unsafe {
         core::arch::asm!(
-            "mov cr3, {pml4}",        // Switch CR3 to the new PML4
-            "mov rax, rsp",           // RSP -> RAX
-            "add rax, {base}",        // Increment stack pointer by kernel base
-            "mov rsp, rax",           // RAX -> RSP updates RSP with new base
-            "lea rax, [rip + 3f]",    // Increment RIP with new base and offset
-            "add rax, {base}",        // Position jump address in RAX
-            "jmp rax",                // Jump to higher half via RAX
-            "3:",                     // Numeric label to keep compiler happy
+            "mov cr3, {pml4}",
             pml4 = in(reg) pml4,
-            base = const globals::KERNEL_VIRTUAL_BASE,
-        )
-    };
+        );
+    }
 
     // At this point, our RIP and RSP are both in the higher-half space. First,
     // we must re-copy these from the pre-jump variables into new stack slots

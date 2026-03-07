@@ -54,7 +54,10 @@ qemu-system-x86_64 \
     -serial stdio \
     -no-reboot \
     -no-shutdown \
-    -net none
+    -net none #\
+    #-s -S            # Uncomment this and the line above for gdb server on 1234
+    #-d int,cpu_reset # Uncomment this and the line above to view interrupts
+                      #   and CPU resets while debugging
 
 # Cleanup
 rm -f ./OVMF_VARS_temp.fd

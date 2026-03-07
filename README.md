@@ -10,24 +10,27 @@ I wanted to learn more about and get some practice with Rust. As any sane person
 ## Demos
 
 - [Demo 1](https://youtu.be/yjD1NYdGLt8)
+- [Demo 2](https://youtu.be/4BRA-oguYKE)
 
-## Setting Up Rust Environment
+## Setting Up Rust Environment on MacOS
+
+To install Rust compiler, needed targets, and dependencies:
 
 ```
+brew install rust
+
 rustup toolchain install nightly
 rustup component add rust-src
 rustup component add rust-src --toolchain nightly-x86_64-apple-darwin
 rustup component add llvm-tools-preview
 rustup component add rust-std --target x86_64-crap_os
 rustup target add x86_64-unknown-none
-```
 
-```
 brew tap SergioBenitez/osxct
 brew install x86_64-elf-gcc
 ```
 
-`~/.cargo/config.toml`:
+The contents of `~/.cargo/config.toml`:
 ```
 [unstable]
 json-target-spec = true
@@ -38,20 +41,23 @@ build-std = ["core", "compiler_builtins"]
 target = "SHARE/crap-os/crap_os/x86_64-crap_os.json"
 ```
 
-To build:
+To compile and link the kernel binary (will be at `target/release/kernel.bin`):
+
 ```
 cd crap_os
 make clean
 make
 ```
 
-## Setting Up Bootloader Environment
+## Setting Up Bootloader Environment on Ubuntu
 
-Installing dependencies:
+Installing UEFI and dependencies:
 
 ```
 sudo apt-get install -y gnu-efi build-essential nasm qemu-system-x86 ovmf
 ```
+
+To build a bootable image for testing:
 
 ```
 cd crap_loader
@@ -61,3 +67,5 @@ make disk
 #make test (optional QEMU test)
 #qemu-img convert -f raw -O vmdk boot.img boot.vmdk (make disk already does this)
 ```
+
+The `make disk` also creates a `boot.vmdk` for testing in a VMware, which is Fusion in this case.

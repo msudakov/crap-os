@@ -878,8 +878,8 @@ fn remove_identity_maps(pml4_phys: u64) {
 /// kernel needed during initialisation, but they are now safe to reclaim as the
 /// last step in `init_higher_half`. The following are intentionally not
 /// reclaimed here:
-///   - EfiRuntimeServicesCode/Data  (firmware reserved - do not touch)
-///   - EfiACPIMemoryNVS             (ACPI firmware tables - permanent)
+///   - EfiRuntimeServicesCode/Data  (firmware reserved; do not touch)
+///   - EfiACPIMemoryNVS             (ACPI firmware tables; permanent)
 ///   - EfiACPIReclaimMemory         (reclaim separately after ACPI init)
 ///   - The memory map buffer itself (still being iterated)
 ///   - The kernel image and stack
@@ -965,7 +965,7 @@ fn reclaim_boot_memory(pmm: &mut PhysicalMemoryManager,
 }
 
 // =============================================================================
-// MemoryManager - public interface
+// MemoryManager: Public Interface
 // =============================================================================
 //
 // This interface encapsulates the needed physical and virtual memory management

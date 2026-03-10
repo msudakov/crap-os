@@ -1,5 +1,5 @@
 // =============================================================================
-// CrapOS Framebuffer Printer Module
+// Framebuffer Printer Module
 // =============================================================================
 // 
 // This module contains the needed functionality to draw pixels in the

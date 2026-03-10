@@ -1,5 +1,5 @@
 // =============================================================================
-// CrapOS Memory Manager Module
+// Memory Manager Module
 // =============================================================================
 // 
 // This module is responsible for all physical and virtual memory operations
@@ -19,10 +19,12 @@
 
 use crate::globals;
 
-const PRESENT: u64 = 1 << 0;  // Must be 1 for the entry to be valid
-const WRITABLE: u64 = 1 << 1; // If 1, writes are allowed; if 0, read-only
-// const USER: u64 = 1 << 2;     // If 1, user-mode access is allowed
-const NX: u64 = 1 << 63;
+const PAGE_SIZE: u64 = 0x1000;  // Default page size of 4096 bytes
+
+pub const PRESENT: u64 = 1 << 0;   // Must be 1 for the entry to be valid
+pub const WRITABLE: u64 = 1 << 1;  // If 1, writes are allowed; if 0, read-only
+// pub const USER: u64 = 1 << 2;     // If 1, user-mode access is allowed
+pub const NX: u64 = 1 << 63;
 
 // Kernel physical start and physical end tags collected from the linker.
 unsafe extern "C" {
@@ -220,8 +222,9 @@ impl PhysicalMemoryManager {
                 EfiMemoryType::EfiConventionalMemory { continue; }
 
             for i in 0..memory_descriptor.num_pages {
-                let page_start_addr = memory_descriptor.physical_start+i*0x1000;
-                let page_end_addr = page_start_addr + 0x1000 - 1;
+                let page_start_addr =
+                    memory_descriptor.physical_start + i * PAGE_SIZE;
+                let page_end_addr = page_start_addr + PAGE_SIZE - 1;
 
                 if page_start_addr == 0 {
                     continue;  // Skipping physical page 0 (null page)
@@ -392,13 +395,24 @@ fn get_or_create_table(pmm: &mut PhysicalMemoryManager, table: *mut u64,
         let entry = table.add(index as usize);
 
         if *entry & PRESENT == 0 {
-            let new_table = pmm.alloc_page().expect(
+            let new_table_phys = pmm.alloc_page().expect(
                 "[CRITICAL] OOM during page table walk!");
-            zero_out_page(new_table);
-            *entry = new_table | PRESENT | WRITABLE;
+            let new_table_virt = if pmm.is_higher_half {
+                new_table_phys + globals::KERNEL_PHYSICAL_MAP_BASE
+            } else {
+                new_table_phys
+            };
+            zero_out_page(new_table_virt);
+            *entry = new_table_phys | PRESENT | WRITABLE;
         }
 
-        (*entry & !0xFFF) as *mut u64
+        let phys = *entry & !0xFFF;
+        let virt = if pmm.is_higher_half {
+            phys + globals::KERNEL_PHYSICAL_MAP_BASE
+        } else {
+            phys
+        };
+        virt as *mut u64
     }
 }
 
@@ -431,6 +445,189 @@ fn map_page(pmm: &mut PhysicalMemoryManager, pml4_addr: *mut u64,
     unsafe {
         let pte = pt.add(pt_index as usize);
         *pte = (physical_addr & !0xFFF) | flags | PRESENT;
+    }
+}
+
+/// Walks the page table hierarchy for a given virtual address and returns
+/// the physical address it maps to, or None if any level is absent.
+///
+/// # Arguments
+///
+/// * `pml4_addr`    - Pointer to the root PML4 table in CR3.
+/// * `virtual_addr` - The virtual address to resolve.
+///
+/// # Returns
+///
+/// Returns the physical address the virtual address maps to, or `None` if it
+/// is unmapped.
+///
+/// # Safety
+///
+/// Dereferences raw pointers derived from the page-table walk.
+fn get_physical_addr(pml4_addr: *mut u64, virtual_addr: u64) -> Option<u64> {
+    let pml4_index = (virtual_addr >> 39) & 0x1FF;
+    let pdpt_index = (virtual_addr >> 30) & 0x1FF;
+    let pd_index   = (virtual_addr >> 21) & 0x1FF;
+    let pt_index   = (virtual_addr >> 12) & 0x1FF;
+    let offset     =  virtual_addr        & 0xFFF;
+
+    unsafe {
+        // PML4 -> PDPT
+        let pml4e = pml4_addr.add(pml4_index as usize);
+        if *pml4e & PRESENT == 0 {
+            return None;
+        }
+        let pdpt = ((*pml4e & !0xFFF) + globals::KERNEL_PHYSICAL_MAP_BASE)
+            as *mut u64;
+
+        // PDPT -> PD
+        let pdpte = pdpt.add(pdpt_index as usize);
+        if *pdpte & PRESENT == 0 {
+            return None;
+        }
+        let pd = ((*pdpte & !0xFFF) + globals::KERNEL_PHYSICAL_MAP_BASE)
+            as *mut u64;
+
+        // PD -> PT
+        let pde = pd.add(pd_index as usize);
+        if *pde & PRESENT == 0 {
+            return None;
+        }
+        let pt = ((*pde & !0xFFF) + globals::KERNEL_PHYSICAL_MAP_BASE)
+            as *mut u64;
+
+        // PT -> PTE
+        let pte = pt.add(pt_index as usize);
+        if *pte & PRESENT == 0 {
+            return None;
+        }
+
+        Some((*pte & !0xFFF) | offset)
+    }
+}
+
+/// Scans a given table for any entries present in it.
+///
+/// Used by `unmap_page` for page table reclamation after unmapping.
+/// 
+/// # Arguments
+///
+/// * `table` - Virtual pointer to the page table to scan.
+/// 
+/// # Returns
+/// 
+/// Returns `true` if all 512 entries in the given page table are absent, false
+/// otherwise.
+///
+/// # Safety
+///
+/// Dereferences raw pointers.
+fn is_table_empty(table: *mut u64) -> bool {
+    for i in 0..512 {  // Max 512 entries to investigate
+        if unsafe { *table.add(i) } & PRESENT != 0 {
+            return false;
+        }
+    }
+    true
+}
+
+/// Unmaps a single virtual page, zeroes its PTE, invalidates the TLB entry,
+/// and reclaims any intermediate page tables (PT, PD, PDPT) that become
+/// empty as a result.
+///
+/// It does not free the physical frame the mapping pointed to; that is the
+/// caller's responsibility. The Memory Manager's function `unmap_and_free_page`
+/// can be used for the common case where we might want to both unmap and free
+/// a page.
+///
+/// # Arguments
+///
+/// * `pmm`          - Physical memory manager, used to free emptied tables.
+/// * `pml4_addr`    - Virtual pointer to the root PML4 table.
+/// * `virtual_addr` - The virtual address whose mapping should be removed.
+///
+/// # Returns
+/// 
+/// Returns `true` if a live mapping was found and removed, `false` if the
+/// address was already unmapped at any level of the walk.
+/// 
+/// # Safety
+///
+/// Dereferences raw pointers derived from the page-table walk.
+fn unmap_page(pmm: &mut PhysicalMemoryManager, pml4_addr: *mut u64,
+    virtual_addr: u64
+) -> bool {
+    let pml4_index = (virtual_addr >> 39) & 0x1FF;
+    let pdpt_index = (virtual_addr >> 30) & 0x1FF;
+    let pd_index   = (virtual_addr >> 21) & 0x1FF;
+    let pt_index   = (virtual_addr >> 12) & 0x1FF;
+
+    unsafe {
+        // First, we need to walk down the hierarchy collecting pointers to
+        // each level's entry.
+
+        // PML4 -> PDPT
+        let pml4e = pml4_addr.add(pml4_index as usize);
+        if *pml4e & PRESENT == 0 {
+            return false;
+        }
+        let pdpt = ((*pml4e & !0xFFF) + globals::KERNEL_PHYSICAL_MAP_BASE)
+            as *mut u64;
+
+        // PDPT -> PD
+        let pdpte = pdpt.add(pdpt_index as usize);
+        if *pdpte & PRESENT == 0 {
+            return false;
+        }
+        let pd = ((*pdpte & !0xFFF) + globals::KERNEL_PHYSICAL_MAP_BASE)
+            as *mut u64;
+
+        // PD -> PT
+        let pde = pd.add(pd_index as usize);
+        if *pde & PRESENT == 0 {
+            return false;
+        }
+        let pt = ((*pde & !0xFFF) + globals::KERNEL_PHYSICAL_MAP_BASE)
+            as *mut u64;
+
+        // PT -> PTE
+        let pte = pt.add(pt_index as usize);
+        if *pte & PRESENT == 0 {
+            return false;
+        }
+
+        // Zero the PTE and flush this TLB slot
+        pte.write_volatile(0u64);
+        invalidate_page(virtual_addr);
+
+        // After zeroing the PTE, we walk back up the hierarchy to reclaim
+        // tables that are now empty. We have to check at each level whether
+        // the table is now entirely empty before freeing it.
+
+        // PT: if empty, free it and clear its entry in the PD
+        if is_table_empty(pt) {
+            let pt_phys = *pde & !0xFFF;
+            pde.write_volatile(0u64);
+            pmm.free_page(pt_phys);
+
+            // PD: if empty after losing the PT, free it and clear its PDPT
+            // entry
+            if is_table_empty(pd) {
+                let pd_phys = *pdpte & !0xFFF;
+                pdpte.write_volatile(0u64);
+                pmm.free_page(pd_phys);
+
+                // PDPT: if empty after losing the PD, free it and clear its
+                // PML4 entry
+                if is_table_empty(pdpt) {
+                    let pdpt_phys = *pml4e & !0xFFF;
+                    pml4e.write_volatile(0u64);
+                    pmm.free_page(pdpt_phys);
+                }
+            }
+        }
+
+        true
     }
 }
 
@@ -542,7 +739,7 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
         if !should_map { continue; }
 
         for i in 0..descriptor.num_pages {
-            let phys = descriptor.physical_start + i * 0x1000;
+            let phys = descriptor.physical_start + i * PAGE_SIZE;
             map_page(pmm, pml4, phys, phys, PRESENT | WRITABLE);
         }
     }
@@ -553,7 +750,7 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
         map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE);
         map_page(pmm, pml4, addr + globals::KERNEL_VIRTUAL_BASE, addr,
             PRESENT | WRITABLE);
-        addr += 0x1000;
+        addr += PAGE_SIZE;
     }
 
     // Identity map + higher-half map: kernel stack with NX bit
@@ -564,7 +761,7 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
         map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE | NX);
         map_page(pmm, pml4, addr + globals::KERNEL_VIRTUAL_BASE, addr,
             PRESENT | WRITABLE | NX);
-        addr += 0x1000;
+        addr += PAGE_SIZE;
     }
 
     // Identity map: framebuffer (low address only; higher-half map is set
@@ -579,7 +776,7 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
     let mut addr = fb_start;
     while addr < fb_end {
         map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE);
-        addr += 0x1000;
+        addr += PAGE_SIZE;
     }
 
     // Identity map: UEFI memory map buffer
@@ -588,7 +785,7 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
     let mut addr = map_start;
     while addr < map_end {
         map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE);
-        addr += 0x1000;
+        addr += PAGE_SIZE;
     }
 
     pml4
@@ -622,7 +819,7 @@ fn build_direct_map(pmm: &mut PhysicalMemoryManager, pml4: *mut u64,
     memory_map: &MemoryMapInfo
 ) {
     // The virtual base at which physical address 0 will appear.
-    // E.g., physical 0x1000 -> virtual KERNEL_PHYSICAL_MAP_BASE + 0x1000.
+    // E.g., physical PAGE_SIZE -> virtual KERNEL_PHYSICAL_MAP_BASE + PAGE_SIZE.
     let phys_map_base = globals::KERNEL_PHYSICAL_MAP_BASE;
 
     // Initialize the descriptor pointer and compute the number of segments
@@ -659,7 +856,7 @@ fn build_direct_map(pmm: &mut PhysicalMemoryManager, pml4: *mut u64,
 
         // Map every 4 KB page in this descriptor's physical range
         for i in 0..descriptor.num_pages {
-            let phys = descriptor.physical_start + i * 0x1000;
+            let phys = descriptor.physical_start + i * PAGE_SIZE;
             map_page(pmm, pml4, phys_map_base + phys, phys, flags);
         }
     }
@@ -706,8 +903,8 @@ fn map_framebuffer_higher_half(pmm: &mut PhysicalMemoryManager, pml4: *mut u64,
     let mut virt = globals::KERNEL_FRAMEBUFFER_VIRTUAL_BASE;
     while phys < fb_phys_end {
         map_page(pmm, pml4, virt, phys, PRESENT | WRITABLE);
-        phys += 0x1000;
-        virt += 0x1000;
+        phys += PAGE_SIZE;
+        virt += PAGE_SIZE;
     }
 }
 
@@ -935,8 +1132,8 @@ fn reclaim_boot_memory(pmm: &mut PhysicalMemoryManager,
         // Iterate over each 4 KB page within this descriptor's range
         for i in 0..desc.num_pages {
             // Physical start and end addresses of this page (inclusive)
-            let page_start = desc.physical_start + i * 0x1000;
-            let page_end = page_start + 0x1000 - 1;
+            let page_start = desc.physical_start + i * PAGE_SIZE;
+            let page_end = page_start + PAGE_SIZE - 1;
 
             if page_start == 0 { continue; }  // Always skip the null/zero page
 
@@ -1125,30 +1322,6 @@ impl MemoryManager {
         reclaim_boot_memory(&mut self.pmm, memory_map);
     }
 
-    /// Delegates to the inner `PhysicalMemoryManager::alloc_page()` and
-    /// allocates a physical page.
-    pub fn alloc_page(&mut self) -> Option<u64> {
-        self.pmm.alloc_page()
-    }
-
-    /// Delegates to the inner `PhysicalMemoryManager::free_page()` and frees
-    /// a physical page.
-    pub fn free_page(&mut self, addr: u64) {
-        self.pmm.free_page(addr)
-    }
-
-    /// Delegates to the `map_page` and maps a physical page to a virtual page.
-    pub fn map_page(&mut self, virtual_addr: u64, physical_addr: u64,
-        flags: u64
-    ) {
-        map_page(&mut self.pmm, self.pml4, virtual_addr, physical_addr, flags);
-    }
-
-    // TODO: implement in the future when needed
-    //pub fn unmap_page(&mut self, virtual_addr: u64) {
-    //    // future
-    //}
-
     /// Converts a physical address to a virtual address through the direct map.
     ///
     /// Valid only after `init_higher_half` has been called.
@@ -1181,6 +1354,73 @@ impl MemoryManager {
     #[inline(always)]
     pub fn virt_to_phys(virt: u64) -> u64 {
         virt - globals::KERNEL_PHYSICAL_MAP_BASE
+    }
+
+    /// Delegates to the inner `PhysicalMemoryManager::alloc_page()` and
+    /// allocates a physical page.
+    pub fn alloc_page(&mut self) -> Option<u64> {
+        self.pmm.alloc_page()
+    }
+
+    /// Delegates to the inner `PhysicalMemoryManager::free_page()` and frees
+    /// a physical page.
+    pub fn free_page(&mut self, addr: u64) {
+        self.pmm.free_page(addr)
+    }
+
+    /// Delegates to the `map_page` and maps a physical page to a virtual page.
+    pub fn map_page(&mut self, virtual_addr: u64, physical_addr: u64,
+        flags: u64
+    ) {
+        map_page(&mut self.pmm, self.pml4, virtual_addr, physical_addr, flags);
+    }
+
+    /// Delegates to the `get_physical_addr` and resolves a virtual address to
+    /// its mapped physical address.
+    pub fn get_physical_addr(&self, virtual_addr: u64) -> Option<u64> {
+        get_physical_addr(self.pml4, virtual_addr)
+    }
+
+    /// Unmaps the virtual page, reclaiming any intermediate page tables that
+    /// become empty as a result.
+    ///
+    /// It does not free the underlying physical frame. The function
+    /// `unmap_and_free_page` can be used for the common case where want want
+    /// both. Some of the use cases when we would not want to free the physical
+    /// frame after unmapping a virtual page are:
+    ///   - Copy-on-write technique
+    ///   - Shared memory
+    ///   - Reference-counted frames
+    ///   - Remapping
+    ///
+    /// # Returns
+    /// 
+    /// Returns `true` if a mapping existed and was removed, `false` if the
+    /// address was already unmapped at any level of the walk.
+    pub fn unmap_page(&mut self, virtual_addr: u64) -> bool {
+        unmap_page(&mut self.pmm, self.pml4, virtual_addr)
+    }
+
+    /// Same as `unmap_page`, except this function also returns its physical
+    /// frame to the PMM.
+    ///
+    /// This is the common case. But, `unmap_page` can be used directly if we
+    /// need to handle the physical frame ourselves (e.g., shared mappings, COW,
+    /// etc).
+    pub fn unmap_and_free_page(&mut self, virtual_addr: u64) {
+        if let Some(phys) = self.get_physical_addr(virtual_addr) {
+            self.unmap_page(virtual_addr);
+            self.pmm.free_page(phys);
+        }
+    }
+
+    /// Gets the number of free physical pages from the Physical Memory Manager.
+    /// 
+    /// # Returns
+    /// 
+    /// Returns the number of free physical frames in the PMM.
+    pub fn free_page_count(&self) -> u64 {
+        self.pmm.free_pages
     }
 }
 

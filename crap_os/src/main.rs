@@ -187,8 +187,16 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     fbprintln!("  - Kernel framebuffer address is: 0x{:X}\n", fb_ptr);
 
     // Testing memory manager and heap allocator
-    //tests::memory::test_memory_manager();
-    //tests::memory::test_heap_allocator();
+    sprintln!("[*] Running general Memory Manager tests...");
+    fbprintln!("[*] Running general Memory Manager tests...");
+    tests::memory::test_memory_manager();
+    sprintln!("[+] All Memory Manager tests passed!\n");
+    fbprintln!("[+] All Memory Manager tests passed!\n");
+    sprintln!("[*] Running MM heap allocator tests...");
+    fbprintln!("[*] Running MM heap allocator tests...");
+    tests::memory::test_heap_allocator();
+    sprintln!("[+] All MM heap allocator tests passed!\n");
+    fbprintln!("[+] All MM heap allocator tests passed!\n");
     
     // Done for now.. loop forever and ever
     loop {

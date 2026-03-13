@@ -9,6 +9,7 @@
 //
 //   0xFFFF800000000000  Physical direct map base (64TB window, covers all RAM)
 //   0xFFFF900000000000  Framebuffer              (permanent virtual window)
+//   0xFFFFA00000000000  Kernel heap              64 MB max heap size
 //   0xFFFFFFFF80000000  Kernel image + stack     Sits in the top 2GB of the
 //                                                48-bit canonical address space
 //

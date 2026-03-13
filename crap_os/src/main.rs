@@ -12,13 +12,18 @@ mod system_routines;
 mod serial;
 mod framebuffer;
 mod memory_manager;
+mod tests;
 
 use framebuffer::FramebufferInfo;
-use memory_manager::MemoryMapInfo;
-use memory_manager::PhysicalMemoryManager;
-use globals::MEMORY_MANAGER;
-use crate::memory_manager::MemoryManager;
+use memory_manager::GlobalHeapAllocator;
 
+// Need to explicitly linke the built-in alloc crate in a no_std environment
+extern crate alloc;
+
+// Register a zero-sized type that implements `GlobalAlloc` by delegating to
+// `globals::KERNEL_HEAP`.
+#[global_allocator]
+static GA: GlobalHeapAllocator = GlobalHeapAllocator;
 
 /// System-wide error code values.
 #[repr(u32)]
@@ -47,8 +52,8 @@ pub enum DebugLevel {
 #[derive(Copy, Clone)]
 pub struct BootInfo {
     magic: u64,
-    framebuffer_info: *const FramebufferInfo,
-    memory_map_info: *const MemoryMapInfo,
+    framebuffer_info: *const framebuffer::FramebufferInfo,
+    memory_map_info: *const memory_manager::MemoryMapInfo,
 }
 
 /// Kernel entry point routine.
@@ -87,7 +92,8 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     // Initialize the physical memory manager. This enumerates and maps physical
     // pages to enable page tables in the next step.
-    let mut pmm = PhysicalMemoryManager::init(&framebuffer, &memory_map);
+    let mut pmm = memory_manager::PhysicalMemoryManager::init(
+        &framebuffer, &memory_map);
 
     // Initialize page tabes and store PML4, which is used in the next step to
     // replace CR3 and then inline-jump to higher-half virtual space.
@@ -113,7 +119,8 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // Properly initialize the memory manager from the higher-half kernel space.
     // This uses the physical manager passed as a struct and the PML4 address of
     // the new page tables we created before the jump.
-    let mut memory_manager = MemoryManager::init(pmm, pml4 as u64);
+    let mut memory_manager = memory_manager::MemoryManager::init(
+        pmm, pml4 as u64);
 
     // Complete virtual memory initialization. This includes building direct
     // physical map, mapping the framebuffer to the new kernel space, reloading
@@ -121,7 +128,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // boot memory.
     memory_manager.init_higher_half(&framebuffer, &memory_map);
     {
-        let mut global_mm = MEMORY_MANAGER.lock();
+        let mut global_mm = globals::MEMORY_MANAGER.lock();
         *global_mm = Some(memory_manager);
     }
 
@@ -138,6 +145,9 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     // We can now use serial port IRQ-safe global spinlock macros
     sprint_debug!(DebugLevel::INFO, "[INFO] Serial initialized successfully");
+
+    // Initialie kernel heap and pre-map 16 pages (64 KB)
+    globals::KERNEL_HEAP.heap.lock().init(16);
 
     // Initialize framebuffer writer for global macros
     {
@@ -176,6 +186,17 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     }
     fbprintln!("  - Kernel framebuffer address is: 0x{:X}\n", fb_ptr);
 
+    // Testing memory manager and heap allocator
+    sprintln!("[*] Running general Memory Manager tests...");
+    fbprintln!("[*] Running general Memory Manager tests...");
+    tests::memory::test_memory_manager();
+    sprintln!("[+] All Memory Manager tests passed!\n");
+    fbprintln!("[+] All Memory Manager tests passed!\n");
+    sprintln!("[*] Running MM heap allocator tests...");
+    fbprintln!("[*] Running MM heap allocator tests...");
+    tests::memory::test_heap_allocator();
+    sprintln!("[+] All MM heap allocator tests passed!\n");
+    fbprintln!("[+] All MM heap allocator tests passed!\n");
     
     // Done for now.. loop forever and ever
     loop {

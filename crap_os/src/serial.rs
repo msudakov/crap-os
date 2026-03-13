@@ -1,5 +1,5 @@
 // =============================================================================
-// CrapOS Serial Printer Module
+// Serial Printer Module
 // =============================================================================
 // 
 // This module contains the needed functionality to write messages to a serial

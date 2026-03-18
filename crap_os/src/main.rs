@@ -17,7 +17,7 @@ pub mod idt;
 mod tests;
 
 use framebuffer::FramebufferInfo;
-use memory_manager::GlobalHeapAllocator;
+use memory_manager::kernel_heap::GlobalHeapAllocator;
 
 // Need to explicitly linke the built-in alloc crate in a no_std environment
 extern crate alloc;
@@ -94,12 +94,12 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     // Initialize the physical memory manager. This enumerates and maps physical
     // pages to enable page tables in the next step.
-    let mut pmm = memory_manager::PhysicalMemoryManager::init(
+    let mut pmm = memory_manager::pmm::PhysicalMemoryManager::init(
         &framebuffer, &memory_map);
 
     // Initialize page tabes and store PML4, which is used in the next step to
     // replace CR3 and then inline-jump to higher-half virtual space.
-    let pml4 = memory_manager::init_page_tables(&mut pmm, &framebuffer,
+    let pml4 = memory_manager::vmm::init_page_tables(&mut pmm, &framebuffer,
         &memory_map);
 
     // Inline switch the CR3 for the new PML4

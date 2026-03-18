@@ -8,8 +8,9 @@
 use crate::spinlock::StaticIrqSpinLock;
 use crate::serial::SerialWriter;
 use crate::framebuffer::FramebufferWriter;
-use crate::{DebugLevel, memory_manager};
+use crate::{DebugLevel};
 use crate::memory_manager::MemoryManager;
+use crate::memory_manager::kernel_heap::LockedHeap;
 use crate::gdt::{Tss, IstStack, DOUBLE_FAULT_IST_SIZE};
 use crate::gdt::{Gdt, GdtEntry};
 
@@ -35,7 +36,11 @@ pub const KERNEL_VIRTUAL_BASE: u64             = 0xFFFFFFFF80000000;
 /// Default page size of 4096 bytes
 pub const PAGE_SIZE: u64 = 0x1000;
 
-
+// Kernel physical start and physical end tags collected from the linker
+unsafe extern "C" {
+    pub static __kernel_phys_start: u8;
+    pub static __kernel_phys_end: u8;
+}
 
 
 
@@ -57,8 +62,8 @@ pub static MEMORY_MANAGER: StaticIrqSpinLock<Option<MemoryManager>> =
     StaticIrqSpinLock::new(None);
 
 /// Kernel heap singleton for 64 MB max
-pub static KERNEL_HEAP: memory_manager::LockedHeap =
-    memory_manager::LockedHeap::new(KERNEL_HEAP_BASE, 64 * 1024 * 1024);
+pub static KERNEL_HEAP: LockedHeap = LockedHeap::new(
+    KERNEL_HEAP_BASE, 64 * 1024 * 1024);
 
 /// The kernel's single TSS instance.
 ///

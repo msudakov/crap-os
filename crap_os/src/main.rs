@@ -12,6 +12,8 @@ mod system_routines;
 mod serial;
 mod framebuffer;
 mod memory_manager;
+pub mod gdt;
+pub mod idt;
 mod tests;
 
 use framebuffer::FramebufferInfo;
@@ -68,7 +70,7 @@ pub struct BootInfo {
 /// * `boot_info` - Raw pointer to a `BootInfo` structure from the bootloader.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
-    // Disable maskable hardware interrupts, until we implement IDT
+    // Disable maskable hardware interrupts, until we initialize IDT
     unsafe { core::arch::asm!("cli", options(nostack, preserves_flags)) };
 
     // Initialize serial port. This is needed here (before the memory manager
@@ -149,6 +151,12 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // Initialie kernel heap and pre-map 16 pages (64 KB)
     globals::KERNEL_HEAP.heap.lock().init(16);
 
+    unsafe { crate::gdt::init_gdt(); }  // Initialize Global Descriptor Table
+    //unsafe { crate::idt::init_idt(); }  // Initialize Interrupt Descriptor Table
+
+    // IDT is initialized; it is safe to re-enable maskable hardware interrupts
+    //unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+
     // Initialize framebuffer writer for global macros
     {
         let mut writer = globals::FRAMEBUFFER.lock();
@@ -197,10 +205,11 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     tests::memory::test_heap_allocator();
     sprintln!("[+] All MM heap allocator tests passed!\n");
     fbprintln!("[+] All MM heap allocator tests passed!\n");
-    
-    // Done for now.. loop forever and ever
+
+
+    // Done for now, loop HALT forever
     loop {
-        //core::arch::asm!("hlt");
+        unsafe { core::arch::asm!("hlt") };
     } 
 }
 

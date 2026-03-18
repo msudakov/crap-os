@@ -15,21 +15,20 @@
 //
 // UEFI runtime services are intentionally NOT mapped. ExitBootServices() was
 // already called in the bootloader, making SetVirtualAddressMap() illegal.
-// Shutdown and reset are handled via ACPI and legacy port 0x64 respectively,
-// with zero firmware involvement at runtime.
+// Shutdown and reset will be handled via ACPI and legacy port 0x64,
+// respectively, with zero firmware involvement at runtime.
 
 use core::alloc::{GlobalAlloc, Layout};
-use crate::globals;
+use crate::globals::{PAGE_SIZE, KERNEL_PHYSICAL_MAP_BASE, KERNEL_VIRTUAL_BASE,
+    KERNEL_FRAMEBUFFER_VIRTUAL_BASE, MEMORY_MANAGER, KERNEL_HEAP};
 use core::ptr;
-
-const PAGE_SIZE: u64 = 0x1000;  // Default page size of 4096 bytes
 
 pub const PRESENT: u64 = 1 << 0;   // Must be 1 for the entry to be valid
 pub const WRITABLE: u64 = 1 << 1;  // If 1, writes are allowed; if 0, read-only
 // pub const USER: u64 = 1 << 2;     // If 1, user-mode access is allowed
 pub const NX: u64 = 1 << 63;
 
-// Kernel physical start and physical end tags collected from the linker.
+// Kernel physical start and physical end tags collected from the linker
 unsafe extern "C" {
     static __kernel_phys_start: u8;
     static __kernel_phys_end: u8;
@@ -50,8 +49,9 @@ pub struct MemoryMapInfo {
 }
 
 /// UEFI memory region types. After ExitBootServices(), only
-/// EfiRuntimeServicesCode/Data and EfiACPIMemoryNVS must remain reserved.
-/// Everything else is either already free or reclaimable by the kernel.
+/// EfiRuntimeServicesCode/Data and EfiACPIMemoryNVS will remain reserved.
+/// Everything else is either already free or reclaimable by the kernel. Efi
+/// services code/data will be reclaimed at the end of initialization.
 #[repr(u32)]
 #[allow(dead_code)]
 #[derive(PartialEq, Eq, PartialOrd, Copy, Clone)]
@@ -98,30 +98,6 @@ impl EfiMemoryDescriptor {
     }
 }
 
-/// GDT (Global Descriptor Table). The GDT must exist and the segment selectors
-/// loaded into the segment registers must reference valid descriptors. The
-/// `align(8)` ensures the table is 8-byte aligned, which is required by the
-/// the x86_64 architecture.
-#[repr(C, align(8))]
-struct Gdt {
-    null:    u64,  // The null descriptor
-    code64:  u64,  // Entry 1 (selector 0x08): 64-bit kernel code segment
-    data64:  u64,  // Entry 2 (selector 0x10): 64-bit kernel data segment
-}
-
-// The kernel's statically allocated GDT, stored in the `.rodata` section.
-///
-/// Using a `static` (rather than stack-allocated) ensures the table remains
-/// alive for the entire life of the kernel and is not accidentally freed.
-/// When the _start routine is invoked from the bootloader, we're still running
-/// under UEFI's GDT and CS segment. This creates our own GDT that the kernel
-/// loads at the very start of the routine.
-static GDT: Gdt = Gdt {
-    null:   0x0000000000000000,
-    code64: 0x00AF9A000000FFFF,  // 64-bit code, ring 0
-    data64: 0x00CF92000000FFFF,  // 64-bit data, ring 0
-};
-
 // =============================================================================
 // Physical Memory Manager
 // =============================================================================
@@ -151,9 +127,9 @@ static GDT: Gdt = Gdt {
 // is allocated, the reverse takes place: the PMM follows the head to the
 // soon-to-be allocated page to read its first 8 bytes and find the
 // next-in-line page for later allocations. It then updates the head address
-// to point to the following page and returns the requsted page to the caller.
+// to point to the following page and returns the requested page to the caller.
 
-/// Physical Memory Manager strcuture.
+/// Physical Memory Manager structure.
 #[allow(dead_code)]
 pub struct PhysicalMemoryManager {
     kernel_load_addr: u64,       // Where the bootloader mapped the kernel image
@@ -161,7 +137,7 @@ pub struct PhysicalMemoryManager {
     kernel_stack_base_addr: u64, // Base address of the initial kernel stack
     kernel_stack_size: u64,      // Size of the initial kernel stack
     framebuffer_addr: u64,       // Where the framebuffer is located
-    framebuffer_size: u64,       // Framebuffer total size (its width x height)
+    framebuffer_size: u64,       // Framebuffer total size
     memory_map_addr: u64,        // Memory map structure address from bootloader
     memory_map_size: u64,        // Total memory map size
     memory_map_desc_size: u64,   // Size of a memory map descriptor structure
@@ -183,7 +159,7 @@ impl PhysicalMemoryManager {
         memory_map: &MemoryMapInfo,
     ) -> Self {
         // Need to divide BPP by 8 because it historically represents
-        // bits-per-pixel instead of bytes.
+        // bits-per-pixel instead of bytes-per-pixel.
         let fb_size = (framebuffer_info.framebuffer_height as u64) *
             (framebuffer_info.framebuffer_width as u64) *
             (framebuffer_info.framebuffer_bpp as u64 / 8);
@@ -222,8 +198,11 @@ impl PhysicalMemoryManager {
             // Boot services and loader memory are reclaimed later in
             // reclaim_boot_memory(), after page tables are fully established.
             if memory_descriptor.region_type !=
-                EfiMemoryType::EfiConventionalMemory { continue; }
+                EfiMemoryType::EfiConventionalMemory {
+                    continue;
+            }
 
+            // Loop through every page in the descriptor segment
             for i in 0..memory_descriptor.num_pages {
                 let page_start_addr =
                     memory_descriptor.physical_start + i * PAGE_SIZE;
@@ -233,7 +212,7 @@ impl PhysicalMemoryManager {
                     continue;  // Skipping physical page 0 (null page)
                 }
 
-                // Skip pages that collide with regions we depend on
+                // Skip pages that collide with regions we depend on.
                 // Detect collision on the UEFI memory map region
                 if page_overlaps(page_start_addr, page_end_addr,
                     pmm.memory_map_addr,
@@ -287,7 +266,7 @@ impl PhysicalMemoryManager {
     /// Dereferences a raw pointer by address value.
     fn free_page(&mut self, address: u64) {
         let virt = if self.is_higher_half {
-            address + globals::KERNEL_PHYSICAL_MAP_BASE
+            address + KERNEL_PHYSICAL_MAP_BASE
         } else {
             address
         };
@@ -313,13 +292,20 @@ impl PhysicalMemoryManager {
     /// Dereferences a raw pointer by address value.
     fn alloc_page(&mut self) -> Option<u64> {
         let head = self.free_list_head?;
+
         let virt = if self.is_higher_half {
-            head + globals::KERNEL_PHYSICAL_MAP_BASE
+            head + KERNEL_PHYSICAL_MAP_BASE
         } else {
             head
         };
+
         let next = unsafe { *(virt as *const u64) };
-        self.free_list_head = if next == 0 { None } else { Some(next) };
+        self.free_list_head = if next == 0 {
+            None
+        } else {
+            Some(next)
+        };
+
         self.free_pages -= 1;
         Some(head)
     }
@@ -403,7 +389,7 @@ unsafe fn get_or_create_table(pmm: &mut PhysicalMemoryManager, table: *mut u64,
             let new_table_phys = pmm.alloc_page().expect(
                 "[CRITICAL] OOM during page table walk!");
             let new_table_virt = if pmm.is_higher_half {
-                new_table_phys + globals::KERNEL_PHYSICAL_MAP_BASE
+                new_table_phys + KERNEL_PHYSICAL_MAP_BASE
             } else {
                 new_table_phys
             };
@@ -413,10 +399,11 @@ unsafe fn get_or_create_table(pmm: &mut PhysicalMemoryManager, table: *mut u64,
 
         let phys = *entry & !0xFFF;
         let virt = if pmm.is_higher_half {
-            phys + globals::KERNEL_PHYSICAL_MAP_BASE
+            phys + KERNEL_PHYSICAL_MAP_BASE
         } else {
             phys
         };
+
         virt as *mut u64
     }
 }
@@ -489,7 +476,7 @@ unsafe fn get_physical_addr(pml4_addr: *mut u64, virtual_addr: u64
         if *pml4e & PRESENT == 0 {
             return None;
         }
-        let pdpt = ((*pml4e & !0xFFF) + globals::KERNEL_PHYSICAL_MAP_BASE)
+        let pdpt = ((*pml4e & !0xFFF) + KERNEL_PHYSICAL_MAP_BASE)
             as *mut u64;
 
         // PDPT -> PD
@@ -497,7 +484,7 @@ unsafe fn get_physical_addr(pml4_addr: *mut u64, virtual_addr: u64
         if *pdpte & PRESENT == 0 {
             return None;
         }
-        let pd = ((*pdpte & !0xFFF) + globals::KERNEL_PHYSICAL_MAP_BASE)
+        let pd = ((*pdpte & !0xFFF) + KERNEL_PHYSICAL_MAP_BASE)
             as *mut u64;
 
         // PD -> PT
@@ -505,7 +492,7 @@ unsafe fn get_physical_addr(pml4_addr: *mut u64, virtual_addr: u64
         if *pde & PRESENT == 0 {
             return None;
         }
-        let pt = ((*pde & !0xFFF) + globals::KERNEL_PHYSICAL_MAP_BASE)
+        let pt = ((*pde & !0xFFF) + KERNEL_PHYSICAL_MAP_BASE)
             as *mut u64;
 
         // PT -> PTE
@@ -585,7 +572,7 @@ fn unmap_page(pmm: &mut PhysicalMemoryManager, pml4_addr: *mut u64,
         if *pml4e & PRESENT == 0 {
             return false;
         }
-        let pdpt = ((*pml4e & !0xFFF) + globals::KERNEL_PHYSICAL_MAP_BASE)
+        let pdpt = ((*pml4e & !0xFFF) + KERNEL_PHYSICAL_MAP_BASE)
             as *mut u64;
 
         // PDPT -> PD
@@ -593,7 +580,7 @@ fn unmap_page(pmm: &mut PhysicalMemoryManager, pml4_addr: *mut u64,
         if *pdpte & PRESENT == 0 {
             return false;
         }
-        let pd = ((*pdpte & !0xFFF) + globals::KERNEL_PHYSICAL_MAP_BASE)
+        let pd = ((*pdpte & !0xFFF) + KERNEL_PHYSICAL_MAP_BASE)
             as *mut u64;
 
         // PD -> PT
@@ -601,7 +588,7 @@ fn unmap_page(pmm: &mut PhysicalMemoryManager, pml4_addr: *mut u64,
         if *pde & PRESENT == 0 {
             return false;
         }
-        let pt = ((*pde & !0xFFF) + globals::KERNEL_PHYSICAL_MAP_BASE)
+        let pt = ((*pde & !0xFFF) + KERNEL_PHYSICAL_MAP_BASE)
             as *mut u64;
 
         // PT -> PTE
@@ -765,7 +752,7 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
     while addr < pmm.kernel_end {
         unsafe { map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE) };
         unsafe {
-            map_page(pmm, pml4, addr + globals::KERNEL_VIRTUAL_BASE, addr,
+            map_page(pmm, pml4, addr + KERNEL_VIRTUAL_BASE, addr,
             PRESENT | WRITABLE)
         };
         addr += PAGE_SIZE;
@@ -778,7 +765,7 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
     while addr < stack_end {
         unsafe { map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE | NX) };
         unsafe {
-            map_page(pmm, pml4, addr + globals::KERNEL_VIRTUAL_BASE, addr,
+            map_page(pmm, pml4, addr + KERNEL_VIRTUAL_BASE, addr,
             PRESENT | WRITABLE | NX)
         };
         addr += PAGE_SIZE;
@@ -824,7 +811,7 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
 /// (KERNEL_PHYSICAL_MAP_BASE + P).
 /// 
 /// This is a standard approach that lets the rest of the kernel avoid reasoning
-/// about raw physical addresses above the PMM layer. We use the functions
+/// about raw physical addresses above the PMM layer. We can use the functions
 /// `MemoryManager::phys_to_virt()` / `virt_to_phys()` to convert between them.
 /// The EfiRuntimeServicesCode regions are mapped without NX since the firmware
 /// may store executable trampolines there, even though we never call them.
@@ -840,7 +827,7 @@ fn build_direct_map(pmm: &mut PhysicalMemoryManager, pml4: *mut u64,
 ) {
     // The virtual base at which physical address 0 will appear.
     // E.g., physical PAGE_SIZE -> virtual KERNEL_PHYSICAL_MAP_BASE + PAGE_SIZE.
-    let phys_map_base = globals::KERNEL_PHYSICAL_MAP_BASE;
+    let phys_map_base = KERNEL_PHYSICAL_MAP_BASE;
 
     // Initialize the descriptor pointer and compute the number of segments
     let mut descriptor_addr = memory_map.memory_map_addr;
@@ -920,7 +907,7 @@ fn map_framebuffer_higher_half(pmm: &mut PhysicalMemoryManager, pml4: *mut u64,
     // Walk through every 4 KB page in the framebuffer's physical range and
     // create a virtual mapping for each one.
     let mut phys = fb_phys_start;
-    let mut virt = globals::KERNEL_FRAMEBUFFER_VIRTUAL_BASE;
+    let mut virt = KERNEL_FRAMEBUFFER_VIRTUAL_BASE;
     while phys < fb_phys_end {
         unsafe { map_page(pmm, pml4, virt, phys, PRESENT | WRITABLE) };
         phys += PAGE_SIZE;
@@ -966,8 +953,8 @@ fn reload_gdt_and_idt() {
     let idt_limit = u16::from_le_bytes(idt_desc[0..2].try_into().unwrap());
 
     // Compute the direct-map virtual addresses
-    let gdt_virt = gdt_phys + globals::KERNEL_PHYSICAL_MAP_BASE;
-    let idt_virt = idt_phys + globals::KERNEL_PHYSICAL_MAP_BASE;
+    let gdt_virt = gdt_phys + KERNEL_PHYSICAL_MAP_BASE;
+    let idt_virt = idt_phys + KERNEL_PHYSICAL_MAP_BASE;
 
     // Build the new 10-byte pseudo-descriptors with virtual base addresses 
     let mut new_gdt = [0u8; 10];
@@ -992,64 +979,12 @@ fn reload_gdt_and_idt() {
     };
 }
 
-/// Installs the kernel's statically defined GDT and performs a far return
-/// to reload the Code Segment (CS) register with the new 64-bit code selector.
-///
-/// The far return is needed because  the CS register cannot be changed with a
-/// normal `MOV` instruction. The only ways to update CS in long mode are:
-///   - A far CALL / far JMP / far RET (which load a new CS:RIP pair atomically)
-///   - An interrupt return (IRETQ)
-///
-/// The trick used here is to push a fake "return address" (new CS selector +
-/// new RIP) onto the stack and execute `RETFQ` (64-bit far return), which pops
-/// CS and RIP simultaneously, effectively performing a long jump to the
-/// instruction after `RETFQ` with the new CS loaded.
-///
-/// # Safety
-/// 
-/// Uses inline assembly to load the kernel's own GDT.
-fn load_gdt() {
-    unsafe {
-        // Build a 10-byte GDTR pseudo-descriptor on the stack as a byte array
-        // to avoid any alignment or packed struct issues.
-        let mut gdtr = [0u8; 10];
-
-        // The reason for `- 1` is that the CPU adds 1 when interpreting the
-        // size of GDT structure.
-        let limit = (core::mem::size_of::<Gdt>() - 1) as u16;
-
-        // Using the virtual address of the static GDT object
-        let base  = &GDT as *const Gdt as u64;
-
-        // Pack limit (bytes 0–1) and base (bytes 2–9) in little-endian order
-        gdtr[0..2].copy_from_slice(&limit.to_le_bytes());
-        gdtr[2..10].copy_from_slice(&base.to_le_bytes());
-
-        core::arch::asm!(
-            "lgdt [{gdtr}]",  // Load the new GDT from our gdtr buffer
-            "push 0x8",       // Push the new code segment selector
-            "lea rax, [rip + 3f]",  // Compute the address of label "3:"
-            "push rax",  // Push it as the return address
-            "retfq",     // Far return: execution continues at label 3 below
-            "3:",        // Execution resumes here with the new CS loaded
-            "mov ax, 0x10",  // Reload the GDT index 2 segment register
-            "mov ds, ax",    // Reload the data segment
-            "mov es, ax",    // Reload the extra segment
-            "mov ss, ax",    // Reload the stack segment
-            "mov fs, ax",    // Reload FS
-            "mov gs, ax",    // Reload GS
-            gdtr = in(reg) gdtr.as_ptr(),  // Pointer to the GDTR buffer
-            out("rax") _,    // RAX is clobbered; discard the output
-        )
-    };
-}
-
 /// Removes the identity-mapped lower half of the virtual address space by
 /// zeroing out the lower 256 PML4 entries to unmap everything below the
 /// halfway point.
 ///
 /// After modifying the page tables, CR3 must be reloaded so the CPU discards
-/// any cached translations in TLB. After this point no address below
+/// any cached translations in TLB. After this point, no address below
 /// 0xFFFF800000000000 is valid. This is the point of no return for
 /// identity-mapped access. PML4 entries 0–255 span the entire lower half of
 /// the canonical address space (0x0000000000000000 – 0x00007FFFFFFFFFFF).
@@ -1065,7 +1000,7 @@ fn load_gdt() {
 fn remove_identity_maps(pml4_phys: u64) {
     // Convert the physical PML4 address to a virtual address through the
     // direct physical map that we just built.
-    let pml4_virt = (pml4_phys + globals::KERNEL_PHYSICAL_MAP_BASE) as *mut u64;
+    let pml4_virt = (pml4_phys + KERNEL_PHYSICAL_MAP_BASE) as *mut u64;
     
     // Zero out the first 256 PML4 entries (the lower half).
     for i in 0..256usize {
@@ -1089,10 +1024,10 @@ fn remove_identity_maps(pml4_phys: u64) {
 }
 
 /// Returns all bootloader and UEFI boot-services memory to the physical memory
-/// allocator so the kernel can reuse those pages as general-purpose RAM.
+/// manager so the kernel can reuse those pages as general-purpose RAM.
 ///
 /// These pages could not be freed earlier because they contained data the
-/// kernel needed during initialisation, but they are now safe to reclaim as the
+/// kernel needed during initialization, but they are now safe to reclaim as the
 /// last step in `init_higher_half`. The following are intentionally not
 /// reclaimed here:
 ///   - EfiRuntimeServicesCode/Data  (firmware reserved; do not touch)
@@ -1124,7 +1059,7 @@ fn reclaim_boot_memory(pmm: &mut PhysicalMemoryManager,
 ) {
     // Obtain the virtual address of the first descriptor
     let mut descriptor_addr = memory_map.memory_map_addr
-        + globals::KERNEL_PHYSICAL_MAP_BASE;
+        + KERNEL_PHYSICAL_MAP_BASE;
     
     // Number of descriptor entries in the map
     let num_segments = memory_map.memory_map_size / memory_map.descriptor_size;
@@ -1155,7 +1090,7 @@ fn reclaim_boot_memory(pmm: &mut PhysicalMemoryManager,
             let page_start = desc.physical_start + i * PAGE_SIZE;
             let page_end = page_start + PAGE_SIZE - 1;
 
-            if page_start == 0 { continue; }  // Always skip the null/zero page
+            if page_start == 0 { continue; }  // Skipping the null/zero page
 
             // Skip pages that overlap with the UEFI memory map itself
             if page_overlaps(page_start, page_end, map_start, map_end) {
@@ -1224,7 +1159,7 @@ impl MemoryManager {
     ///
     /// # Arguments
     /// 
-    /// * `pmm` - An already-initialised physical memory manager.
+    /// * `pmm` - An already-initialized physical memory manager.
     /// * `pml4_phys` - The physical address of the root PML4 table. It is
     ///   updated to virtual address stored in `pml4` during `init_higher_half`.
     /// 
@@ -1269,7 +1204,7 @@ impl MemoryManager {
             pmm,
             // At this point identity mapping is in effect, so the physical
             // address can be used directly as a pointer. The `pml4` starts as
-            // physical and is updated yo virtual in `init_higher_half`.
+            // physical and is updated to virtual in `init_higher_half`.
             pml4: pml4_phys as *mut u64,
             pml4_phys,
         }
@@ -1303,7 +1238,7 @@ impl MemoryManager {
         // KERNEL_PHYSICAL_MAP_BASE + P once switched to higher-half addressing.
         build_direct_map(&mut self.pmm, self.pml4, memory_map);
 
-        // Step 2: Tell the PMM that it should now use higher-half (virtual)
+        // Step 2: Instruct the PMM that it should now use higher-half (virtual)
         // addresses. Future allocations will return virtual pointers rather
         // than physical ones.
         self.pmm.is_higher_half = true;
@@ -1318,7 +1253,7 @@ impl MemoryManager {
         // `map_page` calls will dereference this pointer and must use the
         // virtual address.
         self.pml4 = (
-            self.pml4_phys + globals::KERNEL_PHYSICAL_MAP_BASE) as *mut u64;
+            self.pml4_phys + KERNEL_PHYSICAL_MAP_BASE) as *mut u64;
 
         // Step 5: Reload GDTR and IDTR so they point to the virtual
         // (higher-half) addresses of those tables. If we skipped this step, the
@@ -1327,8 +1262,10 @@ impl MemoryManager {
         reload_gdt_and_idt();
 
         // Step 6: Load the kernel's own minimal 3-entry GDT (null, code, data).
-        // Also reloads CS, DS, ES, SS, FS, and GS with the correct selectors.
-        load_gdt();
+        // This was a placeholder step, before we implemented a better GDT. It
+        // is no longer needed, and the proper GDT is initialized right after
+        // the Memory Manager finishes its init steps. This is kept here for
+        // completeness.
 
         // Step 7: Zero out the lower 256 PML4 entries (the identity-mapped
         // region) and flush the TLB. After this, virtual addresses below
@@ -1356,7 +1293,7 @@ impl MemoryManager {
     /// window.
     #[inline(always)]
     pub fn phys_to_virt(phys: u64) -> u64 {
-        phys + globals::KERNEL_PHYSICAL_MAP_BASE
+        phys + KERNEL_PHYSICAL_MAP_BASE
     }
 
     /// Converts a virtual address (in the direct map window) back to a physical
@@ -1373,7 +1310,7 @@ impl MemoryManager {
     /// Returns the underlying physical address.
     #[inline(always)]
     pub fn virt_to_phys(virt: u64) -> u64 {
-        virt - globals::KERNEL_PHYSICAL_MAP_BASE
+        virt - KERNEL_PHYSICAL_MAP_BASE
     }
 
     /// Delegates to the inner `PhysicalMemoryManager::alloc_page()` and
@@ -1420,7 +1357,7 @@ impl MemoryManager {
     /// become empty as a result.
     ///
     /// It does not free the underlying physical frame. The function
-    /// `unmap_and_free_page` can be used for the common case where want want
+    /// `unmap_and_free_page` can be used for the common case where we want
     /// both. Some of the use cases when we would not want to free the physical
     /// frame after unmapping a virtual page are:
     ///   - Copy-on-write technique
@@ -1481,11 +1418,11 @@ unsafe impl Send for MemoryManager {}
 // =============================================================================
 //
 // This implementation is a linked free-list allocator backed by the kernel VMM.
-// It implements `GlobalAlloc` so Rust's `alloc` crate (Box, Vec, String, etc.)
+// It implements `GlobalAlloc`, so Rust's `alloc` crate (Box, Vec, String, etc.)
 // works transparently once registered with `#[global_allocator]`.
 //
 // The heap grows on demand from a fixed virtual address range
-// ([base, base + max_size)). Physical pages are mapped into that range in
+// `[base, base + max_size)`. Physical pages are mapped into that range in
 // chunks via "grow" calls. Free memory is tracked as a singly-linked list of
 // `FreeBlock` nodes, kept sorted by ascending address. Keeping the list sorted
 // allows adjacent freed blocks to be merged (coalesced) in a single pass,
@@ -1493,14 +1430,14 @@ unsafe impl Send for MemoryManager {}
 //
 // Each allocation stores an `AllocHeader` immediately before the returned
 // pointer, plus a copy of the `data_offset` field in the 8 bytes directly
-// before the data pointer. This redundant copy allows `deallocate` to
+// before the returned data pointer. This redundant copy allows `deallocate` to
 // recover the block start without reading the full header, which is crucial
-// when the pointer is the only information the caller provides on free.
+// when the pointer is the only information the caller provides on `free`.
 //
 // > This is the memory layout of an allocated block:
-//   [ AllocHeader | <alignment padding> | <data> ]
-//     ^                                   ^
-//     block_ptr                           pointer returned to caller
+//   [ AllocHeader | <alignment padding> | data_offset | <data> ]
+//     ^                                                  ^^^^
+//     block_ptr                                      pointer returned to caller
 //
 // > This is another view of the same layout of an allocated block:
 //
@@ -1534,8 +1471,8 @@ unsafe impl Send for MemoryManager {}
 //
 // > Free list ordering:
 //     The free list is kept sorted by ascending block address. This makes
-//     coalescing O(1) per `free` (check immediate neighbours) at the cost of
-//     O(n) sorted insertion, which is acceptable since `free` is not on a
+//     coalescing O(1) per `free` (just check immediate neighbors) at the cost
+//     of O(n) sorted insertion, which is acceptable since `free` is not on a
 //     hot path in a kernel heap.
 //
 // > Lock ordering (this must never be inverted!):
@@ -1580,7 +1517,7 @@ struct FreeBlock {
 }
 
 impl FreeBlock {
-    /// The size of the `FreeBlock` header in bytes (typically 16 on 64-bit).
+    /// The size of the `FreeBlock` header in bytes (16 bytes on x64).
     ///
     /// This is used as the minimum block size; any region smaller than this
     /// cannot store the free-list node and therefore cannot be tracked.
@@ -1614,7 +1551,7 @@ struct AllocHeader {
 }
 
 impl AllocHeader {
-    /// The size of the `AllocHeader` in bytes (typically 16 on 64-bit).
+    /// The size of the `AllocHeader` in bytes (16 bytes on x64).
     ///
     /// Used as the base for computing `data_offset`: the data starts at least
     /// `AllocHeader::SIZE` bytes into the block, then rounded up further to
@@ -1628,9 +1565,8 @@ impl AllocHeader {
 
 /// The kernel heap allocator.
 ///
-/// Manages a virtual address range `[base, base + max_size)`, committing
-/// physical pages into it on demand and tracking free memory with a sorted
-/// linked free list.
+/// Manages a virtual address range, committing physical pages into it on
+/// demand and tracking free memory with a sorted linked free list.
 ///
 /// # Thread Safety
 /// 
@@ -1663,11 +1599,12 @@ unsafe impl Send for KernelHeap {}
 
 impl KernelHeap {
     /// Creates a new, empty `KernelHeap` covering the virtual range
-    /// `[base, base + max_size)`.
+    /// `[base, base + max_size)`, with `base` inclusive and `base + max_size`
+    /// exclusive.
     ///
-    /// No physical memory is mapped and no free blocks exist yet.
-    /// Call `KernelHeap::init` before making any allocations. The `const fn`
-    /// allows this to be used in `static` initialisers.
+    /// No physical memory is mapped and no free blocks exist yet. Call
+    /// `KernelHeap::init` before making any allocations. The `const fn`
+    /// allows this to be used in `static` initializers.
     /// 
     /// #Arguments
     /// 
@@ -1687,7 +1624,7 @@ impl KernelHeap {
     /// allocations.
     ///
     /// Must be called once after the MemoryManager has been placed in the
-    /// global and is initialised.
+    /// global and is initialized.
     pub fn init(&mut self, initial_pages: u64) {
         self.grow(initial_pages);
     }
@@ -1705,12 +1642,12 @@ impl KernelHeap {
     /// 
     /// * `num_pages` - The number of physical pages to insert into the heap.
     fn grow(&mut self, num_pages: u64) {
-        let bytes = num_pages * PAGE_SIZE;  // Convert page count to bytes
+        let num_bytes = num_pages * PAGE_SIZE;  // Convert page count to bytes
         
         // Enforce the hard upper bound on the heap's virtual range
         assert!(
-            self.committed + bytes <= self.max_size,
-            "[KERNEL_HEAP] grow() would exceed max heap size"
+            self.committed + num_bytes <= self.max_size,
+            "[KERNEL_HEAP] Out of heap memory: grow() would exceed max size"
         );
 
         // The virtual address at which the new region starts. New regions are
@@ -1721,7 +1658,7 @@ impl KernelHeap {
             // Lock the global memory manager, which also disables interrupts
             // so an interrupt handler cannot try to allocate concurrently
             // while we're in mid-grow.
-            let mut mm_guard = globals::MEMORY_MANAGER.lock();
+            let mut mm_guard = MEMORY_MANAGER.lock();
             let mm = mm_guard.as_mut()
                 .expect("[KERNEL_HEAP] MemoryManager is not initialized");
 
@@ -1742,18 +1679,18 @@ impl KernelHeap {
         } // MEMORY_MANAGER lock dropped here, and interrupts are re-enabled
 
         // Record that these bytes are now committed
-        self.committed += bytes;
+        self.committed += num_bytes;
 
         // Add the entire newly committed region to the free list as one big
         // block. This will merge it with adjacent blocks if possible.
         unsafe {
             self.insert_free_block_sorted(region_virtual_addr as *mut u8,
-                bytes as usize);
+                num_bytes as usize);
         }
     }
 
     /// Inserts a raw memory region into the sorted free list and immediately
-    /// attempts to coalesce it with its neighbours. The free list is kept in
+    /// attempts to coalesce it with its neighbors. The free list is kept in
     /// ascending order of pointer value. This makes coalescing of adjacent
     /// blocks possible in O(1) after insertion.
     ///
@@ -1782,13 +1719,13 @@ impl KernelHeap {
             "[KERNEL_HEAP] block is too small to hold FreeBlock header"
         );
 
-        // Find the correct insertion positionvy walking the list until we find
+        // Find the correct insertion position by walking the list until we find
         // the first node whose address is >= `ptr`.
         // After the loop:
         //   `prev` = the node that should precede our new block
-        //      (null means insert at head);
+        //      (if null, it means insert at head);
         //   `next` = the node that should follow our new block
-        //      (null = insert at tail).
+        //      (if null, it means insert at tail).
         let mut prev: *mut FreeBlock = ptr::null_mut();
         let mut next = self.free_list;
 
@@ -1896,19 +1833,19 @@ impl KernelHeap {
         (total_size, data_offset)
     }
 
-    /// Allocates a block of memory satisfying a given `layout`.
+    /// Allocates a block of memory, satisfying a given `layout`.
     ///
-    /// Performs a first-fit search through the sorted free list, meaning we
-    /// return the first free block that is large enough, rather than
-    /// searching for the best-fitting or smallest-fitting block. This is fast
-    /// (O(n) in the number of free blocks) and tends to leave larger blocks
+    /// Performs a first-fit search through the sorted free list. We return
+    /// the first free block that is large enough, rather than searching for
+    /// the best-fitting or smallest-fitting block. This runs in the order O(n)
+    /// (in the number of free blocks) and tends to leave larger blocks
     /// intact at the end of the list. If no block is large enough, `grow` is
     /// called to commit more physical pages, which adds a new large free block
     /// and retries from the list head.
     /// 
     /// # Arguments
     /// 
-    /// * `layout`  -  Layout to satisfy with this allocation.
+    /// * `layout`  -  Memory block layout to satisfy with this allocation.
     /// 
     /// # Returns
     ///
@@ -1916,16 +1853,16 @@ impl KernelHeap {
     /// aligned as required by `layout`, or a null pointer on failure
     /// (only possible if `max_size` is exhausted and the PMM is also full).
     pub unsafe fn allocate(&mut self, layout: Layout) -> *mut u8 {
-        // Compute how much raw memory we need and where the data starts
+        // Compute how much raw memory we need and where the data will start
         let (total_size, data_offset) = Self::allocation_sizes(&layout);
 
-        // `prev` and `cur` are the two-pointer hand-over-hand walk used to
-        // splice a node out of the singly-linked list when we find a fit.
-        let mut prev: *mut FreeBlock = ptr::null_mut();
-        let mut cur  = self.free_list;  // Start at the head of the free list
+        // `previous` and `current` are the two-pointer hand-over-hand walk used
+        // to splice a node out of the singly-linked list when we find a fit.
+        let mut previous: *mut FreeBlock = ptr::null_mut();
+        let mut current  = self.free_list;  // Start at the head of free list
 
         loop {
-            if cur.is_null() {
+            if current.is_null() {
                 // Reached the end of the free list without finding a fit.
                 // Grow the heap by at least `total_size` bytes, rounded up to
                 // whole pages. We request a minimum of 4 pages (16 KB) to
@@ -1937,33 +1874,33 @@ impl KernelHeap {
 
                 // After growing, restart the search from the beginning. The
                 // new free block may have been coalesced anywhere in the list.
-                cur  = self.free_list;
-                prev = ptr::null_mut();
+                current  = self.free_list;
+                previous = ptr::null_mut();
                 continue;
             }
 
             // Read the size of the current free block
-            let available = unsafe { (*cur).size };
+            let available = unsafe { (*current).size };
 
             if available >= total_size {
                 // This block is big enough, and we can use it
 
                 // Read `next` before we overwrite the block's memory with the
                 // header
-                let next = unsafe { (*cur).next };
+                let next = unsafe { (*current).next };
 
-                // Splice `cur` out of the free list
-                if prev.is_null() {
-                    // `cur` is the head of the list
+                // Splice `current` out of the free list
+                if previous.is_null() {
+                    // `current` is the head of the list
                     self.free_list = next;
                 }
                 else {
-                    // `cur` is in the middle or tail, so bypass it
-                    unsafe { (*prev).next = next };
+                    // `current` is in the middle or tail, so bypass it
+                    unsafe { (*previous).next = next };
                 }
 
                 // Raw pointer to the start of the block we just removed
-                let block_ptr = cur as *mut u8;
+                let block_ptr = current as *mut u8;
 
                 // Check if there is enough space left over after the allocation
                 // to create a new free block from the remainder
@@ -2013,8 +1950,8 @@ impl KernelHeap {
             }
 
             // This block is too small, and we need to advance to the next one
-            prev = cur;
-            cur  = unsafe { (*cur).next };
+            previous = current;
+            current  = unsafe { (*current).next };
         }
     }
 
@@ -2030,7 +1967,7 @@ impl KernelHeap {
     ///  2. Set `block_ptr = ptr - data_offset`;
     ///  3. Cast `block_ptr` to `*const AllocHeader` and read `total_size`;
     ///  4. Call `insert_free_block_sorted(block_ptr, total_size)` to return
-    ///     the memory to the free list and coalesce with any neighbours.
+    ///     the memory to the free list and coalesce with any neighbors.
     ///
     /// # Arguments
     /// 
@@ -2052,7 +1989,7 @@ impl KernelHeap {
         let block_ptr = unsafe { ptr.sub(data_offset) };
 
         // 3: Read `total_size` from the `AllocHeader` at the block start
-        let header     = block_ptr as *const AllocHeader;
+        let header = block_ptr as *const AllocHeader;
         let total_size = unsafe { (*header).total_size };
 
         // 4: Return the entire block to the free list
@@ -2098,16 +2035,15 @@ impl LockedHeap {
 
 /// A zero-sized type that implements Rust's `GlobalAlloc` trait.
 ///
-/// By registering this as the `#[global_allocator]`, all Rust allocations
-/// (Box, Vec, String, Arc, etc.) are routed through `KERNEL_HEAP`.
+/// By registering this as the `#[global_allocator]`, all Rust allocations in
+/// the kernel (Box, Vec, String, Arc, etc.) are routed through `KERNEL_HEAP`.
 ///
 /// The struct itself holds no state; all state lives in the `KERNEL_HEAP`
 /// static, accessed via `globals::KERNEL_HEAP`.
 pub struct GlobalHeapAllocator;
 
 unsafe impl GlobalAlloc for GlobalHeapAllocator {
-    /// Called by Rust's runtime whenever memory is allocated (e.g. Box::new,
-    /// Vec::push when growing, String::from, etc.).
+    /// Called by Rust's runtime whenever memory is allocated.
     ///
     /// It locks the heap, runs the first-fit allocator, and returns the
     /// received pointer. If the heap needs to grow to satisfy the request,
@@ -2115,7 +2051,7 @@ unsafe impl GlobalAlloc for GlobalHeapAllocator {
     /// 
     /// # Arguments
     /// 
-    /// * `layout`  -  Layout to satisfy with this allocation.
+    /// * `layout`  -  Memory block layout to satisfy with this allocation.
     ///
     /// # Returns
     /// 
@@ -2126,11 +2062,10 @@ unsafe impl GlobalAlloc for GlobalHeapAllocator {
     /// The caller (Rust's allocator infrastructure) guarantees that `layout`
     /// has non-zero size and a power-of-two alignment.
     unsafe fn alloc(&self, layout: Layout) -> *mut u8 {
-        unsafe { globals::KERNEL_HEAP.heap.lock().allocate(layout) }
+        unsafe { KERNEL_HEAP.heap.lock().allocate(layout) }
     }
 
-    /// Called by Rust's runtime whenever memory is freed (e.g. drop(box_val),
-    /// Vec going out of scope, etc.).
+    /// Called by Rust's runtime whenever memory is freed.
     ///
     /// It locks the heap and returns the block to the free list. The passed
     /// `layout` is actually ignored because Rust's `GlobalAlloc` contract
@@ -2152,6 +2087,6 @@ unsafe impl GlobalAlloc for GlobalHeapAllocator {
     unsafe fn dealloc(&self, ptr: *mut u8, layout: Layout) {
         // Explicitly ignore layout, as all info is in the block header
         let _ = layout;
-        unsafe { globals::KERNEL_HEAP.heap.lock().deallocate(ptr) }
+        unsafe { KERNEL_HEAP.heap.lock().deallocate(ptr) }
     }
 }

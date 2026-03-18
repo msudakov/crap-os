@@ -13,6 +13,7 @@ use crate::memory_manager::MemoryManager;
 use crate::memory_manager::kernel_heap::LockedHeap;
 use crate::gdt::{Tss, IstStack, DOUBLE_FAULT_IST_SIZE};
 use crate::gdt::{Gdt, GdtEntry};
+use crate::idt::{Idt, IdtEntry};
 
 // =============================================================================
 // Basic Globals
@@ -41,8 +42,6 @@ unsafe extern "C" {
     pub static __kernel_phys_start: u8;
     pub static __kernel_phys_end: u8;
 }
-
-
 
 
 // =============================================================================
@@ -101,4 +100,15 @@ pub static mut GDT: Gdt = Gdt {
         GdtEntry::NULL,           // 0x18 - TSS low  (patched at runtime)
         GdtEntry::NULL,           // 0x20 - TSS high (patched at runtime)
     ],
+};
+
+/// The global IDT instance.
+/// 
+/// `static mut` is safe here for the same reason as the GDT: the IDT is written
+/// once during single-threaded init (before interrupts are enabled) and is
+/// read-only after that from Rust's perspective. The CPU reads it on every
+/// exception/interrupt, but never writes to it. So, this does not need to be
+/// in a spinlock.
+pub static mut IDT: Idt = Idt {
+    entries: [IdtEntry::missing(); 256],
 };

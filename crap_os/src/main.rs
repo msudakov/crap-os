@@ -12,7 +12,7 @@ mod system_routines;
 mod hardware_manager;
 mod memory_manager;
 pub mod gdt;
-//pub mod idt;
+pub mod idt;
 mod tests;
 
 use hardware_manager::framebuffer::FramebufferInfo;
@@ -151,10 +151,10 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     globals::KERNEL_HEAP.heap.lock().init(16);
 
     unsafe { crate::gdt::init_gdt(); }  // Initialize Global Descriptor Table
-    //unsafe { crate::idt::init_idt(); }  // Initialize Interrupt Descriptor Table
+    unsafe { crate::idt::init_idt(); }  // Initialize Interrupt Descriptor Table
 
     // IDT is initialized; it is safe to re-enable maskable hardware interrupts
-    //unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+    unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
 
     // Initialize framebuffer writer for global macros
     {

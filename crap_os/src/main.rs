@@ -9,14 +9,13 @@ mod globals;
 mod spinlock;
 mod macros;
 mod system_routines;
-mod serial;
-mod framebuffer;
+mod hardware_manager;
 mod memory_manager;
 pub mod gdt;
-pub mod idt;
+//pub mod idt;
 mod tests;
 
-use framebuffer::FramebufferInfo;
+use hardware_manager::framebuffer::FramebufferInfo;
 use memory_manager::kernel_heap::GlobalHeapAllocator;
 
 // Need to explicitly linke the built-in alloc crate in a no_std environment
@@ -54,7 +53,7 @@ pub enum DebugLevel {
 #[derive(Copy, Clone)]
 pub struct BootInfo {
     magic: u64,
-    framebuffer_info: *const framebuffer::FramebufferInfo,
+    framebuffer_info: *const hardware_manager::framebuffer::FramebufferInfo,
     memory_map_info: *const memory_manager::MemoryMapInfo,
 }
 
@@ -76,7 +75,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // Initialize serial port. This is needed here (before the memory manager
     // initialization and the jump to higher-half kernel space) to print debug
     // messages. These writes are not spinlocked at this early stage yet.
-    crate::serial::init(globals::COM1_PORT);
+    hardware_manager::serial::init(globals::COM1_PORT);
     
     // Validate boot_info pointer, then dereference boot_info
     if boot_info.is_null() {loop{unsafe{core::arch::asm!("hlt")}}}
@@ -135,12 +134,12 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     }
 
     // We can now safely print basic messages via serial port
-    crate::serial::print("[INFO] Initialized higher-half kernel\n");
+    hardware_manager::serial::print("[INFO] Initialized higher-half kernel\n");
 
     // Initialize serial port writer for global macros
     {
         let mut writer = globals::SERIAL.lock();
-        *writer = Some(serial::SerialWriter::new(
+        *writer = Some(hardware_manager::serial::SerialWriter::new(
             globals::COM1_PORT,
         ));
     }
@@ -160,7 +159,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // Initialize framebuffer writer for global macros
     {
         let mut writer = globals::FRAMEBUFFER.lock();
-        *writer = Some(framebuffer::FramebufferWriter::new(
+        *writer = Some(hardware_manager::framebuffer::FramebufferWriter::new(
             globals::KERNEL_FRAMEBUFFER_VIRTUAL_BASE as *mut u32,
             framebuffer.framebuffer_width,
             framebuffer.framebuffer_height,
@@ -229,7 +228,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     // Print this without acquiring the spinlock
-    crate::serial::print("\n!!! KERNEL PANIC !!!\n");
+    hardware_manager::serial::print("\n!!! KERNEL PANIC !!!\n");
 
     if let Some(location) = info.location() {
         sprintln!("Panic occurred in file '{}' at line {}", location.file(),

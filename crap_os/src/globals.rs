@@ -6,8 +6,8 @@
 // synchronized and protected from races and deadlocks.
 
 use crate::spinlock::StaticIrqSpinLock;
-use crate::serial::SerialWriter;
-use crate::framebuffer::FramebufferWriter;
+use crate::hardware_manager::serial::SerialWriter;
+use crate::hardware_manager::framebuffer::FramebufferWriter;
 use crate::{DebugLevel};
 use crate::memory_manager::MemoryManager;
 use crate::memory_manager::kernel_heap::LockedHeap;

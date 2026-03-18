@@ -9,13 +9,14 @@ mod globals;
 mod spinlock;
 mod macros;
 mod system_routines;
-mod serial;
-mod framebuffer;
+mod hardware_manager;
 mod memory_manager;
+pub mod gdt;
+pub mod idt;
 mod tests;
 
-use framebuffer::FramebufferInfo;
-use memory_manager::GlobalHeapAllocator;
+use hardware_manager::framebuffer::FramebufferInfo;
+use memory_manager::kernel_heap::GlobalHeapAllocator;
 
 // Need to explicitly linke the built-in alloc crate in a no_std environment
 extern crate alloc;
@@ -52,7 +53,7 @@ pub enum DebugLevel {
 #[derive(Copy, Clone)]
 pub struct BootInfo {
     magic: u64,
-    framebuffer_info: *const framebuffer::FramebufferInfo,
+    framebuffer_info: *const hardware_manager::framebuffer::FramebufferInfo,
     memory_map_info: *const memory_manager::MemoryMapInfo,
 }
 
@@ -68,13 +69,13 @@ pub struct BootInfo {
 /// * `boot_info` - Raw pointer to a `BootInfo` structure from the bootloader.
 #[unsafe(no_mangle)]
 pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
-    // Disable maskable hardware interrupts, until we implement IDT
+    // Disable maskable hardware interrupts, until we initialize IDT
     unsafe { core::arch::asm!("cli", options(nostack, preserves_flags)) };
 
     // Initialize serial port. This is needed here (before the memory manager
     // initialization and the jump to higher-half kernel space) to print debug
     // messages. These writes are not spinlocked at this early stage yet.
-    crate::serial::init(globals::COM1_PORT);
+    hardware_manager::serial::init(globals::COM1_PORT);
     
     // Validate boot_info pointer, then dereference boot_info
     if boot_info.is_null() {loop{unsafe{core::arch::asm!("hlt")}}}
@@ -92,12 +93,12 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     // Initialize the physical memory manager. This enumerates and maps physical
     // pages to enable page tables in the next step.
-    let mut pmm = memory_manager::PhysicalMemoryManager::init(
+    let mut pmm = memory_manager::pmm::PhysicalMemoryManager::init(
         &framebuffer, &memory_map);
 
     // Initialize page tabes and store PML4, which is used in the next step to
     // replace CR3 and then inline-jump to higher-half virtual space.
-    let pml4 = memory_manager::init_page_tables(&mut pmm, &framebuffer,
+    let pml4 = memory_manager::vmm::init_page_tables(&mut pmm, &framebuffer,
         &memory_map);
 
     // Inline switch the CR3 for the new PML4
@@ -133,12 +134,12 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     }
 
     // We can now safely print basic messages via serial port
-    crate::serial::print("[INFO] Initialized higher-half kernel\n");
+    hardware_manager::serial::print("[INFO] Initialized higher-half kernel\n");
 
     // Initialize serial port writer for global macros
     {
         let mut writer = globals::SERIAL.lock();
-        *writer = Some(serial::SerialWriter::new(
+        *writer = Some(hardware_manager::serial::SerialWriter::new(
             globals::COM1_PORT,
         ));
     }
@@ -149,10 +150,16 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // Initialie kernel heap and pre-map 16 pages (64 KB)
     globals::KERNEL_HEAP.heap.lock().init(16);
 
+    unsafe { crate::gdt::init_gdt(); }  // Initialize Global Descriptor Table
+    unsafe { crate::idt::init_idt(); }  // Initialize Interrupt Descriptor Table
+
+    // IDT is initialized; it is safe to re-enable maskable hardware interrupts
+    unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+
     // Initialize framebuffer writer for global macros
     {
         let mut writer = globals::FRAMEBUFFER.lock();
-        *writer = Some(framebuffer::FramebufferWriter::new(
+        *writer = Some(hardware_manager::framebuffer::FramebufferWriter::new(
             globals::KERNEL_FRAMEBUFFER_VIRTUAL_BASE as *mut u32,
             framebuffer.framebuffer_width,
             framebuffer.framebuffer_height,
@@ -197,10 +204,11 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     tests::memory::test_heap_allocator();
     sprintln!("[+] All MM heap allocator tests passed!\n");
     fbprintln!("[+] All MM heap allocator tests passed!\n");
-    
-    // Done for now.. loop forever and ever
+
+
+    // Done for now, loop HALT forever
     loop {
-        //core::arch::asm!("hlt");
+        unsafe { core::arch::asm!("hlt") };
     } 
 }
 
@@ -220,7 +228,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
     // Print this without acquiring the spinlock
-    crate::serial::print("\n!!! KERNEL PANIC !!!\n");
+    hardware_manager::serial::print("\n!!! KERNEL PANIC !!!\n");
 
     if let Some(location) = info.location() {
         sprintln!("Panic occurred in file '{}' at line {}", location.file(),

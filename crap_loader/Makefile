@@ -33,7 +33,7 @@ craploader.so: $(OBJS)
 
 clean:
 	rm -f $(OBJS) craploader.so $(TARGET)
-	rm -f boot.img boot.vmdk kernel.bin
+	rm -f boot.img boot.vmdk boot.vdi kernel.bin
 
 # Create a bootable disk image
 disk: $(TARGET)

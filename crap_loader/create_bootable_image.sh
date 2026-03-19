@@ -5,6 +5,7 @@ set -e
 
 IMAGE_FILE="boot.img"
 VMDK_FILE="boot.vmdk"
+VDI_FILE="boot.vdi"
 IMAGE_SIZE_MB=64
 MOUNT_POINT="./mnt"
 
@@ -66,4 +67,6 @@ sudo umount "$MOUNT_POINT"
 sudo losetup -d "$LOOP_DEVICE"
 rmdir "$MOUNT_POINT"
 
+# Convert raw image into VMware and VirtualBox disk images
 qemu-img convert -f raw -O vmdk $IMAGE_FILE $VMDK_FILE
+qemu-img convert -f raw -O vdi $IMAGE_FILE $VDI_FILE

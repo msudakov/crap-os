@@ -24,7 +24,7 @@
 // in the CPU chip package, uses the CR3 register to locate the PML4. It then
 // traverses the levels to resolve the final physical address.
 
-use crate::memory_manager::{PRESENT, WRITABLE, NX};
+use crate::memory_manager::{PRESENT, WRITABLE, PWT, PCD, NX};
 use crate::memory_manager::{MemoryMapInfo, EfiMemoryDescriptor, EfiMemoryType};
 use crate::memory_manager::pmm::{PhysicalMemoryManager, page_overlaps};
 use crate::globals::{KERNEL_PHYSICAL_MAP_BASE, KERNEL_VIRTUAL_BASE, PAGE_SIZE,
@@ -534,6 +534,27 @@ pub fn build_direct_map(pmm: &mut PhysicalMemoryManager, pml4: *mut u64,
         for i in 0..descriptor.num_pages {
             let phys = descriptor.physical_start + i * PAGE_SIZE;
             unsafe { map_page(pmm, pml4, phys_map_base + phys, phys, flags) };
+        }
+    }
+
+    // Map APIC MMIO regions through the direct physical map.
+    //
+    // These are not in the UEFI memory map as conventional memory, so the
+    // loop above skips them. We map them explicitly here so the APIC driver
+    // can reach them at KERNEL_PHYSICAL_MAP_BASE + phys_addr.
+    let apic_regions: [(u64, u64); 2] = [
+        (0xFEE00000, 0x1000),  // Local APIC
+        (0xFEC00000, 0x1000),  // I/O APIC
+    ];
+
+    for (phys_base, size) in apic_regions {
+        let mut phys = phys_base;
+        while phys < phys_base + size {
+            unsafe {
+                map_page(pmm, pml4, KERNEL_PHYSICAL_MAP_BASE + phys, phys,
+                    PRESENT | WRITABLE | PWT | PCD);
+            }
+            phys += PAGE_SIZE;
         }
     }
 }

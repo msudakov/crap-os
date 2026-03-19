@@ -55,7 +55,8 @@
 // when the exception fired).
 
 use core::arch::asm;        // used in non-naked handlers (cr2 read, cpu_halt)
-use core::arch::naked_asm;  // used inside #[naked] trampolines
+use core::arch::naked_asm;  use crate::fbprint;
+// used inside #[naked] trampolines
 use crate::gdt::KERNEL_CS;
 use crate::globals::IDT;
 use crate::hardware_manager::serial::print as sprint;
@@ -404,6 +405,13 @@ make_exception_stub!(stub_vc,  handler_vmm_communication);    // #VC  vec 29
 make_exception_stub_error_code!(
     stub_sx, handler_security_exception);                     // #SX vec 30
 make_exception_stub!(stub_rsv31, handler_reserved);           // --   vec 31
+
+// Hardware IRQ handlers (APIC)
+make_exception_stub!(stub_apic_timer, handler_apic_timer);    // vec 0x20
+make_exception_stub!(
+    stub_apic_keyboard, handler_apic_keyboard);               // vec 0x21
+make_exception_stub!(
+    stub_apic_spurious, handler_apic_spurious);               // vec 0xFF
 
 /// Generic stub for hardware IRQ vectors 32–255. Pushes vector 0xFF as a
 /// placeholder and halts - these will be replaced by real handlers when the
@@ -769,11 +777,56 @@ extern "C" fn handler_security_exception(frame: &InterruptFrame) {
     cpu_halt();
 }
 
-/// Vectors: 32–255 Unhandled hardware IRQs
+/// Unhandled hardware IRQ vectors
 extern "C" fn handler_unhandled_irq(_frame: &InterruptFrame) {
-    // At this stage IRQs are masked; this should never fire. If it does,
-    // print a warning but do not halt.
-    sprint("[IRQ] Unhandled hardware interrupt (PIC/APIC not initialised)\n");
+    sprint("[IRQ] Unhandled hardware interrupt from APIC!\n");
+}
+
+/// Vector 0x20: APIC Timer
+extern "C" fn handler_apic_timer(_frame: &InterruptFrame) {
+    // Increment tick count
+    crate::hardware_manager::apic::TIMER_TICKS
+        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+
+    // Send End-of-Interrupt (EOI) to the APIC
+    unsafe { crate::hardware_manager::apic::eoi(); }
+}
+
+/// Vector 0x21: PS/2 Keyboard (routed via I/O APIC IRQ 1)
+extern "C" fn handler_apic_keyboard(_frame: &InterruptFrame) {
+    // We must read the scancode before EOI, or the keyboard controller may not
+    // assert another IRQ for the next keypress.
+    let scancode: u8;
+    unsafe {
+        // Read scancode into local variable
+        core::arch::asm!("in al, 0x60", out("al") scancode,
+            options(nomem, nostack));
+        
+        // Send End-of-Interrupt (EOI) to the APIC
+        crate::hardware_manager::apic::eoi();
+    }
+
+    if let Some(ascii) = crate::hardware_manager::keyboard::process_scancode(
+        scancode
+    ) {
+        // Convert the single byte to a str slice and print it to serial and
+        // framebuffer for now
+        let buf = [ascii];
+        if let Ok(s) = core::str::from_utf8(&buf) {
+            crate::hardware_manager::serial::print(s);
+            fbprint!("{s}");
+        }
+    }
+}
+
+/// Vector 0xFF: Spurious Interrupt
+///
+/// A spurious interrupt occurs when the CPU acknowledges an interrupt that
+/// was already resolved. Per the APIC spec, we must not send EOI for a
+/// spurious interrupt, as doing so would signal completion of a real interrupt
+/// that is still pending, corrupting the APIC's internal state.
+extern "C" fn handler_apic_spurious(_frame: &InterruptFrame) {
+    // Intentionally no EOI.
 }
 
 // =============================================================================
@@ -847,6 +900,14 @@ pub unsafe fn init_idt() {
                 stub_irq_generic as unsafe extern "C" fn() as u64, 0);
             i += 1;
         }
+
+        // APIC-specific vectors replace the generic stubs set by the loop above
+        (*idt)[0x20] = IdtEntry::interrupt_gate(
+            stub_apic_timer    as unsafe extern "C" fn() as u64, 0);
+        (*idt)[0x21] = IdtEntry::interrupt_gate(
+            stub_apic_keyboard as unsafe extern "C" fn() as u64, 0);
+        (*idt)[0xFF] = IdtEntry::interrupt_gate(
+            stub_apic_spurious as unsafe extern "C" fn() as u64, 0);
 
         // Build and load the IDTR pseudo-descriptor
         let idtr = IdtDescriptor {

@@ -7,3 +7,6 @@
 
 pub mod serial;
 pub mod framebuffer;
+pub mod acpi;
+pub mod apic;
+pub mod keyboard;

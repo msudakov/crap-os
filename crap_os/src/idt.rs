@@ -55,8 +55,7 @@
 // when the exception fired).
 
 use core::arch::asm;        // used in non-naked handlers (cr2 read, cpu_halt)
-use core::arch::naked_asm;  use crate::fbprint;
-// used inside #[naked] trampolines
+use core::arch::naked_asm;  // used inside #[naked] trampolines
 use crate::gdt::KERNEL_CS;
 use crate::globals::IDT;
 use crate::hardware_manager::serial::print as sprint;
@@ -814,7 +813,7 @@ extern "C" fn handler_apic_keyboard(_frame: &InterruptFrame) {
         let buf = [ascii];
         if let Ok(s) = core::str::from_utf8(&buf) {
             crate::hardware_manager::serial::print(s);
-            fbprint!("{s}");
+            crate::fbprint!("{s}");
         }
     }
 }

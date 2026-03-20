@@ -23,6 +23,9 @@ pub mod vmm;
 pub mod kernel_heap;
 pub mod memory_manager;
 
+// Re-export deeper structs
+pub use memory_manager::MemoryManager;
+
 pub const PRESENT: u64 = 1 << 0;   // Must be 1 for the entry to be valid
 pub const WRITABLE: u64 = 1 << 1;  // If 1, writes are allowed; if 0, read-only
 // pub const USER: u64 = 1 << 2;     // If 1, user-mode access is allowed

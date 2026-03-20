@@ -9,7 +9,7 @@ use crate::spinlock::StaticIrqSpinLock;
 use crate::hardware_manager::serial::SerialWriter;
 use crate::hardware_manager::framebuffer::FramebufferWriter;
 use crate::{DebugLevel};
-use crate::memory_manager::memory_manager::MemoryManager;
+use crate::memory_manager::MemoryManager;
 use crate::memory_manager::kernel_heap::LockedHeap;
 use crate::gdt::{Tss, IstStack, DOUBLE_FAULT_IST_SIZE};
 use crate::gdt::{Gdt, GdtEntry};

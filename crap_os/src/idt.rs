@@ -808,6 +808,15 @@ extern "C" fn handler_apic_keyboard(_frame: &InterruptFrame) {
     if let Some(ascii) = crate::hardware_manager::keyboard::process_scancode(
         scancode
     ) {
+        // TODO:
+        // Placeholder system shutdown control sequence (CTRL+ALT+ESC).
+        // Delete this later, the interrupt handler will initiate system
+        // shutdown.
+        if ascii == 0xFF {
+            crate::fbprint!("SHUTDOWN...");
+            return;
+        }
+
         // Convert the single byte to a str slice and print it to serial and
         // framebuffer for now
         let buf = [ascii];

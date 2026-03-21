@@ -1,5 +1,5 @@
 // =============================================================================
-// ACPI Table Parser
+// ACPI (Advanced Configuration and Power Interface) Table Parser
 // =============================================================================
 //
 // This module walks the ACPI table hierarchy to locate the two physical

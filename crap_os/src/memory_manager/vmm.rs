@@ -26,7 +26,7 @@
 
 use crate::memory_manager::{PRESENT, WRITABLE, PWT, PCD, NX};
 use crate::memory_manager::{MemoryMapInfo, EfiMemoryDescriptor, EfiMemoryType};
-use crate::memory_manager::pmm::{PhysicalMemoryManager, page_overlaps};
+use crate::memory_manager::{PhysicalMemoryManager, page_overlaps};
 use crate::globals::{KERNEL_PHYSICAL_MAP_BASE, KERNEL_VIRTUAL_BASE, PAGE_SIZE,
     KERNEL_FRAMEBUFFER_VIRTUAL_BASE};
 

@@ -21,10 +21,13 @@
 pub mod pmm;
 pub mod vmm;
 pub mod kernel_heap;
-pub mod memory_manager;
+pub mod manager;
 
-// Re-export deeper structs
-pub use memory_manager::MemoryManager;
+// Re-export public APIs
+pub use manager::MemoryManager;
+pub use pmm::{PhysicalMemoryManager, page_overlaps};
+pub use vmm::{init_page_tables};
+pub use kernel_heap::{LockedHeap, GlobalHeapAllocator};
 
 pub const PRESENT: u64 = 1 << 0;   // Must be 1 for the entry to be valid
 pub const WRITABLE: u64 = 1 << 1;  // If 1, writes are allowed; if 0, read-only

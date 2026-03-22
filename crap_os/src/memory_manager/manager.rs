@@ -7,7 +7,7 @@
 // This interface is implemented with IRQ-safe spinlock in the system globals.
 
 use crate::memory_manager::MemoryMapInfo;
-use crate::memory_manager::pmm::PhysicalMemoryManager;
+use crate::memory_manager::PhysicalMemoryManager;
 use crate::memory_manager::vmm;
 use crate::globals::KERNEL_PHYSICAL_MAP_BASE;
 

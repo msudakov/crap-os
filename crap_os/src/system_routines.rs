@@ -2,6 +2,7 @@
 // This file contains system helper routines
 // =============================================================================
 
+use core::sync::atomic::Ordering;
 use crate::globals::HEX_CHARS_UPPER;
 
 /// Converts a u64 to a fixed-width hex byte string.
@@ -109,4 +110,17 @@ pub fn restore_interrupts(flags: usize) {
             options(nomem, preserves_flags)
         );
     }
+}
+
+/// Fetches the current value of the monotonic tick counter.
+///
+/// The tick rate depends on the `initial_count` passed to `configure_timer`.
+/// It is not calibrated to wall-clock time by default.
+/// 
+/// # Returns
+/// 
+/// Returns the current value of the monotonic tick counter.
+#[allow(dead_code)]
+pub fn get_timer_ticks() -> u64 {
+    crate::globals::TIMER_TICKS.load(Ordering::Relaxed)
 }

@@ -16,8 +16,8 @@
 //      handler function via the System V AMD64 calling convention (RDI);
 //   4. On return from the handler, restores all GPRs and executes IRETQ.
 //
-// After the trampoline saves the registers, the stack is laid out as follows on
-// handler entry:
+// After the trampoline saves the registers, the stack is laid out as follows
+// on handler entry:
 //
 //   Higher addresses  (SS pushed first by CPU)
 //   +----------------------+
@@ -58,7 +58,7 @@ use core::arch::asm;        // used in non-naked handlers (cr2 read, cpu_halt)
 use core::arch::naked_asm;  // used inside #[naked] trampolines
 use crate::gdt::KERNEL_CS;
 use crate::globals::IDT;
-use crate::hardware_manager::serial::print as sprint;
+use crate::hardware_manager;
 
 // =============================================================================
 // InterruptFrame
@@ -461,7 +461,7 @@ pub unsafe extern "C" fn stub_irq_generic() {
 /// stack frame during a fault.
 macro_rules! exception_halt {
     ($msg:expr, $frame:expr) => {{
-        sprint(concat!("\n[EXCEPTION] ", $msg, "\n"));
+        hardware_manager::sprint(concat!("\n[EXCEPTION] ", $msg, "\n"));
         print_frame($frame);
         cpu_halt();
     }};
@@ -475,10 +475,10 @@ macro_rules! exception_halt {
 /// * `label` - The label to accompany the given value.
 /// * `value` - The `u64`` value to print.
 fn print_u64_field(label: &str, value: u64) {
-    sprint(label);
+    hardware_manager::sprint(label);
     let hex = crate::system_routines::u64_to_hex_bytes(value);
-    sprint(unsafe { core::str::from_utf8_unchecked(&hex) });
-    sprint("\n");
+    hardware_manager::sprint(unsafe { core::str::from_utf8_unchecked(&hex) });
+    hardware_manager::sprint("\n");
 }
 
 /// Dumps the key fields of an `InterruptFrame` to the serial port.
@@ -491,7 +491,7 @@ fn print_u64_field(label: &str, value: u64) {
 /// 
 /// * `frame` - The given `InterruptFrame` to print fields from.
 fn print_frame(frame: &InterruptFrame) {
-    sprint("----- Register Dump -----\n");
+    hardware_manager::sprint("----- Register Dump -----\n");
     print_u64_field("  RIP    = ", frame.rip);
     print_u64_field("  CS     = ", frame.cs);
     print_u64_field("  RFLAGS = ", frame.rflags);
@@ -513,7 +513,7 @@ fn print_frame(frame: &InterruptFrame) {
     print_u64_field("  R13    = ", frame.r13);
     print_u64_field("  R14    = ", frame.r14);
     print_u64_field("  R15    = ", frame.r15);
-    sprint("----- End Dump -----\n");
+    hardware_manager::sprint("----- End Dump -----\n");
 }
 
 /// Disables interrupts and halts the CPU in an infinite loop.
@@ -562,7 +562,7 @@ extern "C" fn handler_nmi(frame: &InterruptFrame) {
 /// after the INT 3. A future debugger can intercept this and spin waiting for
 /// a "continue" command instead.
 extern "C" fn handler_breakpoint(frame: &InterruptFrame) {
-    sprint("\n[BREAKPOINT] INT3 hit\n");
+    hardware_manager::sprint("\n[BREAKPOINT] INT3 hit\n");
     print_frame(frame);
     // This intentionally returns (does not halt), so that execution continues
 }
@@ -596,8 +596,9 @@ extern "C" fn handler_double_fault(frame: &InterruptFrame) {
     // Unconditionally print via direct serial access - at this point the
     // kernel stack and heap may be corrupted. We cannot trust any spinlock
     // or dynamic allocation.
-    sprint("\n\n[DOUBLE FAULT] Kernel double fault - halting.\n");
-    sprint("Error code (always 0): 0\n");
+    hardware_manager::sprint(
+        "\n\n[DOUBLE FAULT] Kernel double fault - halting.\n");
+    hardware_manager::sprint("Error code (always 0): 0\n");
     print_frame(frame);
     cpu_halt();
 }
@@ -609,8 +610,8 @@ extern "C" fn handler_coproc_seg_overrun(frame: &InterruptFrame) {
 
 /// Vector 10: #TS Invalid TSS
 extern "C" fn handler_invalid_tss(frame: &InterruptFrame) {
-    sprint("\n[EXCEPTION] #TS Invalid TSS\n");
-    sprint("  Selector causing fault = ");
+    hardware_manager::sprint("\n[EXCEPTION] #TS Invalid TSS\n");
+    hardware_manager::sprint("  Selector causing fault = ");
     print_u64_field("", frame.error_code);
     print_frame(frame);
     cpu_halt();
@@ -618,8 +619,8 @@ extern "C" fn handler_invalid_tss(frame: &InterruptFrame) {
 
 /// Vector 11: #NP Segment Not Present
 extern "C" fn handler_segment_not_present(frame: &InterruptFrame) {
-    sprint("\n[EXCEPTION] #NP Segment Not Present\n");
-    sprint("  Selector = ");
+    hardware_manager::sprint("\n[EXCEPTION] #NP Segment Not Present\n");
+    hardware_manager::sprint("  Selector = ");
     print_u64_field("", frame.error_code);
     print_frame(frame);
     cpu_halt();
@@ -627,8 +628,8 @@ extern "C" fn handler_segment_not_present(frame: &InterruptFrame) {
 
 /// Vector 12: #SS Stack-Segment Fault
 extern "C" fn handler_stack_fault(frame: &InterruptFrame) {
-    sprint("\n[EXCEPTION] #SS Stack-Segment Fault\n");
-    sprint("  Selector = ");
+    hardware_manager::sprint("\n[EXCEPTION] #SS Stack-Segment Fault\n");
+    hardware_manager::sprint("  Selector = ");
     print_u64_field("", frame.error_code);
     print_frame(frame);
     cpu_halt();
@@ -640,14 +641,14 @@ extern "C" fn handler_stack_fault(frame: &InterruptFrame) {
 /// faults). Bit 0 set = external event; bit 1 set = IDT selector; bit 2 =
 /// LDT; bits 15:3 = selector index.
 extern "C" fn handler_general_protection(frame: &InterruptFrame) {
-    sprint("\n[EXCEPTION] #GP General Protection Fault\n");
+    hardware_manager::sprint("\n[EXCEPTION] #GP General Protection Fault\n");
 
     let ec = frame.error_code;
     if ec == 0 {
-        sprint("  (no specific segment involved)\n");
+        hardware_manager::sprint("  (no specific segment involved)\n");
     }
     else {
-        sprint("  Error code (selector info): ");
+        hardware_manager::sprint("  Error code (selector info): ");
         print_u64_field("", ec);
     }
 
@@ -670,42 +671,42 @@ extern "C" fn handler_page_fault(frame: &InterruptFrame) {
     let cr2: u64;
     unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack)) };
 
-    sprint("\n[EXCEPTION] #PF Page Fault\n");
+    hardware_manager::sprint("\n[EXCEPTION] #PF Page Fault\n");
 
     let ec = frame.error_code;
-    sprint("  Faulting address: ");
+    hardware_manager::sprint("  Faulting address: ");
     print_u64_field("", cr2);
-    sprint("  Error code:       ");
+    hardware_manager::sprint("  Error code:       ");
     print_u64_field("", ec);
 
     // Decode the error code for easier debugging
     if ec & (1 << 0) == 0 {
-        sprint("  Reason: non-present page\n");
+        hardware_manager::sprint("  Reason: non-present page\n");
     }
     else {
-        sprint("  Reason: protection violation\n");
+        hardware_manager::sprint("  Reason: protection violation\n");
     }
 
     if ec & (1 << 1) != 0 {
-        sprint("  Access: write\n");
+        hardware_manager::sprint("  Access: write\n");
     }
     else {
-        sprint("  Access: read\n");
+        hardware_manager::sprint("  Access: read\n");
     }
 
     if ec & (1 << 2) != 0 {
-        sprint("  Mode:   user\n");
+        hardware_manager::sprint("  Mode:   user\n");
     }
     else {
-        sprint("  Mode:   supervisor\n");
+        hardware_manager::sprint("  Mode:   supervisor\n");
     }
 
     if ec & (1 << 3) != 0 {
-        sprint("  Note:   reserved PTE bit set\n");
+        hardware_manager::sprint("  Note:   reserved PTE bit set\n");
     }
 
     if ec & (1 << 4) != 0 {
-        sprint("  Note:   instruction fetch\n");
+        hardware_manager::sprint("  Note:   instruction fetch\n");
     }
 
     print_frame(frame);
@@ -724,7 +725,7 @@ extern "C" fn handler_x87_fpu(frame: &InterruptFrame) {
 
 /// Vector 17: #AC Alignment Check
 extern "C" fn handler_alignment_check(frame: &InterruptFrame) {
-    sprint("\n[EXCEPTION] #AC Alignment Check\n");
+    hardware_manager::sprint("\n[EXCEPTION] #AC Alignment Check\n");
     print_u64_field("  Error code: ", frame.error_code);
     print_frame(frame);
     cpu_halt();
@@ -736,7 +737,7 @@ extern "C" fn handler_alignment_check(frame: &InterruptFrame) {
 /// trust memory at this point and must halt.
 extern "C" fn handler_machine_check(_frame: &InterruptFrame) {
     // Avoid dereferencing the frame, as the hardware state may be compromised
-    sprint("\n[EXCEPTION] #MC Machine Check - halting.\n");
+    hardware_manager::sprint("\n[EXCEPTION] #MC Machine Check - halting.\n");
     cpu_halt();
 }
 
@@ -770,7 +771,7 @@ extern "C" fn handler_vmm_communication(frame: &InterruptFrame) {
 
 /// Vector 30: #SX Security Exception
 extern "C" fn handler_security_exception(frame: &InterruptFrame) {
-    sprint("\n[EXCEPTION] #SX Security Exception\n");
+    hardware_manager::sprint("\n[EXCEPTION] #SX Security Exception\n");
     print_u64_field("  Error code: ", frame.error_code);
     print_frame(frame);
     cpu_halt();
@@ -778,17 +779,17 @@ extern "C" fn handler_security_exception(frame: &InterruptFrame) {
 
 /// Unhandled hardware IRQ vectors
 extern "C" fn handler_unhandled_irq(_frame: &InterruptFrame) {
-    sprint("[IRQ] Unhandled hardware interrupt from APIC!\n");
+    hardware_manager::sprint("[IRQ] Unhandled hardware interrupt from APIC!\n");
 }
 
 /// Vector 0x20: APIC Timer
 extern "C" fn handler_apic_timer(_frame: &InterruptFrame) {
     // Increment tick count
-    crate::hardware_manager::apic::TIMER_TICKS
-        .fetch_add(1, core::sync::atomic::Ordering::Relaxed);
+    crate::globals::TIMER_TICKS.fetch_add(
+        1, core::sync::atomic::Ordering::Relaxed);
 
     // Send End-of-Interrupt (EOI) to the APIC
-    unsafe { crate::hardware_manager::apic::eoi(); }
+    unsafe { hardware_manager::eoi(); }
 }
 
 /// Vector 0x21: PS/2 Keyboard (routed via I/O APIC IRQ 1)
@@ -802,12 +803,10 @@ extern "C" fn handler_apic_keyboard(_frame: &InterruptFrame) {
             options(nomem, nostack));
         
         // Send End-of-Interrupt (EOI) to the APIC
-        crate::hardware_manager::apic::eoi();
+        hardware_manager::eoi();
     }
 
-    if let Some(ascii) = crate::hardware_manager::keyboard::process_scancode(
-        scancode
-    ) {
+    if let Some(ascii) = crate::hardware_manager::process_scancode(scancode) {
         // TODO:
         // Placeholder system shutdown control sequence (CTRL+ALT+ESC).
         // Delete this later, the interrupt handler will initiate system
@@ -821,7 +820,7 @@ extern "C" fn handler_apic_keyboard(_frame: &InterruptFrame) {
         // framebuffer for now
         let buf = [ascii];
         if let Ok(s) = core::str::from_utf8(&buf) {
-            crate::hardware_manager::serial::print(s);
+            crate::hardware_manager::sprint(s);
             crate::fbprint!("{s}");
         }
     }

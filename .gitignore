@@ -6,6 +6,7 @@ crap_loader/kernel
 crap_loader/kernel.bin
 crap_loader/boot.img
 crap_loader/boot.vmdk
+crap_loader/boot.vdi
 crap_loader/craploader.efi
 crap_loader/craploader.o
 crap_loader/craploader.so

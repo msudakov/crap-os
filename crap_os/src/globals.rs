@@ -5,14 +5,12 @@
 // This file contains global system resources, some of which must be
 // synchronized and protected from races and deadlocks.
 
-use crate::spinlock::StaticIrqSpinLock;
-use crate::hardware_manager::serial::SerialWriter;
-use crate::hardware_manager::framebuffer::FramebufferWriter;
+use core::sync::atomic::AtomicU64;
 use crate::{DebugLevel};
-use crate::memory_manager::MemoryManager;
-use crate::memory_manager::kernel_heap::LockedHeap;
-use crate::gdt::{Tss, IstStack, DOUBLE_FAULT_IST_SIZE};
-use crate::gdt::{Gdt, GdtEntry};
+use crate::spinlock::StaticIrqSpinLock;
+use crate::hardware_manager::{SerialWriter, FramebufferWriter};
+use crate::memory_manager::{MemoryManager, LockedHeap};
+use crate::gdt::{Gdt, GdtEntry, Tss, IstStack, DOUBLE_FAULT_IST_SIZE};
 use crate::idt::{Idt, IdtEntry};
 
 // =============================================================================
@@ -22,7 +20,7 @@ use crate::idt::{Idt, IdtEntry};
 /// Standard base address for COM1 serial port, used for serial port functions
 pub const COM1_PORT: u16 = 0x3F8;
 
-/// System-wide debug level
+/// System-wide debug message level
 pub const DEBUG_LEVEL: DebugLevel = DebugLevel::INFO;
 
 /// Upper hexadecimal character set
@@ -112,3 +110,11 @@ pub static mut GDT: Gdt = Gdt {
 pub static mut IDT: Idt = Idt {
     entries: [IdtEntry::missing(); 256],
 };
+
+/// Global monotonic tick counter, incremented by the APIC timer IRQ handler.
+///
+/// `AtomicU64` makes the counter safe to read from any context (interrupt
+/// handlers, kernel threads) without a lock. `Relaxed` ordering is acceptable
+/// for reads because the counter is not used to establish a happens-before
+/// relationship with other shared data, so callers only need the numeric value.
+pub static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);

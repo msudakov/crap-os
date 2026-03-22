@@ -1,6 +1,6 @@
 use crate::globals;
-use crate::sprintln;
-use crate::fbprintln;
+//use crate::sprintln;
+//use crate::fbprintln;
 use crate::memory_manager::{PRESENT, WRITABLE};
 
 macro_rules! mm {
@@ -28,8 +28,8 @@ pub fn test_memory_manager() {
                 "Test 1 FAILED: expected {:#x}, got {:#x}", phys1, resolved),
             None => panic!("Test 1 FAILED: address not mapped"),
         }
-        sprintln!("Test 1 passed: map_page + get_physical_addr");
-        fbprintln!("Test 1 passed: map_page + get_physical_addr");
+        //sprintln!("Test 1 passed: map_page + get_physical_addr");
+        //fbprintln!("Test 1 passed: map_page + get_physical_addr");
 
         // =====================================================================
         // Test 2: unmap_and_free_page
@@ -48,8 +48,8 @@ pub fn test_memory_manager() {
             "Test 2 FAILED: expected freed page {:#x} to be reallocated, got {:#x}",
             phys1, reallocated);
         mm!().free_page(reallocated);  // Clean up
-        sprintln!("Test 2 passed: unmap_and_free_page recycles physical frame");
-        fbprintln!("Test 2 passed: unmap_and_free_page recycles physical frame");
+        //sprintln!("Test 2 passed: unmap_and_free_page recycles physical frame");
+        //fbprintln!("Test 2 passed: unmap_and_free_page recycles physical frame");
 
         // =====================================================================
         // Test 3: unmap_page does not free the physical frame
@@ -70,16 +70,16 @@ pub fn test_memory_manager() {
             "Test 3 FAILED: physical frame was freed when it should not have been");
         mm!().free_page(next_alloc);  // Clean up
         mm!().free_page(phys3);       // Now manually free the orphaned frame
-        sprintln!("Test 3 passed: unmap_page does not free physical frame");
-        fbprintln!("Test 3 passed: unmap_page does not free physical frame");
+        //sprintln!("Test 3 passed: unmap_page does not free physical frame");
+        //fbprintln!("Test 3 passed: unmap_page does not free physical frame");
 
         // =====================================================================
         // Test 4: Unmapping an already-unmapped address returns false
         // =====================================================================
         let result = mm!().unmap_page(virt3);
         assert!(!result, "Test 4 FAILED: expected false for unmapped address");
-        sprintln!("Test 4 passed: unmap_page returns false for unmapped address");
-        fbprintln!("Test 4 passed: unmap_page returns false for unmapped address");
+        //sprintln!("Test 4 passed: unmap_page returns false for unmapped address");
+        //fbprintln!("Test 4 passed: unmap_page returns false for unmapped address");
 
         // =====================================================================
         // Test 5: Intermediate page table reclamation
@@ -100,8 +100,8 @@ pub fn test_memory_manager() {
         assert!(mm!().free_page_count() == free_before,
             "Test 5 FAILED: expected full reclamation after unmap, got {} free (expected {})",
             mm!().free_page_count(), free_before);
-        sprintln!("Test 5 passed: intermediate page tables reclaimed on unmap");
-        fbprintln!("Test 5 passed: intermediate page tables reclaimed on unmap");
+        //sprintln!("Test 5 passed: intermediate page tables reclaimed on unmap");
+        //fbprintln!("Test 5 passed: intermediate page tables reclaimed on unmap");
     }
 }
 
@@ -118,8 +118,8 @@ pub fn test_heap_allocator() {
     let b = Box::new(0xDEAD_BEEF_u64);
     assert!(*b == 0xDEAD_BEEF_u64, "Test 1 FAILED: Box value mismatch");
     drop(b);
-    sprintln!("Test 1 passed: basic Box alloc/dealloc");
-    fbprintln!("Test 1 passed: basic Box alloc/dealloc");
+    //sprintln!("Test 1 passed: basic Box alloc/dealloc");
+    //fbprintln!("Test 1 passed: basic Box alloc/dealloc");
 
     // =========================================================================
     // Test 2: Vec growth
@@ -134,8 +134,8 @@ pub fn test_heap_allocator() {
         assert!(v[i as usize] == i, "Test 2 FAILED: Vec value mismatch at {}", i);
     }
     drop(v);
-    sprintln!("Test 2 passed: Vec growth and dealloc");
-    fbprintln!("Test 2 passed: Vec growth and dealloc");
+    //sprintln!("Test 2 passed: Vec growth and dealloc");
+    //fbprintln!("Test 2 passed: Vec growth and dealloc");
 
     // =========================================================================
     // Test 3: String allocation
@@ -144,8 +144,8 @@ pub fn test_heap_allocator() {
     s.push_str("hello from the kernel heap");
     assert!(s == "hello from the kernel heap", "Test 3 FAILED: String mismatch");
     drop(s);
-    sprintln!("Test 3 passed: String alloc/dealloc");
-    fbprintln!("Test 3 passed: String alloc/dealloc");
+    //sprintln!("Test 3 passed: String alloc/dealloc");
+    //fbprintln!("Test 3 passed: String alloc/dealloc");
 
     // =========================================================================
     // Test 4: Alignment
@@ -161,8 +161,8 @@ pub fn test_heap_allocator() {
         "Test 4 FAILED: pointer {:#x} is not 64-byte aligned", ptr);
     assert!(a.val == 0xCAFE, "Test 4 FAILED: value corrupted");
     drop(a);
-    sprintln!("Test 4 passed: alignment");
-    fbprintln!("Test 4 passed: alignment");
+    //sprintln!("Test 4 passed: alignment");
+    //fbprintln!("Test 4 passed: alignment");
 
     // =========================================================================
     // Test 5: Coalescing - repeated alloc/free of same size should not
@@ -187,8 +187,8 @@ pub fn test_heap_allocator() {
         "Test 5 FAILED: heap grew during alloc/free cycle \
          (before={}, after={}), coalescing may be broken",
         free_before, free_after);
-    sprintln!("Test 5 passed: coalescing");
-    fbprintln!("Test 5 passed: coalescing");
+    //sprintln!("Test 5 passed: coalescing");
+    //fbprintln!("Test 5 passed: coalescing");
 
     // =========================================================================
     // Test 6: Multiple live allocations with distinct values
@@ -215,8 +215,8 @@ pub fn test_heap_allocator() {
     assert!(*b3 == 0x3333, "Test 6 FAILED: b3 corrupted");
     assert!(*b4 == 0x4444, "Test 6 FAILED: b4 corrupted");
     drop(b1); drop(b2); drop(b3); drop(b4);
-    sprintln!("Test 6 passed: multiple simultaneous allocations");
-    fbprintln!("Test 6 passed: multiple simultaneous allocations");
+    //sprintln!("Test 6 passed: multiple simultaneous allocations");
+    //fbprintln!("Test 6 passed: multiple simultaneous allocations");
 
     // =========================================================================
     // Test 7: Heap growth
@@ -234,6 +234,6 @@ pub fn test_heap_allocator() {
             "Test 7 FAILED: value corrupted after heap growth");
     }
     drop(boxes);
-    sprintln!("Test 7 passed: heap growth");
-    fbprintln!("Test 7 passed: heap growth");
+    //sprintln!("Test 7 passed: heap growth");
+    //fbprintln!("Test 7 passed: heap growth");
 }

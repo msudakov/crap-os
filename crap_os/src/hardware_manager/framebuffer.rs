@@ -1,12 +1,12 @@
 // =============================================================================
-// CrapOS Framebuffer Printer Module
+// Framebuffer Printer Module
 // =============================================================================
 // 
 // This module contains the needed functionality to draw pixels in the
 // framebuffer.
 
 // Simple 8x12 bitmap font for ASCII characters 32-126, used for drawing text
-pub const FONT: [[u8; 12]; 95] = [
+const FONT: [[u8; 12]; 95] = [
     [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // Space (32)
     [0x18, 0x18, 0x3C, 0x3C, 0x3C, 0x18, 0x18, 0x18, 0x00, 0x18, 0x18, 0x00], // !
     [0x66, 0x66, 0x66, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // "

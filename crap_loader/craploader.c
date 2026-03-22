@@ -100,6 +100,7 @@ typedef struct {
     UINT64 kernel_image_size;
     UINT64 stack_base_addr;
     UINT64 stack_size;
+    UINT64 rsdp_addr;
 } MemoryMapInfo;
 
 // Boot information structure to pass to kernel
@@ -230,6 +231,31 @@ void serial_write_hex(UINT64 value) {
         value >>= 4;
     }
     serial_write(buf);
+}
+
+/**
+  Compares two EFI GUIDs for equality.
+
+  Have to use this, because CompareGuid does not seem to behave correctly and
+  returns true for everything, resulting in incorrect behavior during boot.
+
+  @param[in]  a   One of the two GUIDs to compare.
+  @param[in]  b   The other of the two GUIDs to compare.
+
+  @return TRUE if the given GUIDs are of equal value, FALSE otherwise.
+**/
+static BOOLEAN guids_equal(EFI_GUID *a, EFI_GUID *b) {
+    return a->Data1 == b->Data1 &&
+           a->Data2 == b->Data2 &&
+           a->Data3 == b->Data3 &&
+           a->Data4[0] == b->Data4[0] &&
+           a->Data4[1] == b->Data4[1] &&
+           a->Data4[2] == b->Data4[2] &&
+           a->Data4[3] == b->Data4[3] &&
+           a->Data4[4] == b->Data4[4] &&
+           a->Data4[5] == b->Data4[5] &&
+           a->Data4[6] == b->Data4[6] &&
+           a->Data4[7] == b->Data4[7];
 }
 
 /**
@@ -370,6 +396,7 @@ static void map_page_pool(PagePool *pool, UINT64 pml4, UINT64 virtual_addr,
  * @param[in] FramebufferBase  Physical base address of the GPU framebuffer.
  * @param[in] FramebufferSize  Size of the framebuffer in bytes.
  * @param[in] PoolPages        Number of pool pages to use.
+ * @param[in] RsdpAddr         Root System Description Pointer address to use.
  *
  * @return Physical address of the PML4 root page table, or 0 on failure.
  */
@@ -383,7 +410,8 @@ static UINT64 build_page_tables(
     EFI_PHYSICAL_ADDRESS     KernelStackBase,
     UINT64                   FramebufferBase,
     UINT64                   FramebufferSize,
-    UINTN                    PoolPages)
+    UINTN                    PoolPages,
+    UINT64                   RsdpAddr)
 {
     // -------------------------------------------------------------------------
     // Step 1: Allocate the page-table node pool upfront.
@@ -545,18 +573,30 @@ static UINT64 build_page_tables(
     }
 
     // -------------------------------------------------------------------------
-    // Step 8: Identity-map the UEFI memory map buffer.
+    // Step 8: Identity-map the UEFI memory map buffer and the RSDP page.
     //
     // The MemoryMap pointer passed into this function points to a buffer
     // in UEFI-managed memory. The kernel reads this buffer during its own
     // memory manager initialisation to discover usable physical memory.
     // It must remain accessible after CR3 is switched to our new tables. Its
     // start is page-aligned downward to catch any partial leading page.
+    //
+    // The RSDP pointer passed into this function is used by the kernel for
+    // parsing ACPI information for the APIC functionality.
     // -------------------------------------------------------------------------
     UINT64 map_start = (UINT64)MemoryMap & ~0xFFFULL;  // Page-align down
     UINT64 map_end   = (UINT64)MemoryMap + MemoryMapSize;
     for (UINT64 addr = map_start; addr < map_end; addr += 0x1000) {
         map_page_pool(&pool, pml4, addr, addr, PT_PRESENT | PT_WRITABLE);
+    }
+
+    // Identity-map the RSDP page so the kernel can read it
+    if (RsdpAddr) {
+        UINT64 rsdp_page = RsdpAddr & ~0xFFFULL;
+        map_page_pool(&pool, pml4, rsdp_page, rsdp_page, PT_PRESENT);
+        // Also map the next page since XSDT pointer inside may reference it
+        map_page_pool(&pool, pml4, rsdp_page + 0x1000, rsdp_page + 0x1000,
+            PT_PRESENT);
     }
 
     // -------------------------------------------------------------------------
@@ -652,6 +692,19 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     MemoryMapInfo *MemoryMapInfoStruct;
     BootInfo *BootInfoStruct;
     UINT64 Pml4 = 0;
+    UINT64 RsdpAddr = 0;
+    EFI_GUID acpi20_guid = {  // The preferred GUID for ACPI v 2.0
+        0x8868E871,
+        0xE4F1,
+        0x11D3,
+        {0xBC, 0x22, 0x00, 0x80, 0xC7, 0x3C, 0x88, 0x81}
+    };
+    EFI_GUID acpi10_guid = {  // Fallback GUID for ACPI v1.0
+        0xEB9D2D30,
+        0x2D88,
+        0x11D3,
+        {0x9A, 0x16, 0x00, 0x90, 0x27, 0x3F, 0xC1, 0x4D}
+    };
     
     InitializeLib(ImageHandle, SystemTable);  // Initialize the GNU-EFI library
     init_serial();  // Initialize serial port for debugging
@@ -818,6 +871,34 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
     print_debug(DEBUG, L"[+] Allocated kernel stack\n\r");
     Print(L"[+] Stack: base=0x%lx  top=0x%lx  size=%d bytes\n\r",
         KernelStackBase, KernelStackTop, KERNEL_STACK_SIZE);
+    
+    // Locate Root System Description Pointer (RSDP) by checking two GUIDs:
+    // ACPI v2.0 is preferred, but ACPI v1.0 can be used as fallback
+    for (UINTN i = 0; i < SystemTable->NumberOfTableEntries; i++) {
+        EFI_GUID *guid = &SystemTable->ConfigurationTable[i].VendorGuid;
+        if (guids_equal(guid, &acpi20_guid)) {
+            RsdpAddr = (UINT64)SystemTable->ConfigurationTable[i].VendorTable;
+            Print(L"[+] Found ACPI v2.0\n\r");
+            break; // Prefer ACPI 2.0, stop here
+        }
+        if (guids_equal(guid, &acpi10_guid)) {
+            // Record it but keep looking for ACPI 2.0
+            RsdpAddr = (UINT64)SystemTable->ConfigurationTable[i].VendorTable;
+        }
+    }
+    if (RsdpAddr == 0) {
+        print_debug(ERROR, L"[-] Failed to get RSDP\n\r");
+        Print(L"[!FATAL!] Press any key to exit...\n\r");
+        while (uefi_call_wrapper(SystemTable->ConIn->ReadKeyStroke, 2,
+            SystemTable->ConIn, &Key) != EFI_SUCCESS);
+        return Status;
+    }
+    else {
+        Print(L"[+] RSDP located at 0x%x\n\r", RsdpAddr);
+    }
+
+    // Add the RSDP address to the memory map
+    MemoryMapInfoStruct->rsdp_addr = RsdpAddr;
 
     // We have to call GetMemoryMap twice. This first call gets the
     // initial size of the memory map structure. It may or may not change
@@ -918,7 +999,8 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
         KernelStackBase,
         FramebufferInfoStruct->framebuffer_addr,
         fb_size,
-        pool_pages
+        pool_pages,
+        RsdpAddr
     );
     if (!Pml4) {
         print_debug(ERROR, L"[-] Failed to build page tables (OOM)\n\r");

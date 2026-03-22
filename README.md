@@ -11,6 +11,7 @@ I wanted to learn more about and get some practice with Rust. As any sane person
 
 - [Demo 1](https://youtu.be/yjD1NYdGLt8)
 - [Demo 2](https://youtu.be/4BRA-oguYKE)
+- [Demo 3](https://youtu.be/8_tjmZy2sUU)
 
 ## Setting Up Rust Environment on MacOS
 

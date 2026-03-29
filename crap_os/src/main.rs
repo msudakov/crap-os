@@ -11,6 +11,7 @@ mod macros;
 mod system_routines;
 mod hardware_manager;
 mod memory_manager;
+mod task_scheduler;
 pub mod gdt;
 pub mod idt;
 mod tests;
@@ -189,13 +190,17 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         sprint_debug!(DebugLevel::DEBUG, "[DEBUG] APICs have been initialized");
 
         // Configure the APIC timer (tune initial_count as needed for testing)
-        hardware_manager::configure_timer(1000000);
+        hardware_manager::configure_timer(1_000_000);
         sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Timer interrupt initialized");
 
         // Unmask the keyboard IRQ in the I/O APIC
         hardware_manager::ioapic_unmask_irq(1);
         sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Keyboard interrupts ready");
     }
+
+    // Initialize the Task Scheduler, and register the main kernel _start
+    // routine as the idle task for the scheduler.
+    task_scheduler::init();
 
     // IDT is initialized, and the APIC is set up with the registered interrupt
     // handlers. It is now safe to re-enable maskable hardware interrupts.
@@ -271,6 +276,10 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     sprintln!("[*] Testing keyboard interrupts. Type some stuff...");
     fbprintln!("[*] Testing keyboard interrupts. Type some stuff...");
 
+    // Spawn test tasks
+    task_scheduler::spawn(task_a, 0).expect("failed to spawn task A");
+    task_scheduler::spawn(task_b, 0).expect("failed to spawn task B");
+
     // Halt until the next interrupt to avoid spinning the CPU at 100%
     loop {
         unsafe { core::arch::asm!("hlt") };
@@ -305,5 +314,26 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     loop {
         // Halt the CPU
         unsafe { core::arch::asm!("hlt"); }
+    }
+}
+
+
+/// Temporary: Testing task scheduler.
+fn task_a(_arg: u64) -> ! {
+    loop {
+        crate::hardware_manager::sprint("A");
+        for _ in 0..2_000_000 {
+            unsafe { core::arch::asm!("nop"); }
+        }
+    }
+}
+
+/// Temporary: Testing task scheduler.
+fn task_b(_arg: u64) -> ! {
+    loop {
+        crate::hardware_manager::sprint("B");
+        for _ in 0..2_000_000 {
+            unsafe { core::arch::asm!("nop"); }
+        }
     }
 }

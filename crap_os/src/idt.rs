@@ -784,12 +784,18 @@ extern "C" fn handler_unhandled_irq(_frame: &InterruptFrame) {
 
 /// Vector 0x20: APIC Timer
 extern "C" fn handler_apic_timer(_frame: &InterruptFrame) {
-    // Increment tick count
+    // Increment tick count first so any task that reads TIMER_TICKS after
+    // being woken this tick sees the updated value.
     crate::globals::TIMER_TICKS.fetch_add(
         1, core::sync::atomic::Ordering::Relaxed);
 
-    // Send End-of-Interrupt (EOI) to the APIC
-    unsafe { hardware_manager::eoi(); }
+    // Send EOI before schedule(). This re-arms the APIC for the next tick.
+    unsafe { crate::hardware_manager::eoi(); }
+
+    // Hand control to the scheduler. If there is another ready task, this
+    // call does not return until we are scheduled again. If no other task is
+    // ready, it returns immediately and we fall through to iretq normally.
+    unsafe { crate::task_scheduler::schedule(); }
 }
 
 /// Vector 0x21: PS/2 Keyboard (routed via I/O APIC IRQ 1)

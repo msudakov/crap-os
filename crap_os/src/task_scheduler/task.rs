@@ -86,6 +86,7 @@ fn alloc_task_id() -> TaskId {
 //                                    +----------+
 
 /// The lifecycle state of a task as tracked by the scheduler.
+#[allow(dead_code)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum TaskState {
     /// The task is in the run queue and eligible to be scheduled onto a CPU.

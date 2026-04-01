@@ -556,7 +556,6 @@ pub unsafe fn schedule() {
 /// This must be called from task context; it must not be called from an ISR, as
 /// the calling task must have a valid `saved_rsp` that `schedule()` can save
 /// the outgoing RSP into.
-#[allow(dead_code)]
 pub fn yield_blocked() {
     // Transition the current task to `Blocked` state under the lock
     let current_id = {
@@ -604,7 +603,6 @@ pub fn yield_blocked() {
 /// 
 /// Returns `Ok(())` on success (including the case of waking a non-blocked
 /// task), or `Err(UnknownTask)` if no task with this ID exists.
-#[allow(dead_code)]
 pub fn wake(task_id: TaskId) -> Result<(), SchedulerError> {
     let mut scheduler = SCHEDULER.lock();
     let task = scheduler
@@ -623,8 +621,7 @@ pub fn wake(task_id: TaskId) -> Result<(), SchedulerError> {
 /// Looks up the ID of the task currently executing on the CPU.
 /// 
 /// The returned ID is a snapshot; by the time the caller inspects it, a context
-/// switch may have occurred and a different task may be running. This is
-/// acceptable for diagnostic and logging purposes.
+/// switch may have occurred and a different task may be running.
 ///
 /// # Returns
 /// 
@@ -634,7 +631,6 @@ pub fn wake(task_id: TaskId) -> Result<(), SchedulerError> {
 /// 
 /// Acquires the scheduler lock for a single field read, then immediately
 /// releases it. Safe to call from both task context and ISR context.
-#[allow(dead_code)]
 #[inline]
 pub fn get_current_task_id() -> TaskId {
     SCHEDULER.lock().current

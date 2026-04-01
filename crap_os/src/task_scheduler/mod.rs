@@ -13,4 +13,6 @@ mod switcher;
 pub mod scheduler;
 
 // Re-export public APIs
-pub use scheduler::{init, schedule, spawn};
+pub use scheduler::{init, schedule, spawn, wake, yield_blocked,
+    get_current_task_id};
+pub use task::TaskId;

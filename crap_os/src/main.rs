@@ -272,17 +272,17 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     sprintln!("\n[+] IRQ timer interrupt test complete!\n");
     fbprintln!("\n[+] IRQ timer interrupt test complete!\n");
 
+    // Register keyboard buffer reader task
+    task_scheduler::spawn(task_keyboard, 0).expect(
+        "failed to spawn keyboard task");
+    
     // Testing keyboard interrupts
     sprintln!("[*] Testing keyboard interrupts. Type some stuff...");
     fbprintln!("[*] Testing keyboard interrupts. Type some stuff...");
 
-    // Spawn test tasks
-    task_scheduler::spawn(task_a, 0).expect("failed to spawn task A");
-    task_scheduler::spawn(task_b, 0).expect("failed to spawn task B");
-
     // Halt until the next interrupt to avoid spinning the CPU at 100%
     loop {
-        unsafe { core::arch::asm!("hlt") };
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
     } 
 }
 
@@ -317,23 +317,41 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     }
 }
 
+/// Registers a keyboard buffer reader task with the ISR, then loops through
+/// the buffer and processes all scancodes in it; finally, blocks itself via
+/// `yield_blocked()` until the next it is it woken.
+/// 
+/// # Arguments
+///
+/// * `_arg` - Unused argument; accepted for conformity.
+fn task_keyboard(_arg: u64) -> ! {
+    // Register this task, so the keyboard ISR knows who to wake
+    hardware_manager::keyboard_set_task_id(
+        task_scheduler::get_current_task_id());
 
-/// Temporary: Testing task scheduler.
-fn task_a(_arg: u64) -> ! {
     loop {
-        crate::hardware_manager::sprint("A");
-        for _ in 0..2_000_000 {
-            unsafe { core::arch::asm!("nop"); }
-        }
-    }
-}
+        // Drain everything currently in the ring buffer
+        while let Some(scancode) = hardware_manager::keyboard_pop_scancode() {
+            if let Some(ascii) = hardware_manager::process_scancode(scancode) {
+                // TODO:
+                // Placeholder system shutdown control sequence (CTRL+ALT+ESC),
+                // which returns as 0xFF for now.
+                if ascii == 0xFF {
+                    fbprint!("SHUTDOWN...");
+                    continue;
+                }
 
-/// Temporary: Testing task scheduler.
-fn task_b(_arg: u64) -> ! {
-    loop {
-        crate::hardware_manager::sprint("B");
-        for _ in 0..2_000_000 {
-            unsafe { core::arch::asm!("nop"); }
+                // Convert the single byte to a str slice and print it to
+                // serial and framebuffer for now.
+                let buf = [ascii];
+                if let Ok(s) = core::str::from_utf8(&buf) {
+                    sprint!("{}", s);
+                    fbprint!("{}", s);
+                }
+            }
         }
+
+        // Buffer is empty, block until the ISR wakes us on the next key event
+        task_scheduler::yield_blocked();
     }
 }

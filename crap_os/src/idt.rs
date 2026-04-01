@@ -807,29 +807,14 @@ extern "C" fn handler_apic_keyboard(_frame: &InterruptFrame) {
         // Read scancode into local variable
         core::arch::asm!("in al, 0x60", out("al") scancode,
             options(nomem, nostack));
-        
+
         // Send End-of-Interrupt (EOI) to the APIC
         hardware_manager::eoi();
     }
 
-    if let Some(ascii) = crate::hardware_manager::process_scancode(scancode) {
-        // TODO:
-        // Placeholder system shutdown control sequence (CTRL+ALT+ESC).
-        // Delete this later, the interrupt handler will initiate system
-        // shutdown.
-        if ascii == 0xFF {
-            crate::fbprint!("SHUTDOWN...");
-            return;
-        }
-
-        // Convert the single byte to a str slice and print it to serial and
-        // framebuffer for now
-        let buf = [ascii];
-        if let Ok(s) = core::str::from_utf8(&buf) {
-            crate::hardware_manager::sprint(s);
-            crate::fbprint!("{s}");
-        }
-    }
+    // Push raw scancode into the ring and wake the keyboard task.
+    // process_scancode is now called by the keyboard task, not here.
+    hardware_manager::keyboard_push_scancode(scancode);
 }
 
 /// Vector 0xFF: Spurious Interrupt

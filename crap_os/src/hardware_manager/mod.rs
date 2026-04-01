@@ -16,7 +16,8 @@ pub use serial::SerialWriter;
 pub use serial::print as sprint;
 pub use serial::init as serial_init;
 pub use framebuffer::{FramebufferInfo, FramebufferWriter};
-pub use keyboard::process_scancode;
+pub use keyboard::{keyboard_push_scancode, keyboard_pop_scancode,
+    process_scancode, keyboard_set_task_id};
 pub use acpi::parse_acpi;
 pub use apic::{init_apic, eoi, disable_pic_8259, configure_timer,
     ioapic_unmask_irq};

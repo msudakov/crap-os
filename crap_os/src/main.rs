@@ -275,6 +275,10 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // Register keyboard buffer reader task
     task_scheduler::spawn(task_keyboard, 0).expect(
         "failed to spawn keyboard task");
+
+    // Spawn test tasks
+    task_scheduler::spawn(task_a, 0).expect("failed to spawn task A");
+    task_scheduler::spawn(task_b, 0).expect("failed to spawn task B");
     
     // Testing keyboard interrupts
     sprintln!("[*] Testing keyboard interrupts. Type some stuff...");
@@ -324,7 +328,7 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
 /// # Arguments
 ///
 /// * `_arg` - Unused argument; accepted for conformity.
-fn task_keyboard(_arg: u64) -> ! {
+fn task_keyboard(_arg: u64) {
     // Register this task, so the keyboard ISR knows who to wake
     hardware_manager::keyboard_set_task_id(
         task_scheduler::get_current_task_id());
@@ -353,5 +357,24 @@ fn task_keyboard(_arg: u64) -> ! {
 
         // Buffer is empty, block until the ISR wakes us on the next key event
         task_scheduler::yield_blocked();
+    }
+}
+
+
+fn task_a(_arg: u64) {
+    loop {
+        crate::hardware_manager::sprint("A");
+        for _ in 0..2_000_000 {
+            unsafe { core::arch::asm!("nop"); }
+        }
+    }
+}
+
+fn task_b(_arg: u64) {
+    for _ in 0..10 {
+        crate::hardware_manager::sprint("Hello, world!");
+        for _ in 0..2_000_000 {
+            unsafe { core::arch::asm!("nop"); }
+        }
     }
 }

@@ -78,8 +78,9 @@ const QUEUE_MASK: usize = QUEUE_SIZE - 1;
 ///     and, `queue_len == QUEUE_SIZE` when the queue is full.
 ///
 /// The scheduler's spinlock is always acquired through `SCHEDULER.lock()`, and
-/// it must never held across `switch_to`.
-struct Scheduler {
+/// it must never held across `switch_to`. We define it as `pub(super)` because
+/// it needs to be accessible from `task_exit` in `task.rs`.
+pub(super) struct Scheduler {
     /// Flat array of optional tasks, where each index is a storage slot with no
     /// semantic meaning; tasks are located by scanning for a matching `TaskId`,
     /// not by indexing directly.
@@ -119,7 +120,10 @@ struct Scheduler {
     /// is stored here has `TaskState::Running` and is not in `queue`. `init()`
     /// initializes this to `TaskId::IDLE`; and, it is set to the actual
     /// running task ID at the end of every `schedule()` call.
-    current: TaskId,
+    /// 
+    /// We define it as `pub(super)` because it needs to be accessible from
+    /// `task_exit` in `task.rs`.
+    pub(super) current: TaskId,
 }
 
 #[allow(dead_code)]
@@ -235,7 +239,9 @@ impl Scheduler {
 
     /// Obtains a mutable reference to a `Task` by its ID.
     /// 
-    /// The linear scan runs in time O(MAX_TASKS).
+    /// The linear scan runs in time O(MAX_TASKS). We declare it as `pub(super)`
+    /// because this function needs to be accessible from `task_exit` in
+    /// `task.rs`.
     /// 
     /// # Arguments
     /// 
@@ -245,7 +251,7 @@ impl Scheduler {
     /// 
     /// Returns a mutable reference to the located task, or `None` if no
     /// such task exists in the table.
-    fn get_task_mut(&mut self, task_id: TaskId) -> Option<&mut Task> {
+    pub(super) fn get_task_mut(&mut self, task_id: TaskId) -> Option<&mut Task> {
         self.tasks.iter_mut()
             .filter_map(|slot| slot.as_mut())  // Skip the `None` slots
             .find(|task| task.id == task_id)
@@ -304,7 +310,10 @@ pub enum SchedulerError {
 /// hardware interrupts for the duration of every lock acquisition, preventing
 /// the timer ISR from re-entering the scheduler while the lock is held by a
 /// task-context caller (e.g., `spawn` or `wake`).
-static SCHEDULER: StaticIrqSpinLock<Scheduler> =
+/// 
+/// We declare it as `pub(super)` because it needs to be accessible from
+/// `task_exit` in `task.rs`.
+pub(super) static SCHEDULER: StaticIrqSpinLock<Scheduler> =
     StaticIrqSpinLock::new(Scheduler::new());
 
 // =============================================================================
@@ -362,7 +371,7 @@ pub fn init() {
 ///
 /// # Arguments
 /// 
-/// * `entry` - The task's entry function. For now, it does not return. TODO...
+/// * `entry` - The task's entry function.
 /// * `arg`   - An opaque `u64` passed as the sole argument to `entry` function.
 ///
 /// # Returns
@@ -379,7 +388,7 @@ pub fn init() {
 /// `Task::new` (the heap allocation) is done before acquiring the scheduler
 /// lock, minimizing the time the lock is held. The lock is only held for the
 /// brief table-insertion and queue-push operations.
-pub fn spawn(entry: fn(u64) -> !, arg: u64) -> Result<TaskId, SchedulerError> {
+pub fn spawn(entry: fn(u64), arg: u64) -> Result<TaskId, SchedulerError> {
     // Allocate the task and its stack outside the lock. Heap allocation may
     // block briefly (if the heap needs to grow) or involve page-mapping
     // operations. Doing this with the scheduler lock held would block the

@@ -644,3 +644,48 @@ pub fn wake(task_id: TaskId) -> Result<(), SchedulerError> {
 pub fn get_current_task_id() -> TaskId {
     SCHEDULER.lock().current
 }
+
+/// Tombstone cleanup removes all `Dead` tasks from the task table and frees
+/// their resources.
+/// 
+/// This is called exclusively by the `dead_task_reaper` `SystemTask`,
+/// which fires on the timer interrupt after a task has exited. By the time this
+/// runs, the dead task has already been switched away from by `schedule()`,
+/// so its stack is no longer in use and is safe to drop.
+pub fn tombstone_cleanup() {
+    // Hold the lock only long enough to sweep the task table
+    let tasks_reaped = {
+        let mut scheduler = SCHEDULER.lock();
+        let mut dead_task_count = 0u32;
+
+        for slot in scheduler.tasks.iter_mut() {
+            // Check if this slot holds a Dead task
+            let is_dead = slot
+                .as_ref()
+                .map_or(false, |task| task.state == TaskState::Dead);
+
+            if is_dead {
+                // Dropping the Task here drops its Box<[u8]> stack allocation.
+                // This is safe because the task is Dead, and schedule() has
+                // already switched away from it and will never switch back.
+                *slot = None;
+                dead_task_count += 1;
+            }
+        }
+
+        dead_task_count
+    };  // The lock is released here
+
+    if tasks_reaped > 0 {
+        // TODO: for debugging purposes; can clean up later on.
+        // Log how many tasks were cleaned up, so we can verify during testing.
+        if crate::globals::DEBUG_LEVEL == crate::DebugLevel::DEBUG {
+            crate::hardware_manager::sprint(
+                "[REAPER] Tombstone cleanup: reaped ");
+            let mut buf = [0u8; 20];
+            crate::hardware_manager::sprint(
+                crate::system_routines::u32_to_str(tasks_reaped, &mut buf));
+            crate::hardware_manager::sprint(" dead task(s)\n");
+        }
+    }
+}

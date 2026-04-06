@@ -14,5 +14,5 @@ pub mod scheduler;
 
 // Re-export public APIs
 pub use scheduler::{init, schedule, spawn, wake, yield_blocked,
-    get_current_task_id};
+    get_current_task_id, tombstone_cleanup};
 pub use task::TaskId;

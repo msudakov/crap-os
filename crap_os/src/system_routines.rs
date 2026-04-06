@@ -71,6 +71,34 @@ pub fn u32_to_hex_bytes(value: u32) -> [u8; 10] {
     buffer
 }
 
+/// Converts a u32 to a string for logging inside the Task Scheduler, where we
+/// cannot use `format!` or any allocating machinery.
+/// 
+/// # Arguments
+///
+/// * `value`  - The u32 mutable value to convert.
+/// * `buffer` - Mutable buffer to use during conversion.
+/// 
+/// # Returns
+/// 
+/// Returns the string representation of the given u32 value.
+#[allow(dead_code)]
+pub fn u32_to_str(mut value: u32, buffer: &mut [u8; 20]) -> &str {
+    if value == 0 {
+        buffer[19] = b'0';
+        return core::str::from_utf8(&buffer[19..]).unwrap();
+    }
+
+    let mut i = 20usize;
+    while value > 0 {
+        i -= 1;
+        buffer[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+
+    core::str::from_utf8(&buffer[i..]).unwrap()
+}
+
 /// Saves the current CPU flags register (which includes the interrupt-enable
 /// flag `IF`) and then disables hardware interrupts by executing `CLI` (Clear
 /// Interrupt Flag).

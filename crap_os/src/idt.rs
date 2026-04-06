@@ -792,6 +792,12 @@ extern "C" fn handler_apic_timer(_frame: &InterruptFrame) {
     // Send EOI before schedule(). This re-arms the APIC for the next tick.
     unsafe { crate::hardware_manager::eoi(); }
 
+    // Drain all pending `SystemTask`s before yielding to the next normal task.
+    // This is the sole drain point; system tasks run here at elevated
+    // priority, with interrupts disabled (as we are inside an IRQ handler),
+    // before any normal task gets the CPU.
+    crate::system_core::drain_system_tasks();
+
     // Hand control to the scheduler. If there is another ready task, this
     // call does not return until we are scheduled again. If no other task is
     // ready, it returns immediately and we fall through to iretq normally.

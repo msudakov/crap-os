@@ -11,6 +11,7 @@ mod macros;
 mod system_routines;
 mod hardware_manager;
 mod memory_manager;
+mod system_core;
 mod task_scheduler;
 pub mod gdt;
 pub mod idt;

@@ -447,7 +447,8 @@ impl Task {
 /// function returns normally. It marks the current task as `Dead` and
 /// immediately yields to the scheduler. The actual stack and task table
 /// cleanup (tombstone cleanup) is deferred to the `dead_task_reaper`
-/// SystemTask, which runs at the next timer tick. This function never returns.
+/// `SystemTask`, which runs at the next timer tick. This function never
+/// returns.
 pub fn task_exit() -> ! {
     // Mark this task as `Dead`. We do this in a block, so the scheduler lock
     // is dropped before we call `schedule()` (which will acquire it again
@@ -460,6 +461,12 @@ pub fn task_exit() -> ! {
         }
         // The lock is dropped here
     }
+
+    // Enqueue the `dead_task_reaper` `SystemTask`, so tombstone cleanup runs
+    // on the next timer tick. The reaper will find this task's slot marked
+    // `Dead` and free it.
+    crate::system_core::queue_system_task(
+        crate::system_core::system_tasks::dead_task_reaper, 0);
 
     // With the status set to `Dead`, we now hand off to the next ready task.
     // This task will never be rescheduled, because `Dead` tasks are not

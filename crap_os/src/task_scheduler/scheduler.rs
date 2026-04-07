@@ -656,7 +656,7 @@ pub fn tombstone_cleanup() {
     // Hold the lock only long enough to sweep the task table
     let tasks_reaped = {
         let mut scheduler = SCHEDULER.lock();
-        let mut dead_task_count = 0u32;
+        let mut dead_task_count = 0u64;
 
         for slot in scheduler.tasks.iter_mut() {
             // Check if this slot holds a Dead task
@@ -679,13 +679,40 @@ pub fn tombstone_cleanup() {
     if tasks_reaped > 0 {
         // TODO: for debugging purposes; can clean up later on.
         // Log how many tasks were cleaned up, so we can verify during testing.
-        if crate::globals::DEBUG_LEVEL == crate::DebugLevel::DEBUG {
-            crate::hardware_manager::sprint(
-                "[REAPER] Tombstone cleanup: reaped ");
-            let mut buf = [0u8; 20];
-            crate::hardware_manager::sprint(
-                crate::system_routines::u32_to_str(tasks_reaped, &mut buf));
+        if crate::globals::DEBUG_LEVEL == crate::DebugLevel::INFO {
+            crate::system_routines::print_u64_field(
+                "[REAPER] Tombstone cleanup: reaped ", tasks_reaped);
             crate::hardware_manager::sprint(" dead task(s)\n");
         }
     }
+}
+
+/// Marks the currently-running task as `Dead` and enqueues the
+/// `dead_task_reaper` SystemTask for the tombstone cleanup on the next timer
+/// tick.
+/// 
+/// Called from exception handlers when a recoverable fault is attributed to the
+/// current task. This is the abnormal termination counterpart to `task_exit()`
+/// in `task.rs`, and both paths converge on the same `Dead` task state and the
+/// same reaper, so the cleanup machinery does not need to distinguish between
+/// normal and abnormal task termination.
+///
+/// We do not call `schedule()` from here; the caller is responsible for that,
+/// since the call site (an exception handler) may need to do additional work,
+/// such as logging, before switching away. The lock is released before
+/// returning, so the caller can call `schedule()` without holding it.
+pub fn kill_current_task() {
+    {
+        let mut scheduler = SCHEDULER.lock();
+        let this_id = scheduler.current;
+        if let Some(task) = scheduler.get_task_mut(this_id) {
+            task.state = TaskState::Dead;
+        }
+    }  // The lock is released here
+
+    // Enqueue the reaper, so the dead task's slot and stack are freed on the
+    // next timer tick, by which point `schedule()` will have switched us away
+    // and the stack will no longer be in use.
+    crate::system_core::queue_system_task(
+        crate::system_core::system_tasks::dead_task_reaper, 0);
 }

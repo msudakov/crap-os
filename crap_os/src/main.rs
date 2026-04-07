@@ -280,6 +280,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // Spawn test tasks
     task_scheduler::spawn(task_a, 0).expect("failed to spawn task A");
     task_scheduler::spawn(task_b, 0).expect("failed to spawn task B");
+    task_scheduler::spawn(task_fault, 0).expect("failed to spawn Fault Task");
     
     // Testing keyboard interrupts
     sprintln!("[*] Testing keyboard interrupts. Type some stuff...");
@@ -377,5 +378,21 @@ fn task_b(_arg: u64) {
         for _ in 0..2_000_000 {
             unsafe { core::arch::asm!("nop"); }
         }
+    }
+}
+
+fn task_fault(_arg: u64) {
+    for _ in 0..2_000_000 {
+        unsafe { core::arch::asm!("nop"); }
+    }
+    // Deliberately trigger a #DE divide by zero
+    unsafe {
+        core::arch::asm!(
+            "xor rdx, rdx",
+            "xor rax, rax",
+            "xor rcx, rcx",
+            "div rcx",
+            options(nomem, nostack)
+        );
     }
 }

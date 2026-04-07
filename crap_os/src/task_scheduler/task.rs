@@ -1,21 +1,19 @@
-// =============================================================================
-// Kernel Task Representation
-// =============================================================================
-//
-// This module defines the data types that represent a kernel task and the
-// instrumentation needed to construct a new task's initial stack frame, so
-// that the generic context switcher (`switcher.rs`) can resume it for the very
-// first time without any special handling.
-//
-// A task is an independent thread of kernel execution. Each task has:
-//   - A unique numeric ID (`TaskId`);
-//   - A lifecycle state (`TaskState`) visible to the scheduler;
-//   - A private stack, heap-allocated as a `Box<[u8]>`;
-//   - A saved stack pointer (`saved_rsp`) that the context switcher uses to
-//     restore the task's register state when it is next scheduled.
-//
-// All tasks run at ring 0, for now, with interrupts enabled once they start
-// executing.
+//! Kernel Task Representation
+//!
+//! This module defines the data types that represent a kernel task and the
+//! instrumentation needed to construct a new task's initial stack frame, so
+//! that the generic context switcher (`switcher.rs`) can resume it for the very
+//! first time without any special handling.
+//!
+//! A task is an independent thread of kernel execution. Each task has:
+//!   - A unique numeric ID (`TaskId`);
+//!   - A lifecycle state (`TaskState`) visible to the scheduler;
+//!   - A private stack, heap-allocated as a `Box<[u8]>`;
+//!   - A saved stack pointer (`saved_rsp`) that the context switcher uses to
+//!     restore the task's register state when it is next scheduled.
+//!
+//! All tasks run at ring 0, for now, with interrupts enabled once they start
+//! executing.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use alloc::boxed::Box;

@@ -1,77 +1,75 @@
-// =============================================================================
-// Local APIC (Advanced Programmable Interrupt Controller) and I/O APIC Driver
-// =============================================================================
-//
-// This module configures and operates the two APIC components, replacing the
-// legacy 8259 PIC pair that UEFI leaves active by default. The two APICs
-// coordinate interrupts like this:
-//
-//  +-------------------------------------------------------------------------+
-//  |  Hardware device (keyboard, timer, PCI, etc.)                           |
-//  |         |                                                               |
-//  |         |  IRQ line                                                     |
-//  |         V                                                               |
-//  |   +----------+  Redirection    +------------+  IPI / vector   +-----+   |
-//  |   | I/O APIC | ------------->  | Local APIC | --------------> | CPU |   |
-//  |   +----------+                 +------------+                 +-----+   |
-//  +-------------------------------------------------------------------------+
-//
-//  I/O APIC (one per motherboard interrupt controller, MMIO at 0xFEC00000):
-//    - Receives external hardware IRQ lines from devices;
-//    - Routes each IRQ to a chosen Local APIC vector via a 64-bit redirection
-//      table entry (one entry per IRQ pin);
-//    - Programmed indirectly through an index/data register pair (IOREGSEL /
-//      IOWIN) rather than direct register access.
-//
-//  Local APIC (one per CPU core, MMIO at 0xFEE00000 by default):
-//    - Receives interrupt messages from the I/O APIC and delivers them to the
-//      core as vectors (0x00–0xFF);
-//    - Hosts the per-CPU APIC timer, used for periodic scheduling ticks;
-//    - Must be explicitly signalled at the end of each interrupt via the EOI
-//      register, and forgetting this silently masks all further interrupts of
-//      the same or lower priority class;
-//    - Manages spurious interrupts, which are phantom interrupts the hardware
-//      can generate; the APIC spec requires a dedicated "spurious vector"
-//      handler.
-//
-// -----------------------------------------------------------------------------
-// Access model
-// -----------------------------------------------------------------------------
-//
-// Both APICs are memory-mapped I/O (MMIO) devices. All reads and writes must
-// use `read_volatile` / `write_volatile` to prevent the compiler from
-// optimizing, reordering, or combining accesses to their registers.
-//
-// After `init_apic`, LAPIC_BASE and IOAPIC_BASE hold virtual addresses,
-// translated through the kernel's direct physical map. They are initially
-// set to their default physical values as a compile-time fallback, but are
-// overwritten on the first call to `init_apic` with the ACPI-derived addresses
-// converted to virtual.
-//
-// -----------------------------------------------------------------------------
-// Interrupt vector layout
-// -----------------------------------------------------------------------------
-//
-//   0x00–0x1F  CPU exceptions           (defined by Intel architecture)
-//   0x20       APIC timer               (VECTOR_TIMER)
-//   0x21       PS/2 keyboard, I/O IRQ 1 (VECTOR_KEYBOARD)
-//   0xFF       Spurious interrupt       (VECTOR_SPURIOUS - required by APIC)
-//
-// Vectors 0x22–0xFE are free for future devices.
-//
-// -----------------------------------------------------------------------------
-// Initialization sequence
-// -----------------------------------------------------------------------------
-//
-//   1. Call `disable_pic_8259()` to reinitialize and mask the legacy PIC, so
-//      its IRQs do not conflict with APIC vectors;
-//   2. Call `init_apic(lapic_phys, ioapic_phys)` with the addresses from ACPI;
-//   3. Load the IDT with handlers for VECTOR_TIMER, VECTOR_KEYBOARD, and
-//      VECTOR_SPURIOUS;
-//   4. Call `configure_timer(count)` to start the periodic APIC timer;
-//   5. Enable the keyboard by calling `ioapic_unmask_irq(1)` from the keyboard
-//      driver once it is ready to handle interrupts;
-//   6. Execute `sti` to globally enable interrupts.
+//! Local APIC (Advanced Programmable Interrupt Controller) and I/O APIC Driver
+//!
+//! This module configures and operates the two APIC components, replacing the
+//! legacy 8259 PIC pair that UEFI leaves active by default. The two APICs
+//! coordinate interrupts like this:
+//!
+//!  +-------------------------------------------------------------------------+
+//!  |  Hardware device (keyboard, timer, PCI, etc.)                           |
+//!  |         |                                                               |
+//!  |         |  IRQ line                                                     |
+//!  |         V                                                               |
+//!  |   +----------+  Redirection    +------------+  IPI / vector   +-----+   |
+//!  |   | I/O APIC | ------------->  | Local APIC | --------------> | CPU |   |
+//!  |   +----------+                 +------------+                 +-----+   |
+//!  +-------------------------------------------------------------------------+
+//!
+//!  I/O APIC (one per motherboard interrupt controller, MMIO at 0xFEC00000):
+//!    - Receives external hardware IRQ lines from devices;
+//!    - Routes each IRQ to a chosen Local APIC vector via a 64-bit redirection
+//!      table entry (one entry per IRQ pin);
+//!    - Programmed indirectly through an index/data register pair (IOREGSEL /
+//!      IOWIN) rather than direct register access.
+//!
+//!  Local APIC (one per CPU core, MMIO at 0xFEE00000 by default):
+//!    - Receives interrupt messages from the I/O APIC and delivers them to the
+//!      core as vectors (0x00–0xFF);
+//!    - Hosts the per-CPU APIC timer, used for periodic scheduling ticks;
+//!    - Must be explicitly signalled at the end of each interrupt via the EOI
+//!      register, and forgetting this silently masks all further interrupts of
+//!      the same or lower priority class;
+//!    - Manages spurious interrupts, which are phantom interrupts the hardware
+//!      can generate; the APIC spec requires a dedicated "spurious vector"
+//!      handler.
+//!
+//! ----------------------------------------------------------------------------
+//! Access model
+//! ----------------------------------------------------------------------------
+//!
+//! Both APICs are memory-mapped I/O (MMIO) devices. All reads and writes must
+//! use `read_volatile` / `write_volatile` to prevent the compiler from
+//! optimizing, reordering, or combining accesses to their registers.
+//!
+//! After `init_apic`, LAPIC_BASE and IOAPIC_BASE hold virtual addresses,
+//! translated through the kernel's direct physical map. They are initially
+//! set to their default physical values as a compile-time fallback, but are
+//! overwritten on the first call to `init_apic` with the ACPI-derived addresses
+//! converted to virtual.
+//!
+//! ----------------------------------------------------------------------------
+//! Interrupt vector layout
+//! ----------------------------------------------------------------------------
+//!
+//!   0x00–0x1F  CPU exceptions           (defined by Intel architecture)
+//!   0x20       APIC timer               (VECTOR_TIMER)
+//!   0x21       PS/2 keyboard, I/O IRQ 1 (VECTOR_KEYBOARD)
+//!   0xFF       Spurious interrupt       (VECTOR_SPURIOUS - required by APIC)
+//!
+//! Vectors 0x22–0xFE are free for future devices.
+//!
+//! ----------------------------------------------------------------------------
+//! Initialization sequence
+//! ----------------------------------------------------------------------------
+//!
+//!   1. Call `disable_pic_8259()` to reinitialize and mask the legacy PIC, so
+//!      its IRQs do not conflict with APIC vectors;
+//!   2. Call `init_apic(lapic_phys, ioapic_phys)` with the addresses from ACPI;
+//!   3. Load the IDT with handlers for VECTOR_TIMER, VECTOR_KEYBOARD, and
+//!      VECTOR_SPURIOUS;
+//!   4. Call `configure_timer(count)` to start the periodic APIC timer;
+//!   5. Enable the keyboard by calling `ioapic_unmask_irq(1)` from the keyboard
+//!      driver once it is ready to handle interrupts;
+//!   6. Execute `sti` to globally enable interrupts.
 
 use crate::memory_manager::MemoryManager;
 use core::ptr::{read_volatile, write_volatile};

@@ -1,6 +1,4 @@
-// =============================================================================
-// This file contains system helper routines
-// =============================================================================
+//! This file contains system helper routines
 
 use core::sync::atomic::Ordering;
 use crate::globals::HEX_CHARS_UPPER;

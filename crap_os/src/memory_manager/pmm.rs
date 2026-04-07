@@ -1,33 +1,31 @@
-// =============================================================================
-// Physical Memory Manager
-// =============================================================================
-//
-// The main job of the Physical Memory Manager is to allocate, free, and keep
-// track of physical memory pages in RAM. But, it has to do it really-really
-// efficiently because the entire system, including the Virtual Memory Manager,
-// depends on it for this one task. It has to be as fast as possible. 
-//
-// There are several methods of keeping track of physical pages. For example,
-// the bitmap method is able to locate a new free page in time O(n) when
-// unoptimized and down to O(log n) with some optimizations. However, this
-// implementation uses a simpler method that is able to fetch a new page and
-// also release a page in runtime of O(1), or in deterministic time.
-//
-// Specifically, it uses a stack-type (LIFO) singly-linked list.
-// Besides a counter for the number of free pages remaining in RAM, its
-// `free_list_head` member always points to the first/next free physical page
-// to be delivered when requested. In turn, each free physical page is
-// modified to have its first 8 bytes hold the address of the next page, and
-// so on.
-//
-// Each free page points to the next. Every time a page is freed and recycled
-// back to the manager, the PMM will take the current head address, place it
-// in the first 8 bytes of the newly-freed page to bump the old top page down,
-// and then update the head to point to the newly-freed page. And when a page
-// is allocated, the reverse takes place: the PMM follows the head to the
-// soon-to-be allocated page to read its first 8 bytes and find the
-// next-in-line page for later allocations. It then updates the head address
-// to point to the following page and returns the requested page to the caller.
+//! Physical Memory Manager
+//!
+//! The main job of the Physical Memory Manager is to allocate, free, and keep
+//! track of physical memory pages in RAM. But, it has to do it really-really
+//! efficiently because the entire system, including the Virtual Memory Manager,
+//! depends on it for this one task. It has to be as fast as possible. 
+//!
+//! There are several methods of keeping track of physical pages. For example,
+//! the bitmap method is able to locate a new free page in time O(n) when
+//! unoptimized and down to O(log n) with some optimizations. However, this
+//! implementation uses a simpler method that is able to fetch a new page and
+//! also release a page in runtime of O(1), or in deterministic time.
+//!
+//! Specifically, it uses a stack-type (LIFO) singly-linked list.
+//! Besides a counter for the number of free pages remaining in RAM, its
+//! `free_list_head` member always points to the first/next free physical page
+//! to be delivered when requested. In turn, each free physical page is
+//! modified to have its first 8 bytes hold the address of the next page, and
+//! so on.
+//!
+//! Each free page points to the next. Every time a page is freed and recycled
+//! back to the manager, the PMM will take the current head address, place it
+//! in the first 8 bytes of the newly-freed page to bump the old top page down,
+//! and then update the head to point to the newly-freed page. And when a page
+//! is allocated, the reverse takes place: the PMM follows the head to the
+//! soon-to-be allocated page to read its first 8 bytes and find the
+//! next-in-line page for later allocations. It then updates the head address
+//! to point to the following page and returns the requested page to the caller.
 
 use crate::memory_manager::{MemoryMapInfo, EfiMemoryDescriptor, EfiMemoryType};
 use crate::globals::{PAGE_SIZE, KERNEL_PHYSICAL_MAP_BASE,

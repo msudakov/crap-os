@@ -1,88 +1,86 @@
-// =============================================================================
-// Kernel Heap Allocator
-// =============================================================================
-//
-// This implementation is a linked free-list allocator backed by the kernel VMM.
-// It implements `GlobalAlloc`, so Rust's `alloc` crate (Box, Vec, String, etc.)
-// works transparently once registered with `#[global_allocator]`.
-//
-// The heap grows on demand from a fixed virtual address range
-// `[base, base + max_size)`. Physical pages are mapped into that range in
-// chunks via "grow" calls. Free memory is tracked as a singly-linked list of
-// `FreeBlock` nodes, kept sorted by ascending address. Keeping the list sorted
-// allows adjacent freed blocks to be merged (coalesced) in a single pass,
-// preventing fragmentation over time.
-//
-// Each allocation stores an `AllocHeader` immediately before the returned
-// pointer, plus a copy of the `data_offset` field in the 8 bytes directly
-// before the returned data pointer. This redundant copy allows `deallocate` to
-// recover the block start without reading the full header, which is crucial
-// when the pointer is the only information the caller provides on `free`.
-//
-// > This is the memory layout of an allocated block:
-//   [ AllocHeader | <alignment padding> | data_offset | <data> ]
-//     ^                                                  ^^^^
-//     block_ptr                                      pointer returned to caller
-//
-// > This is another view of the same layout of an allocated block:
-//
-//  +----------------------------------+  <- block_ptr (raw page-aligned base)
-//  |  AllocHeader                     |
-//  |    total_size: usize  (8 bytes)  |
-//  |    data_offset: usize (8 bytes)  |
-//  |----------------------------------|
-//  |  alignment padding (0+ bytes)    |
-//  |----------------------------------|
-//  |  data_offset copy  (8 bytes)     |  <- data_ptr - 8
-//  |----------------------------------|  <- data_ptr (returned to caller)
-//  |  data  (layout.size bytes)       |
-//  +----------------------------------+  <- block_ptr + total_size
-//
-// > This is the memory layout of a free block:
-//   [ FreeBlock { size, *next } | ... unused space ... ]
-//     ^
-//     block_ptr
-//
-// > This is another view of the same layout of a free block:
-//
-//  +----------------------------------+  <- FreeBlock pointer
-//  |  size: usize   (8 bytes)         |  Total bytes available in this block
-//  |  next: *mut FreeBlock (8 bytes)  |  Pointer to next free block
-//  +----------------------------------+
-//
-// FreeBlock::size is the total size of the free region, including the
-// FreeBlock header itself. FreeBlock::next is the next free block in
-// address-sorted order, or null if this is the tail of the list.
-//
-// > Free list ordering:
-//     The free list is kept sorted by ascending block address. This makes
-//     coalescing O(1) per `free` (just check immediate neighbors) at the cost
-//     of O(n) sorted insertion, which is acceptable since `free` is not on a
-//     hot path in a kernel heap.
-//
-// > Lock ordering (this must never be inverted!):
-//     KERNEL_HEAP -> MEMORY_MANAGER
-//
-// This way, `grow()` acquires the MEMORY_MANAGER lock while the caller holds
-// the KERNEL_HEAP lock. No code path may hold MEMORY_MANAGER and then trigger
-// a heap allocation. Otherwise, a deadlock would be imminent.
-//
-// Two IRQ-safe spinlocks are necessary here, and this is what happens during a
-// heap allocation:
-//
-// caller
-// |_ GlobalHeapAllocator::alloc()
-//    |_ KERNEL_HEAP.heap.lock()      -> this acquires heap lock
-//    .  |_ KernelHeap::allocate()
-//    .     |_ if free list has space -> no second lock needed, returns directly
-//    .     |_ if free list exhausted:
-//    .        |_ KernelHeap::grow()
-//    .        .  |_ MEMORY_MANAGER.lock()  -> this acquires MM lock
-//    .        .  .  |_ mm.alloc_page()
-//    .        .  .  |_ mm.map_page()
-//    .        .  |_ MEMORY_MANAGER unlocked
-//    .        |_ retries free list
-//    |_ KERNEL_HEAP unlocked
+//! Kernel Heap Allocator
+//!
+//! This implementation is a linked free-list allocator backed by the kernel
+//! VMM. It implements `GlobalAlloc`, so Rust's `alloc` crate (Box, Vec, String,
+//! etc.) works transparently once registered with `#[global_allocator]`.
+//!
+//! The heap grows on demand from a fixed virtual address range
+//! `[base, base + max_size)`. Physical pages are mapped into that range in
+//! chunks via "grow" calls. Free memory is tracked as a singly-linked list of
+//! `FreeBlock` nodes, kept sorted by ascending address. Keeping the list sorted
+//! allows adjacent freed blocks to be merged (coalesced) in a single pass,
+//! preventing fragmentation over time.
+//!
+//! Each allocation stores an `AllocHeader` immediately before the returned
+//! pointer, plus a copy of the `data_offset` field in the 8 bytes directly
+//! before the returned data pointer. This redundant copy allows `deallocate` to
+//! recover the block start without reading the full header, which is crucial
+//! when the pointer is the only information the caller provides on `free`.
+//!
+//! > This is the memory layout of an allocated block:
+//!   [ AllocHeader | <alignment padding> | data_offset | <data> ]
+//!     ^                                                  ^^^^
+//!     block_ptr                                     pointer returned to caller
+//!
+//! > This is another view of the same layout of an allocated block:
+//!
+//!  +----------------------------------+  <- block_ptr (raw page-aligned base)
+//!  |  AllocHeader                     |
+//!  |    total_size: usize  (8 bytes)  |
+//!  |    data_offset: usize (8 bytes)  |
+//!  |----------------------------------|
+//!  |  alignment padding (0+ bytes)    |
+//!  |----------------------------------|
+//!  |  data_offset copy  (8 bytes)     |  <- data_ptr - 8
+//!  |----------------------------------|  <- data_ptr (returned to caller)
+//!  |  data  (layout.size bytes)       |
+//!  +----------------------------------+  <- block_ptr + total_size
+//!
+//! > This is the memory layout of a free block:
+//!   [ FreeBlock { size, *next } | ... unused space ... ]
+//!     ^
+//!     block_ptr
+//!
+//! > This is another view of the same layout of a free block:
+//!
+//!  +----------------------------------+  <- FreeBlock pointer
+//!  |  size: usize   (8 bytes)         |  Total bytes available in this block
+//!  |  next: *mut FreeBlock (8 bytes)  |  Pointer to next free block
+//!  +----------------------------------+
+//!
+//! FreeBlock::size is the total size of the free region, including the
+//! FreeBlock header itself. FreeBlock::next is the next free block in
+//! address-sorted order, or null if this is the tail of the list.
+//!
+//! > Free list ordering:
+//!     The free list is kept sorted by ascending block address. This makes
+//!     coalescing O(1) per `free` (just check immediate neighbors) at the cost
+//!     of O(n) sorted insertion, which is acceptable since `free` is not on a
+//!     hot path in a kernel heap.
+//!
+//! > Lock ordering (this must never be inverted!):
+//!     KERNEL_HEAP -> MEMORY_MANAGER
+//!
+//! This way, `grow()` acquires the MEMORY_MANAGER lock while the caller holds
+//! the KERNEL_HEAP lock. No code path may hold MEMORY_MANAGER and then trigger
+//! a heap allocation. Otherwise, a deadlock would be imminent.
+//!
+//! Two IRQ-safe spinlocks are necessary here, and this is what happens during a
+//! heap allocation:
+//!
+//! caller
+//! |_ GlobalHeapAllocator::alloc()
+//!    |_ KERNEL_HEAP.heap.lock()      -> this acquires heap lock
+//!    .  |_ KernelHeap::allocate()
+//!    .     |_ if free list has space: no second lock needed, returns directly
+//!    .     |_ if free list exhausted:
+//!    .        |_ KernelHeap::grow()
+//!    .        .  |_ MEMORY_MANAGER.lock()  -> this acquires MM lock
+//!    .        .  .  |_ mm.alloc_page()
+//!    .        .  .  |_ mm.map_page()
+//!    .        .  |_ MEMORY_MANAGER unlocked
+//!    .        |_ retries free list
+//!    |_ KERNEL_HEAP unlocked
 
 use crate::memory_manager::{PRESENT, WRITABLE, NX};
 use crate::globals::{PAGE_SIZE, MEMORY_MANAGER, KERNEL_HEAP};

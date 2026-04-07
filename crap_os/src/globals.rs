@@ -1,9 +1,7 @@
-// =============================================================================
-// System Globals
-// =============================================================================
-// 
-// This file contains global system resources, some of which must be
-// synchronized and protected from races and deadlocks.
+//! System Globals
+//! 
+//! This file contains global system resources, some of which must be
+//! synchronized and protected from races and deadlocks.
 
 use core::sync::atomic::AtomicU64;
 use crate::{DebugLevel};

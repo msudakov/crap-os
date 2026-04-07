@@ -1,58 +1,56 @@
-// =============================================================================
-// Interrupt Descriptor Table (IDT)
-// =============================================================================
-//
-// This module owns the full 256-entry IDT and all CPU exception handlers for
-// vectors 0–31. It also implements the needed hardware IRQ vectors (e.g., APIC)
-// in the 32–255 range, and all unused ones get a generic "unhandled IRQ" stub
-// that halts.
-//
-// Each IDT entry points to a `#[naked]` trampoline function, which does the
-//  following:
-//   1. Pushes a dummy error code (0) on vectors that don't push one
-//      automatically, so every handler receives a uniform stack layout;
-//   2. Saves all general-purpose registers (RAX..R15) onto the stack;
-//   3. Passes a pointer to the resulting `InterruptFrame` to a safe
-//      handler function via the System V AMD64 calling convention (RDI);
-//   4. On return from the handler, restores all GPRs and executes IRETQ.
-//
-// After the trampoline saves the registers, the stack is laid out as follows
-// on handler entry:
-//
-//   Higher addresses  (SS pushed first by CPU)
-//   +----------------------+
-//   |  SS         (+80)    |  -+
-//   |  RSP        (+72)    |   |
-//   |  RFLAGS     (+64)    |   |  Pushed by CPU automatically
-//   |  CS         (+56)    |   |
-//   |  RIP        (+48)    |  -+
-//   |  error_code (+40)    |  <- CPU (for #DF, #PF, #GP, etc.) or 0 (our stub)
-//   |  R15        (+32)    |  -+
-//   |  R14        (+24)    |   |
-//   |  R13        (+16)    |   |
-//   |  R12        (+ 8)    |   |  Saved by trampoline (PUSH order: R15..RAX)
-//   |  R11        (+ 0)    |   |
-//   |  R10        (-8 )    |   |
-//   |  R9         (-16)    |   |
-//   |  R8         (-24)    |   |
-//   |  RBP        (-32)    |   |
-//   |  RDI        (-40)    |   |
-//   |  RSI        (-48)    |   |
-//   |  RDX        (-56)    |   |
-//   |  RCX        (-64)    |   |
-//   |  RBX        (-72)    |   |
-//   |  RAX        (-80)    |  -+  <- RSP on handler entry, passed as &frame
-//   +----------------------+
-//   Lower addresses
-//
-// The `InterruptFrame` struct mirrors this layout in declaration order so
-// that `&frame` (where frame: *const InterruptFrame = RSP) gives safe Rust
-// access to every field.
-//
-// The double-fault handler (#DF, vector 8) is installed with IST=1, which
-// points to the dedicated `DOUBLE_FAULT_STACK` defined in gdt.rs. All other
-// handlers use IST=0 (no stack switch; they run on whatever stack was active
-// when the exception fired).
+//! Interrupt Descriptor Table (IDT)
+//!
+//! This module owns the full 256-entry IDT and all CPU exception handlers for
+//! vectors 0–31. It also implements the needed hardware IRQ vectors (e.g. APIC)
+//! in the 32–255 range, and all unused ones get a generic "unhandled IRQ" stub
+//! that halts.
+//!
+//! Each IDT entry points to a `#[naked]` trampoline function, which does the
+//!  following:
+//!   1. Pushes a dummy error code (0) on vectors that don't push one
+//!      automatically, so every handler receives a uniform stack layout;
+//!   2. Saves all general-purpose registers (RAX..R15) onto the stack;
+//!   3. Passes a pointer to the resulting `InterruptFrame` to a safe
+//!      handler function via the System V AMD64 calling convention (RDI);
+//!   4. On return from the handler, restores all GPRs and executes IRETQ.
+//!
+//! After the trampoline saves the registers, the stack is laid out as follows
+//! on handler entry:
+//!
+//!   Higher addresses  (SS pushed first by CPU)
+//!   +----------------------+
+//!   |  SS         (+80)    |  -+
+//!   |  RSP        (+72)    |   |
+//!   |  RFLAGS     (+64)    |   |  Pushed by CPU automatically
+//!   |  CS         (+56)    |   |
+//!   |  RIP        (+48)    |  -+
+//!   |  error_code (+40)    |  <- CPU (for #DF, #PF, #GP, etc.) or 0 (our stub)
+//!   |  R15        (+32)    |  -+
+//!   |  R14        (+24)    |   |
+//!   |  R13        (+16)    |   |
+//!   |  R12        (+ 8)    |   |  Saved by trampoline (PUSH order: R15..RAX)
+//!   |  R11        (+ 0)    |   |
+//!   |  R10        (-8 )    |   |
+//!   |  R9         (-16)    |   |
+//!   |  R8         (-24)    |   |
+//!   |  RBP        (-32)    |   |
+//!   |  RDI        (-40)    |   |
+//!   |  RSI        (-48)    |   |
+//!   |  RDX        (-56)    |   |
+//!   |  RCX        (-64)    |   |
+//!   |  RBX        (-72)    |   |
+//!   |  RAX        (-80)    |  -+  <- RSP on handler entry, passed as &frame
+//!   +----------------------+
+//!   Lower addresses
+//!
+//! The `InterruptFrame` struct mirrors this layout in declaration order so
+//! that `&frame` (where frame: *const InterruptFrame = RSP) gives safe Rust
+//! access to every field.
+//!
+//! The double-fault handler (#DF, vector 8) is installed with IST=1, which
+//! points to the dedicated `DOUBLE_FAULT_STACK` defined in gdt.rs. All other
+//! handlers use IST=0 (no stack switch; they run on whatever stack was active
+//! when the exception fired).
 
 use core::arch::asm;        // used in non-naked handlers (cr2 read, cpu_halt)
 use core::arch::naked_asm;  // used inside #[naked] trampolines

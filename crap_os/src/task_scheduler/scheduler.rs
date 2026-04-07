@@ -1,40 +1,39 @@
-// =============================================================================
-// Kernel Task Scheduler
-// =============================================================================
-//
-// This module implements the kernel's task scheduler. It uses preemptive
-// scheduling, maintains a table of all live tasks and a round-robin ready
-// queue, and performs context switches in response to timer interrupts.
-//
-// The task table (`tasks: [Option<Task>; MAX_TASKS]`) is a flat array of
-// optional `Task` values; a `Some` slot holds a live task, regardless of its
-// state, while a `None` slot is free. The ready queue is a power-of-two ring
-// buffer (`queue: [TaskId; QUEUE_SIZE]`) of `TaskId` values representing tasks
-// in the `Ready` state.
-//
-// The scheduling algorithm is a first-in-first-out round robin: the task at the
-// head of the queue gets the next time slice. After the slice, if the task is
-// still `Running`, it is moved to `Ready` and appended to the tail, giving all
-// other ready tasks a turn before it runs again. This is the simplest fair
-// scheduling algorithm with O(1) enqueue and dequeue operations. There is no
-// priority system yet; tasks preempted by the timer, tasks woken from being
-// `Blocked`, newly-spawned tasks, etc., are all treated equally.
-//
-// All mutable scheduler state is protected by a single `StaticIrqSpinLock`.
-// Because it is an IrqSpinLock, acquiring it also disables hardware interrupts
-// on the current CPU for the duration of the critical section. This prevents
-// the timer ISR from re-entering `schedule()` while we are in the middle of
-// modifying the task table or queue.
-//
-// CRITICAL RULE: The lock must NEVER be held across a call to `switch_to`
-// because of:
-//   - Deadlock danger: the incoming task will try to acquire the same lock on
-//     its next scheduler interaction; if we hold it during the switch, it can
-//     never acquire it.
-//   - Wrong stack danger: `IrqSpinLockGuard::drop` restores RFLAGS (re-enabling
-//     interrupts) by executing `popfq`. If the guard is dropped after the
-//     switch, `popfq` runs on the incoming task's stack with the outgoing
-//     task's saved flags, thus corrupting the incoming task's interrupt state.
+//! Kernel Task Scheduler
+//!
+//! This module implements the kernel's task scheduler. It uses preemptive
+//! scheduling, maintains a table of all live tasks and a round-robin ready
+//! queue, and performs context switches in response to timer interrupts.
+//!
+//! The task table (`tasks: [Option<Task>; MAX_TASKS]`) is a flat array of
+//! optional `Task` values; a `Some` slot holds a live task, regardless of its
+//! state, while a `None` slot is free. The ready queue is a power-of-two ring
+//! buffer (`queue: [TaskId; QUEUE_SIZE]`) of `TaskId` values representing tasks
+//! in the `Ready` state.
+//!
+//! The scheduling algorithm is a first-in-first-out round robin: the task at
+//! the head of the queue gets the next time slice. After the slice, if the task
+//! is still `Running`, it is moved to `Ready` and appended to the tail, giving
+//! all other ready tasks a turn before it runs again. This is the simplest fair
+//! scheduling algorithm with O(1) enqueue and dequeue operations. There is no
+//! priority system yet; tasks preempted by the timer, tasks woken from being
+//! `Blocked`, newly-spawned tasks, etc., are all treated equally.
+//!
+//! All mutable scheduler state is protected by a single `StaticIrqSpinLock`.
+//! Because it is an IrqSpinLock, acquiring it also disables hardware interrupts
+//! on the current CPU for the duration of the critical section. This prevents
+//! the timer ISR from re-entering `schedule()` while we are in the middle of
+//! modifying the task table or queue.
+//!
+//! CRITICAL RULE: The lock must NEVER be held across a call to `switch_to`
+//! because of:
+//!   - Deadlock danger: the incoming task will try to acquire the same lock on
+//!     its next scheduler interaction; if we hold it during the switch, it can
+//!     never acquire it.
+//!   - Wrong stack danger: `IrqSpinLockGuard::drop` restores RFLAGS
+//!     (re-enabling interrupts) by executing `popfq`. If the guard is dropped
+//!     after the switch, `popfq` runs on the incoming task's stack with the
+//!     outgoing task's saved flags, thus corrupting the incoming task's
+//!     interrupt state.
 
 use super::switcher::switch_to;
 use super::task::{Task, TaskId, TaskState};

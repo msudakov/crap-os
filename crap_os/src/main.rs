@@ -1,6 +1,4 @@
-// =============================================================================
-// CrapOS Main System Module
-// =============================================================================
+//! CrapOS Main System Module
 
 #![no_std]   // This is an OS kernel; there is no standard library for now
 #![no_main]  // Not depending on a runtime, so cannot use main as entry point

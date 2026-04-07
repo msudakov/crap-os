@@ -1,40 +1,39 @@
-// =============================================================================
-// Kernel Task Scheduler
-// =============================================================================
-//
-// This module implements the kernel's task scheduler. It uses preemptive
-// scheduling, maintains a table of all live tasks and a round-robin ready
-// queue, and performs context switches in response to timer interrupts.
-//
-// The task table (`tasks: [Option<Task>; MAX_TASKS]`) is a flat array of
-// optional `Task` values; a `Some` slot holds a live task, regardless of its
-// state, while a `None` slot is free. The ready queue is a power-of-two ring
-// buffer (`queue: [TaskId; QUEUE_SIZE]`) of `TaskId` values representing tasks
-// in the `Ready` state.
-//
-// The scheduling algorithm is a first-in-first-out round robin: the task at the
-// head of the queue gets the next time slice. After the slice, if the task is
-// still `Running`, it is moved to `Ready` and appended to the tail, giving all
-// other ready tasks a turn before it runs again. This is the simplest fair
-// scheduling algorithm with O(1) enqueue and dequeue operations. There is no
-// priority system yet; tasks preempted by the timer, tasks woken from being
-// `Blocked`, newly-spawned tasks, etc., are all treated equally.
-//
-// All mutable scheduler state is protected by a single `StaticIrqSpinLock`.
-// Because it is an IrqSpinLock, acquiring it also disables hardware interrupts
-// on the current CPU for the duration of the critical section. This prevents
-// the timer ISR from re-entering `schedule()` while we are in the middle of
-// modifying the task table or queue.
-//
-// CRITICAL RULE: The lock must NEVER be held across a call to `switch_to`
-// because of:
-//   - Deadlock danger: the incoming task will try to acquire the same lock on
-//     its next scheduler interaction; if we hold it during the switch, it can
-//     never acquire it.
-//   - Wrong stack danger: `IrqSpinLockGuard::drop` restores RFLAGS (re-enabling
-//     interrupts) by executing `popfq`. If the guard is dropped after the
-//     switch, `popfq` runs on the incoming task's stack with the outgoing
-//     task's saved flags, thus corrupting the incoming task's interrupt state.
+//! Kernel Task Scheduler
+//!
+//! This module implements the kernel's task scheduler. It uses preemptive
+//! scheduling, maintains a table of all live tasks and a round-robin ready
+//! queue, and performs context switches in response to timer interrupts.
+//!
+//! The task table (`tasks: [Option<Task>; MAX_TASKS]`) is a flat array of
+//! optional `Task` values; a `Some` slot holds a live task, regardless of its
+//! state, while a `None` slot is free. The ready queue is a power-of-two ring
+//! buffer (`queue: [TaskId; QUEUE_SIZE]`) of `TaskId` values representing tasks
+//! in the `Ready` state.
+//!
+//! The scheduling algorithm is a first-in-first-out round robin: the task at
+//! the head of the queue gets the next time slice. After the slice, if the task
+//! is still `Running`, it is moved to `Ready` and appended to the tail, giving
+//! all other ready tasks a turn before it runs again. This is the simplest fair
+//! scheduling algorithm with O(1) enqueue and dequeue operations. There is no
+//! priority system yet; tasks preempted by the timer, tasks woken from being
+//! `Blocked`, newly-spawned tasks, etc., are all treated equally.
+//!
+//! All mutable scheduler state is protected by a single `StaticIrqSpinLock`.
+//! Because it is an IrqSpinLock, acquiring it also disables hardware interrupts
+//! on the current CPU for the duration of the critical section. This prevents
+//! the timer ISR from re-entering `schedule()` while we are in the middle of
+//! modifying the task table or queue.
+//!
+//! CRITICAL RULE: The lock must NEVER be held across a call to `switch_to`
+//! because of:
+//!   - Deadlock danger: the incoming task will try to acquire the same lock on
+//!     its next scheduler interaction; if we hold it during the switch, it can
+//!     never acquire it.
+//!   - Wrong stack danger: `IrqSpinLockGuard::drop` restores RFLAGS
+//!     (re-enabling interrupts) by executing `popfq`. If the guard is dropped
+//!     after the switch, `popfq` runs on the incoming task's stack with the
+//!     outgoing task's saved flags, thus corrupting the incoming task's
+//!     interrupt state.
 
 use super::switcher::switch_to;
 use super::task::{Task, TaskId, TaskState};
@@ -78,8 +77,9 @@ const QUEUE_MASK: usize = QUEUE_SIZE - 1;
 ///     and, `queue_len == QUEUE_SIZE` when the queue is full.
 ///
 /// The scheduler's spinlock is always acquired through `SCHEDULER.lock()`, and
-/// it must never held across `switch_to`.
-struct Scheduler {
+/// it must never held across `switch_to`. We define it as `pub(super)` because
+/// it needs to be accessible from `task_exit` in `task.rs`.
+pub(super) struct Scheduler {
     /// Flat array of optional tasks, where each index is a storage slot with no
     /// semantic meaning; tasks are located by scanning for a matching `TaskId`,
     /// not by indexing directly.
@@ -119,7 +119,10 @@ struct Scheduler {
     /// is stored here has `TaskState::Running` and is not in `queue`. `init()`
     /// initializes this to `TaskId::IDLE`; and, it is set to the actual
     /// running task ID at the end of every `schedule()` call.
-    current: TaskId,
+    /// 
+    /// We define it as `pub(super)` because it needs to be accessible from
+    /// `task_exit` in `task.rs`.
+    pub(super) current: TaskId,
 }
 
 #[allow(dead_code)]
@@ -235,7 +238,9 @@ impl Scheduler {
 
     /// Obtains a mutable reference to a `Task` by its ID.
     /// 
-    /// The linear scan runs in time O(MAX_TASKS).
+    /// The linear scan runs in time O(MAX_TASKS). We declare it as `pub(super)`
+    /// because this function needs to be accessible from `task_exit` in
+    /// `task.rs`.
     /// 
     /// # Arguments
     /// 
@@ -245,7 +250,7 @@ impl Scheduler {
     /// 
     /// Returns a mutable reference to the located task, or `None` if no
     /// such task exists in the table.
-    fn get_task_mut(&mut self, task_id: TaskId) -> Option<&mut Task> {
+    pub(super) fn get_task_mut(&mut self, task_id: TaskId) -> Option<&mut Task> {
         self.tasks.iter_mut()
             .filter_map(|slot| slot.as_mut())  // Skip the `None` slots
             .find(|task| task.id == task_id)
@@ -304,7 +309,10 @@ pub enum SchedulerError {
 /// hardware interrupts for the duration of every lock acquisition, preventing
 /// the timer ISR from re-entering the scheduler while the lock is held by a
 /// task-context caller (e.g., `spawn` or `wake`).
-static SCHEDULER: StaticIrqSpinLock<Scheduler> =
+/// 
+/// We declare it as `pub(super)` because it needs to be accessible from
+/// `task_exit` in `task.rs`.
+pub(super) static SCHEDULER: StaticIrqSpinLock<Scheduler> =
     StaticIrqSpinLock::new(Scheduler::new());
 
 // =============================================================================
@@ -362,7 +370,7 @@ pub fn init() {
 ///
 /// # Arguments
 /// 
-/// * `entry` - The task's entry function. For now, it does not return. TODO...
+/// * `entry` - The task's entry function.
 /// * `arg`   - An opaque `u64` passed as the sole argument to `entry` function.
 ///
 /// # Returns
@@ -379,7 +387,7 @@ pub fn init() {
 /// `Task::new` (the heap allocation) is done before acquiring the scheduler
 /// lock, minimizing the time the lock is held. The lock is only held for the
 /// brief table-insertion and queue-push operations.
-pub fn spawn(entry: fn(u64) -> !, arg: u64) -> Result<TaskId, SchedulerError> {
+pub fn spawn(entry: fn(u64), arg: u64) -> Result<TaskId, SchedulerError> {
     // Allocate the task and its stack outside the lock. Heap allocation may
     // block briefly (if the heap needs to grow) or involve page-mapping
     // operations. Doing this with the scheduler lock held would block the
@@ -634,4 +642,76 @@ pub fn wake(task_id: TaskId) -> Result<(), SchedulerError> {
 #[inline]
 pub fn get_current_task_id() -> TaskId {
     SCHEDULER.lock().current
+}
+
+/// Tombstone cleanup removes all `Dead` tasks from the task table and frees
+/// their resources.
+/// 
+/// This is called exclusively by the `dead_task_reaper` `SystemTask`,
+/// which fires on the timer interrupt after a task has exited. By the time this
+/// runs, the dead task has already been switched away from by `schedule()`,
+/// so its stack is no longer in use and is safe to drop.
+pub fn tombstone_cleanup() {
+    // Hold the lock only long enough to sweep the task table
+    let tasks_reaped = {
+        let mut scheduler = SCHEDULER.lock();
+        let mut dead_task_count = 0u64;
+
+        for slot in scheduler.tasks.iter_mut() {
+            // Check if this slot holds a Dead task
+            let is_dead = slot
+                .as_ref()
+                .map_or(false, |task| task.state == TaskState::Dead);
+
+            if is_dead {
+                // Dropping the Task here drops its Box<[u8]> stack allocation.
+                // This is safe because the task is Dead, and schedule() has
+                // already switched away from it and will never switch back.
+                *slot = None;
+                dead_task_count += 1;
+            }
+        }
+
+        dead_task_count
+    };  // The lock is released here
+
+    if tasks_reaped > 0 {
+        // TODO: for debugging purposes; can clean up later on.
+        // Log how many tasks were cleaned up, so we can verify during testing.
+        if crate::globals::DEBUG_LEVEL == crate::DebugLevel::INFO {
+            crate::system_routines::print_u64_field(
+                "[REAPER] Tombstone cleanup: reaped ", tasks_reaped);
+            crate::hardware_manager::sprint(" dead task(s)\n");
+        }
+    }
+}
+
+/// Marks the currently-running task as `Dead` and enqueues the
+/// `dead_task_reaper` SystemTask for the tombstone cleanup on the next timer
+/// tick.
+/// 
+/// Called from exception handlers when a recoverable fault is attributed to the
+/// current task. This is the abnormal termination counterpart to `task_exit()`
+/// in `task.rs`, and both paths converge on the same `Dead` task state and the
+/// same reaper, so the cleanup machinery does not need to distinguish between
+/// normal and abnormal task termination.
+///
+/// We do not call `schedule()` from here; the caller is responsible for that,
+/// since the call site (an exception handler) may need to do additional work,
+/// such as logging, before switching away. The lock is released before
+/// returning, so the caller can call `schedule()` without holding it.
+pub fn kill_current_task() {
+    {
+        let mut scheduler = SCHEDULER.lock();
+        let this_id = scheduler.current;
+        if let Some(task) = scheduler.get_task_mut(this_id) {
+            task.state = TaskState::Dead;
+        }
+    }  // The lock is released here
+
+    // Enqueue the reaper, so the dead task's slot and stack are freed on the
+    // next timer tick, by which point `schedule()` will have switched us away
+    // and the stack will no longer be in use.
+    crate::system_core::queue_system_task(
+        crate::system_core::system_tasks::dead_task_reaper, 0);
 }

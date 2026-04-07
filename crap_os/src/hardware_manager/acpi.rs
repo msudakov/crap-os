@@ -1,54 +1,52 @@
-// =============================================================================
-// ACPI (Advanced Configuration and Power Interface) Table Parser
-// =============================================================================
-//
-// This module walks the ACPI table hierarchy to locate the two physical
-// addresses the APIC driver needs to initialize interrupt routing:
-// - Local APIC base address, which is usually at 0xFEE00000:
-//     The Local APIC (LAPIC) is a per-CPU controller. Each core uses its own
-//     LAPIC to receive interrupts, send inter-processor interrupts (IPIs), and
-//     manage the local timer. The base address is the same for all CPU cores.
-//
-// - I/O APIC base address, which is usually at 0xFEC00000:
-//     The I/O APIC is a single chip (or one per cluster) that receives
-//     external hardware interrupts (PCI, PS/2, timers, etc.) and routes
-//     them to one or more LAPICs. We'll only track the first I/O APIC.
-//
-// The ACPI table hierarchy is comprised of the following components: RSDP,
-// XSDT/RSDT, MADT (the APIC), and others. Visually, it looks like this:
-//   RSDP
-//    |_ XSDT or RSDT
-//         |- FACP (Fixed ACPI Description Table)
-//         |- APIC <- this is the MADT, and it contains what we need
-//         |- HPET
-//         |_ ... (other tables, which we can ignore for now)
-// 
-//  - RSDP (Root System Description Pointer):
-//      Supplied by the firmware and passed through by our bootloader.
-//      Contains the physical address of either the XSDT (for ACPI 2.0+) or
-//      RSDT (for ACPI 1.0), depending on the revision field.
-//
-//  - XSDT/RSDT (Extended/Root System Description Table)
-//      An array of physical pointers (64-bit for XSDT, 32-bit for RSDT),
-//      each pointing to another SDT. We scan this array looking for "APIC",
-//      which is the MADT signature.
-//
-//  - MADT (Multiple APIC Description Table, signature "APIC")
-//      Contains the default Local APIC address, followed by a variable-length
-//      list of interrupt controller structures - one per LAPIC, I/O APIC,
-//      interrupt source override, NMI source, etc. We scan these entries to
-//      find the first I/O APIC entry (type 1).
-//
-// All ACPI structures are defined as `repr(C, packed)`. The ACPI spec lays
-// them out with no implicit padding, and they may be placed at arbitrary byte
-// offsets in firmware-provided memory, so alignment cannot be assumed.
-//
-// Rust forbids creating a reference (`&T`) to an unaligned field of a packed
-// struct, because the reference itself would be misaligned and any read through
-// it is undefined behaviour on architectures that require alignment. To avoid
-// this, we always use `ptr::read_unaligned` (via `addr_of!`) when reading
-// multi-byte fields from packed structs. Single `u8` fields can be read
-// through a field access because they are always aligned.
+//! ACPI (Advanced Configuration and Power Interface) Table Parser
+//!
+//! This module walks the ACPI table hierarchy to locate the two physical
+//! addresses the APIC driver needs to initialize interrupt routing:
+//! - Local APIC base address, which is usually at 0xFEE00000:
+//!     The Local APIC (LAPIC) is a per-CPU controller. Each core uses its own
+//!     LAPIC to receive interrupts, send inter-processor interrupts (IPIs), and
+//!     manage the local timer. The base address is the same for all CPU cores.
+//!
+//! - I/O APIC base address, which is usually at 0xFEC00000:
+//!     The I/O APIC is a single chip (or one per cluster) that receives
+//!     external hardware interrupts (PCI, PS/2, timers, etc.) and routes
+//!     them to one or more LAPICs. We'll only track the first I/O APIC.
+//!
+//! The ACPI table hierarchy is comprised of the following components: RSDP,
+//! XSDT/RSDT, MADT (the APIC), and others. Visually, it looks like this:
+//!   RSDP
+//!    |_ XSDT or RSDT
+//!         |- FACP (Fixed ACPI Description Table)
+//!         |- APIC <- this is the MADT, and it contains what we need
+//!         |- HPET
+//!         |_ ... (other tables, which we can ignore for now)
+//! 
+//!  - RSDP (Root System Description Pointer):
+//!      Supplied by the firmware and passed through by our bootloader.
+//!      Contains the physical address of either the XSDT (for ACPI 2.0+) or
+//!      RSDT (for ACPI 1.0), depending on the revision field.
+//!
+//!  - XSDT/RSDT (Extended/Root System Description Table)
+//!      An array of physical pointers (64-bit for XSDT, 32-bit for RSDT),
+//!      each pointing to another SDT. We scan this array looking for "APIC",
+//!      which is the MADT signature.
+//!
+//!  - MADT (Multiple APIC Description Table, signature "APIC")
+//!      Contains the default Local APIC address, followed by a variable-length
+//!      list of interrupt controller structures - one per LAPIC, I/O APIC,
+//!      interrupt source override, NMI source, etc. We scan these entries to
+//!      find the first I/O APIC entry (type 1).
+//!
+//! All ACPI structures are defined as `repr(C, packed)`. The ACPI spec lays
+//! them out with no implicit padding, and they may be placed at arbitrary byte
+//! offsets in firmware-provided memory, so alignment cannot be assumed.
+//!
+//! Rust forbids creating a reference (`&T`) to an unaligned field of a packed
+//! struct, because the reference itself would be misaligned and any read
+//! through it is undefined behaviour on architectures that require alignment.
+//! To avoid this, we always use `ptr::read_unaligned` (via `addr_of!`) when
+//! reading multi-byte fields from packed structs. Single `u8` fields can be
+//! read through a field access because they are always aligned.
 
 use core::ptr;
 use crate::memory_manager::MemoryManager;

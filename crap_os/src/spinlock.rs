@@ -1,26 +1,24 @@
-// =============================================================================
-// Spinlock and IRQ Safety Module
-// =============================================================================
-//
-// This module contains spinlock implementations for synchronizing critical
-// globals. These are mutual-exclusion primitives that busy-wait (spin) until
-// the lock is available. They are suitable for short critical sections in a
-// kernel context. Plain spinlocks are not safe to use in both thread and
-// interrupt context simultaneously. If an interrupt fires while the lock is
-// held on a current CPU, and the interrupt handler also tries to acquire
-// the same lock, we would deadlock - bad news bear.
-//
-// SpinLock<T> is the core primitive here. It spins on an AtomicBool using a
-// test-and-test-and-set (TTAS) loop for cache efficiency. IrqSpinLock<T> then
-// wraps SpinLock and disables CPU hardware interrupts while held, preventing
-// deadlock between a thread and an interrupt service routine competing for
-// the same lock. StaticSpinLock<T> and StaticIrqSpinLock<T> are thin wrappers
-// that manually implement Sync so these can be safe to put in a static
-// variable.
-//
-// Each lock has a corresponding RAII (Resource Acquisition Is Initialization)
-// guard type that automatically releases the lock (for IrqSpinLock, it also
-// restores interrupt state) when it is dropped.
+//! Spinlock and IRQ Safety Module
+//!
+//! This module contains spinlock implementations for synchronizing critical
+//! globals. These are mutual-exclusion primitives that busy-wait (spin) until
+//! the lock is available. They are suitable for short critical sections in a
+//! kernel context. Plain spinlocks are not safe to use in both thread and
+//! interrupt context simultaneously. If an interrupt fires while the lock is
+//! held on a current CPU, and the interrupt handler also tries to acquire
+//! the same lock, we would deadlock - bad news bear.
+//!
+//! SpinLock<T> is the core primitive here. It spins on an AtomicBool using a
+//! test-and-test-and-set (TTAS) loop for cache efficiency. IrqSpinLock<T> then
+//! wraps SpinLock and disables CPU hardware interrupts while held, preventing
+//! deadlock between a thread and an interrupt service routine competing for
+//! the same lock. StaticSpinLock<T> and StaticIrqSpinLock<T> are thin wrappers
+//! that manually implement Sync so these can be safe to put in a static
+//! variable.
+//!
+//! Each lock has a corresponding RAII (Resource Acquisition Is Initialization)
+//! guard type that automatically releases the lock (for IrqSpinLock, it also
+//! restores interrupt state) when it is dropped.
 
 // Needed for interior mutability; it tells the compiler that the value inside
 // may be mutated through a shared reference.

@@ -1,6 +1,4 @@
-// =============================================================================
-// This file contains system helper routines
-// =============================================================================
+//! This file contains system helper routines
 
 use core::sync::atomic::Ordering;
 use crate::globals::HEX_CHARS_UPPER;
@@ -69,6 +67,80 @@ pub fn u32_to_hex_bytes(value: u32) -> [u8; 10] {
     buffer[0] = b'0';
     buffer[1] = b'x';
     buffer
+}
+
+/// Converts a u32 to a decimal string for logging where we cannot use
+/// `format!` or any allocating machinery.
+/// 
+/// # Arguments
+///
+/// * `value`  - The u32 mutable value to convert.
+/// * `buffer` - Mutable buffer to use during conversion.
+/// 
+/// # Returns
+/// 
+/// Returns the decimal string representation of the given value.
+#[allow(dead_code)]
+pub fn u32_to_dec_str(mut value: u32, buffer: &mut [u8; 10]) -> &str {
+    if value == 0 {
+        buffer[9] = b'0';
+        return core::str::from_utf8(&buffer[9..]).unwrap();
+    }
+
+    let mut i = 10usize;
+    while value > 0 {
+        i -= 1;
+        buffer[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+
+    core::str::from_utf8(&buffer[i..]).unwrap()
+}
+
+/// Converts a u64 to a decimal string for logging where we cannot use 
+/// `format!` or any allocating machinery.
+/// 
+/// # Arguments
+///
+/// * `value`  - The u64 mutable value to convert.
+/// * `buffer` - Mutable buffer to use during conversion.
+/// 
+/// # Returns
+/// 
+/// Returns the decimal string representation of the given value.
+#[allow(dead_code)]
+pub fn u64_to_dec_str(mut value: u64, buffer: &mut [u8; 20]) -> &str {
+    if value == 0 {
+        buffer[19] = b'0';
+        return core::str::from_utf8(&buffer[19..]).unwrap();
+    }
+
+    let mut i = 20usize;
+    while value > 0 {
+        i -= 1;
+        buffer[i] = b'0' + (value % 10) as u8;
+        value /= 10;
+    }
+
+    core::str::from_utf8(&buffer[i..]).unwrap()
+}
+
+/// Formats and prints one `u64` value as a labelled hex line to the serial
+/// port, bypassing the spinlock.
+/// 
+/// # Arguments
+/// 
+/// * `label` - The label to accompany the given value.
+/// * `value` - The `u64`` value to print.
+pub fn print_u64_field(label: &str, value: u64) {
+    crate::hardware_manager::sprint(label);
+    let hex = crate::system_routines::u64_to_hex_bytes(value);
+    crate::hardware_manager::sprint(
+        unsafe { 
+            core::str::from_utf8_unchecked(&hex)
+        }
+    );
+    crate::hardware_manager::sprint("\n");
 }
 
 /// Saves the current CPU flags register (which includes the interrupt-enable

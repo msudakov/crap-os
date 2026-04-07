@@ -1,10 +1,8 @@
-// =============================================================================
-// MemoryManager - Public Interface
-// =============================================================================
-//
-// This interface encapsulates the needed physical and virtual memory management
-// structures and functionality, and exports them to the rest of the system.
-// This interface is implemented with IRQ-safe spinlock in the system globals.
+//! MemoryManager - Public Interface
+//!
+//! This interface encapsulates the needed physical and virtual memory management
+//! structures and functionality, and exports them to the rest of the system.
+//! This interface is implemented with IRQ-safe spinlock in the system globals.
 
 use crate::memory_manager::MemoryMapInfo;
 use crate::memory_manager::PhysicalMemoryManager;

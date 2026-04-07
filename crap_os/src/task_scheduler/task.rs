@@ -1,21 +1,19 @@
-// =============================================================================
-// Kernel Task Representation
-// =============================================================================
-//
-// This module defines the data types that represent a kernel task and the
-// instrumentation needed to construct a new task's initial stack frame, so
-// that the generic context switcher (`switcher.rs`) can resume it for the very
-// first time without any special handling.
-//
-// A task is an independent thread of kernel execution. Each task has:
-//   - A unique numeric ID (`TaskId`);
-//   - A lifecycle state (`TaskState`) visible to the scheduler;
-//   - A private stack, heap-allocated as a `Box<[u8]>`;
-//   - A saved stack pointer (`saved_rsp`) that the context switcher uses to
-//     restore the task's register state when it is next scheduled.
-//
-// All tasks run at ring 0, for now, with interrupts enabled once they start
-// executing.
+//! Kernel Task Representation
+//!
+//! This module defines the data types that represent a kernel task and the
+//! instrumentation needed to construct a new task's initial stack frame, so
+//! that the generic context switcher (`switcher.rs`) can resume it for the very
+//! first time without any special handling.
+//!
+//! A task is an independent thread of kernel execution. Each task has:
+//!   - A unique numeric ID (`TaskId`);
+//!   - A lifecycle state (`TaskState`) visible to the scheduler;
+//!   - A private stack, heap-allocated as a `Box<[u8]>`;
+//!   - A saved stack pointer (`saved_rsp`) that the context switcher uses to
+//!     restore the task's register state when it is next scheduled.
+//!
+//! All tasks run at ring 0, for now, with interrupts enabled once they start
+//! executing.
 
 use core::sync::atomic::{AtomicU64, Ordering};
 use alloc::boxed::Box;
@@ -186,7 +184,7 @@ struct InitialFrame {
     r13: u64,
 
     /// Popped into R12. Holds the entry function pointer
-    /// (`entry: fn(u64) -> !`). `task_entry_stub` calls this via `call r12`.
+    /// (`entry: fn(u64)`). `task_entry_stub` calls this via `call r12`.
     r12: u64,
 
     /// Popped into RBX. Zero.
@@ -211,7 +209,7 @@ struct InitialFrame {
 /// gap: it moves R13 into RDI and then calls the entry function through R12.
 ///
 /// Upon entry to this stub, R12 contains the entry function pointer
-/// (`fn(u64) -> !`), R13 has the `u64` argument, and all other caller-saved
+/// (`fn(u64)`), R13 has the `u64` argument, and all other caller-saved
 /// registers are undefined (the new task owns them).
 ///
 /// We use a naked function here (with no compiler-generated prologue or
@@ -240,21 +238,19 @@ unsafe extern "C" fn task_entry_stub() {
         // After this, calling `entry(arg)` via R12 will pass `arg` correctly.
         "mov rdi, r13",
 
-        // Call the task's entry function through R12.
-        // The entry function is declared `-> !` (diverging), so it must never
-        // return. If it does anyway (a bug), the `ud2` below will fire an
-        // Invalid Opcode exception (#UD) and halt the CPU, making the bug
-        // immediately visible rather than silently corrupting memory.
-        //
-        // This is a temporary measure until we implement task exit and cleanup
-        // functionality that's vital for thread abstraction.
-        // TODO: address this later on.
+        // Call the task's entry function through R12
         "call r12",
+
+        // Finite tasks return here and exit cleanly, while diverging
+        // tasks (essentially, fn(u64) -> !) never reach this point.
+        "call {exit}",
 
         // Defensive trap: unreachable under correct usage.
         // `ud2` raises #UD (Invalid Opcode exception, vector 6), which will
         // be caught by the IDT's #UD handler and produce a kernel panic.
         "ud2",
+
+        exit = sym task_exit,  // Call tombstone cleanup routines
     );
 }
 
@@ -369,8 +365,7 @@ impl Task {
     ///
     /// # Arguments
     /// 
-    /// * `entry` - The task's entry function. For now, it does not return.
-    ///   TODO: implement tombstone cleanup and exit later on.
+    /// * `entry` - The task's entry function.
     /// * `arg`   - An opaque `u64` passed as the sole argument to `entry`. We
     ///   can use it as a type-erased pointer, an integer, or ignore it if the
     ///   task needs no parameter.
@@ -380,7 +375,7 @@ impl Task {
     /// Panics if the kernel heap cannot satisfy the stack allocation. This may
     /// happen if `TASK_STACK_SIZE` bytes are unavailable, and the heap cannot
     /// grow.
-    pub fn new(entry: fn(u64) -> !, arg: u64) -> Self {
+    pub fn new(entry: fn(u64), arg: u64) -> Self {
         // This allocates the stack for the new task.
         // We use Vec::with_capacity + resize + into_boxed_slice rather than
         // `vec![0u8; TASK_STACK_SIZE]` because the latter may not zero-
@@ -442,4 +437,42 @@ impl Task {
             _stack:    stack,
         }
     }
+}
+
+/// Handles a task's normal return and exit.
+/// 
+/// This gets called automatically by `task_entry_stub` when a task's entry
+/// function returns normally. It marks the current task as `Dead` and
+/// immediately yields to the scheduler. The actual stack and task table
+/// cleanup (tombstone cleanup) is deferred to the `dead_task_reaper`
+/// `SystemTask`, which runs at the next timer tick. This function never
+/// returns.
+pub fn task_exit() -> ! {
+    // Mark this task as `Dead`. We do this in a block, so the scheduler lock
+    // is dropped before we call `schedule()` (which will acquire it again
+    // internally), and we must not hold it across that call.
+    {
+        let mut scheduler = super::scheduler::SCHEDULER.lock();
+        let this_id = scheduler.current;
+        if let Some(task) = scheduler.get_task_mut(this_id) {
+            task.state = TaskState::Dead;
+        }
+        // The lock is dropped here
+    }
+
+    // Enqueue the `dead_task_reaper` `SystemTask`, so tombstone cleanup runs
+    // on the next timer tick. The reaper will find this task's slot marked
+    // `Dead` and free it.
+    crate::system_core::queue_system_task(
+        crate::system_core::system_tasks::dead_task_reaper, 0);
+
+    // With the status set to `Dead`, we now hand off to the next ready task.
+    // This task will never be rescheduled, because `Dead` tasks are not
+    // re-queued. The reaper will free this task's stack at the next timer tick,
+    // by which point we are no longer running on it.
+    unsafe { super::scheduler::schedule() };
+
+    // Truly unreachable, as `schedule()` switches the stack away and never
+    // returns to a `Dead` task. If we somehow land here, fault loudly.
+    unreachable!("task_exit: schedule() returned to a dead task");
 }

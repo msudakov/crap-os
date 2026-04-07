@@ -1,77 +1,76 @@
-// =============================================================================
-// CPU Context Switcher
-// =============================================================================
-//
-// This module contains the single function `switch_to`, which is the only
-// place in the entire kernel where CPU register state is manually saved and
-// restored. Everything else in the Task Scheduler is ordinary Rust code
-// that never touches registers directly.
-//
-// A context switch involves pausing one task's execution and resuming
-// another's. From each task's perspective, it looks like an ordinary function
-// call to `switch_to` that takes an unusually long time to return, because
-// between the call and the return, the CPU executed some other task entirely.
-//
-// The mechanism that makes this transparent is saving and restoring a minimal
-// snapshot of the CPU's registers. When we switch away from task A:
-//   1. We push A's callee-saved registers onto A's own stack;
-//   2. We record A's stack pointer so we can find these registers later.
-//
-// When we later switch back to task A:
-//   1. We restore A's stack pointer;
-//   2. We pop A's callee-saved registers back from A's stack;
-//   3. We execute `ret`, which pops A's return address and jumps there,
-//      resuming A exactly where it left off, as if `switch_to` just returned.
-//
-// The function is declared `extern "C"`, so the compiler treats it exactly
-// like any other function call under the System V AMD64 ABI. Under the ABI,
-// we must save and restore callee-saved registers (RBX, RBP, R12–R15). The
-// frame layout is as follows:
-//
-//   +----------------------------------+  <- stack_top (highest address)
-//   |  (unused / guard space)          |
-//   |----------------------------------|
-//   |  rip  = task_entry_stub ptr      |  <- "return address" consumed by ret
-//   |----------------------------------|
-//   |  rbp  = 0                        |  <- pushed first, popped last  (rbp)
-//   |  rbx  = 0                        |
-//   |  r12  = entry fn ptr (new tasks) |  <- pushed 3rd, popped 4th     (r12)
-//   |  r13  = arg u64 (for new tasks)  |  <- pushed 4th, popped 3rd     (r13)
-//   |  r14  = 0                        |
-//   |  r15  = 0                        |  <- pushed last, popped first (r15)
-//   +----------------------------------+  <- saved_rsp points here
-//
-// We don't need to handle the caller-saved registers because the caller is
-// responsible for them, and the callee is free to clobber them. And, the
-// compiler already saves these before calling `switch_to`, if needed. So, we
-// don't need to worry about them.
-//
-// This is deliberately minimal (48 bytes per task context) and avoids
-// saving the FPU/SSE/AVX state (XMM/YMM registers), which works as long
-// as the kernel does not use floating-point or SIMD in task context. If FP
-// support is ever added, each task will need an additional FP state save area.
-//
-// The function handles both cases of brand-new tasks vs. previously-run tasks
-// transparently. This unified design means it needs no "first-run" task check
-// and contains no branches at all; the hot path is a straight-line sequence
-// of instructions:
-//
-//   - For a previously-run task:
-//     Its stack already contains a real context frame pushed by the last
-//     `switch_to` call that switched away from it. Popping that frame
-//     restores the task's registers exactly as they were, and `ret` jumps
-//     back into `schedule()` at the instruction after the `call switch_to`.
-//
-//   - For a brand-new task (never yet scheduled):
-//     `Task::new` (in task.rs) pre-builds a synthetic `InitialFrame` at the
-//     top of the task's stack with the following:
-//       - R12 = entry function pointer
-//       - R13 = entry argument
-//       - RBP, RBX, R14, R15 = 0 (no meaningful initial values)
-//       - A fake "return address" above the frame pointing at `task_entry_stub`
-//     When `switch_to` pops this synthetic frame and executes `ret`, it jumps
-//     to `task_entry_stub`, which moves R12/R13 into the ABI argument registers
-//     (RDI) and calls the real entry function.
+//! CPU Context Switcher
+//!
+//! This module contains the single function `switch_to`, which is the only
+//! place in the entire kernel where CPU register state is manually saved and
+//! restored. Everything else in the Task Scheduler is ordinary Rust code
+//! that never touches registers directly.
+//!
+//! A context switch involves pausing one task's execution and resuming
+//! another's. From each task's perspective, it looks like an ordinary function
+//! call to `switch_to` that takes an unusually long time to return, because
+//! between the call and the return, the CPU executed some other task entirely.
+//!
+//! The mechanism that makes this transparent is saving and restoring a minimal
+//! snapshot of the CPU's registers. When we switch away from task A:
+//!   1. We push A's callee-saved registers onto A's own stack;
+//!   2. We record A's stack pointer so we can find these registers later.
+//!
+//! When we later switch back to task A:
+//!   1. We restore A's stack pointer;
+//!   2. We pop A's callee-saved registers back from A's stack;
+//!   3. We execute `ret`, which pops A's return address and jumps there,
+//!      resuming A exactly where it left off, as if `switch_to` just returned.
+//!
+//! The function is declared `extern "C"`, so the compiler treats it exactly
+//! like any other function call under the System V AMD64 ABI. Under the ABI,
+//! we must save and restore callee-saved registers (RBX, RBP, R12–R15). The
+//! frame layout is as follows:
+//!
+//!   +----------------------------------+  <- stack_top (highest address)
+//!   |  (unused / guard space)          |
+//!   |----------------------------------|
+//!   |  rip  = task_entry_stub ptr      |  <- "return address" consumed by ret
+//!   |----------------------------------|
+//!   |  rbp  = 0                        |  <- pushed first, popped last  (rbp)
+//!   |  rbx  = 0                        |
+//!   |  r12  = entry fn ptr (new tasks) |  <- pushed 3rd, popped 4th     (r12)
+//!   |  r13  = arg u64 (for new tasks)  |  <- pushed 4th, popped 3rd     (r13)
+//!   |  r14  = 0                        |
+//!   |  r15  = 0                        |  <- pushed last, popped first (r15)
+//!   +----------------------------------+  <- saved_rsp points here
+//!
+//! We don't need to handle the caller-saved registers because the caller is
+//! responsible for them, and the callee is free to clobber them. And, the
+//! compiler already saves these before calling `switch_to`, if needed. So, we
+//! don't need to worry about them.
+//!
+//! This is deliberately minimal (48 bytes per task context) and avoids
+//! saving the FPU/SSE/AVX state (XMM/YMM registers), which works as long
+//! as the kernel does not use floating-point or SIMD in task context. If FP
+//! support is ever added, each task will need an additional FP state save area.
+//!
+//! The function handles both cases of brand-new tasks vs. previously-run tasks
+//! transparently. This unified design means it needs no "first-run" task check
+//! and contains no branches at all; the hot path is a straight-line sequence
+//! of instructions:
+//!
+//!   - For a previously-run task:
+//!     Its stack already contains a real context frame pushed by the last
+//!     `switch_to` call that switched away from it. Popping that frame
+//!     restores the task's registers exactly as they were, and `ret` jumps
+//!     back into `schedule()` at the instruction after the `call switch_to`.
+//!
+//!   - For a brand-new task (never yet scheduled):
+//!     `Task::new` (in task.rs) pre-builds a synthetic `InitialFrame` at the
+//!     top of the task's stack with the following:
+//!       - R12 = entry function pointer
+//!       - R13 = entry argument
+//!       - RBP, RBX, R14, R15 = 0 (no meaningful initial values)
+//!       - A fake "return address" above the frame pointing at
+//!         `task_entry_stub`
+//!     When `switch_to` pops this synthetic frame and executes `ret`, it jumps
+//!     to `task_entry_stub`, which moves R12/R13 into the ABI argument
+//!     registers (RDI) and calls the real entry function.
 
 
 /// Switches the execution context from an "outgoing" task to an "incoming"

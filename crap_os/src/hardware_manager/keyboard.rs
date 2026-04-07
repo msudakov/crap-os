@@ -1,39 +1,37 @@
-// =============================================================================
-// PS/2 Keyboard Scancode Set 1 Driver
-// =============================================================================
-//
-// Translates raw scancode set 1 bytes, delivered by IRQ 1 from the PS/2
-// controller, into printable ASCII characters for a standard US QWERTY layout
-// including the numpad.
-//
-// The PS/2 keyboard controller sits between the physical keyboard and the CPU.
-// When a key is pressed or released, the keyboard sends a scancode byte to the
-// controller, which buffers it and raises IRQ 1. The interrupt handler reads
-// the byte from I/O port 0x60 (the 8042 data port) and passes it to this
-// decoder.
-//
-// Scancode set 1 is the legacy set delivered by default by most PS/2 keyboards
-// (and emulated by USB keyboards in legacy mode). Its encoding is as follows:
-//   - Make code (key down): a single byte with bit 7 clear (0x01–0x58)
-//   - Break code (key up): the make code with bit 7 set (0x81–0xD8)
-//   - Extended prefix 0xE0: precedes a second byte for extended keys
-//     (right Ctrl, right Alt, arrow keys, Insert, Delete, Home, End, etc.).
-//     We do not handle extended keys yet, and both the 0xE0 prefix byte and the
-//     following byte are silently consumed and discarded for now.
-//
-// We track three modifier states using atomic booleans:
-//   - Shift (left or right): held while either shift key is physically down
-//   - Caps Lock: toggled on the make code of the caps lock key
-//   - Extended: set when 0xE0 is received, cleared after the next byte,
-//     so the two-byte extended sequence is consumed atomically.
-//
-// Caps lock only affects alphabetic keys (a–z). Symbols on number/punctuation
-// keys are unaffected by caps lock, which mirrors real keyboard behaviour.
-// When both caps lock and shift are active on an alphabetic key, they cancel
-// out (shift + caps = lowercase), which is also standard behaviour.
-//
-// Non-printable keys (F1–F12, Ctrl, Alt, arrow keys, etc.) are silently
-// ignored.
+//! PS/2 Keyboard Scancode Set 1 Driver
+//!
+//! Translates raw scancode set 1 bytes, delivered by IRQ 1 from the PS/2
+//! controller, into printable ASCII characters for a standard US QWERTY layout
+//! including the numpad.
+//!
+//! The PS/2 keyboard controller sits between the physical keyboard and the CPU.
+//! When a key is pressed or released, the keyboard sends a scancode byte to the
+//! controller, which buffers it and raises IRQ 1. The interrupt handler reads
+//! the byte from I/O port 0x60 (the 8042 data port) and passes it to this
+//! decoder.
+//!
+//! Scancode set 1 is the legacy set delivered by default by most PS/2 keyboards
+//! (and emulated by USB keyboards in legacy mode). Its encoding is as follows:
+//!   - Make code (key down): a single byte with bit 7 clear (0x01–0x58)
+//!   - Break code (key up): the make code with bit 7 set (0x81–0xD8)
+//!   - Extended prefix 0xE0: precedes a second byte for extended keys
+//!     (right Ctrl, right Alt, arrow keys, Insert, Delete, Home, End, etc.).
+//!     We do not handle extended keys yet, and both the 0xE0 prefix byte and
+//!     the following byte are silently consumed and discarded for now.
+//!
+//! We track three modifier states using atomic booleans:
+//!   - Shift (left or right): held while either shift key is physically down
+//!   - Caps Lock: toggled on the make code of the caps lock key
+//!   - Extended: set when 0xE0 is received, cleared after the next byte,
+//!     so the two-byte extended sequence is consumed atomically.
+//!
+//! Caps lock only affects alphabetic keys (a–z). Symbols on number/punctuation
+//! keys are unaffected by caps lock, which mirrors real keyboard behaviour.
+//! When both caps lock and shift are active on an alphabetic key, they cancel
+//! out (shift + caps = lowercase), which is also standard behaviour.
+//!
+//! Non-printable keys (F1–F12, Ctrl, Alt, arrow keys, etc.) are silently
+//! ignored.
 
 use core::sync::atomic::{AtomicBool, Ordering};
 use crate::spinlock::StaticIrqSpinLock;

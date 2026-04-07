@@ -1,64 +1,63 @@
-// =============================================================================
-// Interrupt Descriptor Table (IDT)
-// =============================================================================
-//
-// This module owns the full 256-entry IDT and all CPU exception handlers for
-// vectors 0–31. It also implements the needed hardware IRQ vectors (e.g., APIC)
-// in the 32–255 range, and all unused ones get a generic "unhandled IRQ" stub
-// that halts.
-//
-// Each IDT entry points to a `#[naked]` trampoline function, which does the
-//  following:
-//   1. Pushes a dummy error code (0) on vectors that don't push one
-//      automatically, so every handler receives a uniform stack layout;
-//   2. Saves all general-purpose registers (RAX..R15) onto the stack;
-//   3. Passes a pointer to the resulting `InterruptFrame` to a safe
-//      handler function via the System V AMD64 calling convention (RDI);
-//   4. On return from the handler, restores all GPRs and executes IRETQ.
-//
-// After the trampoline saves the registers, the stack is laid out as follows
-// on handler entry:
-//
-//   Higher addresses  (SS pushed first by CPU)
-//   +----------------------+
-//   |  SS         (+80)    |  -+
-//   |  RSP        (+72)    |   |
-//   |  RFLAGS     (+64)    |   |  Pushed by CPU automatically
-//   |  CS         (+56)    |   |
-//   |  RIP        (+48)    |  -+
-//   |  error_code (+40)    |  <- CPU (for #DF, #PF, #GP, etc.) or 0 (our stub)
-//   |  R15        (+32)    |  -+
-//   |  R14        (+24)    |   |
-//   |  R13        (+16)    |   |
-//   |  R12        (+ 8)    |   |  Saved by trampoline (PUSH order: R15..RAX)
-//   |  R11        (+ 0)    |   |
-//   |  R10        (-8 )    |   |
-//   |  R9         (-16)    |   |
-//   |  R8         (-24)    |   |
-//   |  RBP        (-32)    |   |
-//   |  RDI        (-40)    |   |
-//   |  RSI        (-48)    |   |
-//   |  RDX        (-56)    |   |
-//   |  RCX        (-64)    |   |
-//   |  RBX        (-72)    |   |
-//   |  RAX        (-80)    |  -+  <- RSP on handler entry, passed as &frame
-//   +----------------------+
-//   Lower addresses
-//
-// The `InterruptFrame` struct mirrors this layout in declaration order so
-// that `&frame` (where frame: *const InterruptFrame = RSP) gives safe Rust
-// access to every field.
-//
-// The double-fault handler (#DF, vector 8) is installed with IST=1, which
-// points to the dedicated `DOUBLE_FAULT_STACK` defined in gdt.rs. All other
-// handlers use IST=0 (no stack switch; they run on whatever stack was active
-// when the exception fired).
+//! Interrupt Descriptor Table (IDT)
+//!
+//! This module owns the full 256-entry IDT and all CPU exception handlers for
+//! vectors 0–31. It also implements the needed hardware IRQ vectors (e.g. APIC)
+//! in the 32–255 range, and all unused ones get a generic "unhandled IRQ" stub
+//! that halts.
+//!
+//! Each IDT entry points to a `#[naked]` trampoline function, which does the
+//!  following:
+//!   1. Pushes a dummy error code (0) on vectors that don't push one
+//!      automatically, so every handler receives a uniform stack layout;
+//!   2. Saves all general-purpose registers (RAX..R15) onto the stack;
+//!   3. Passes a pointer to the resulting `InterruptFrame` to a safe
+//!      handler function via the System V AMD64 calling convention (RDI);
+//!   4. On return from the handler, restores all GPRs and executes IRETQ.
+//!
+//! After the trampoline saves the registers, the stack is laid out as follows
+//! on handler entry:
+//!
+//!   Higher addresses  (SS pushed first by CPU)
+//!   +----------------------+
+//!   |  SS         (+80)    |  -+
+//!   |  RSP        (+72)    |   |
+//!   |  RFLAGS     (+64)    |   |  Pushed by CPU automatically
+//!   |  CS         (+56)    |   |
+//!   |  RIP        (+48)    |  -+
+//!   |  error_code (+40)    |  <- CPU (for #DF, #PF, #GP, etc.) or 0 (our stub)
+//!   |  R15        (+32)    |  -+
+//!   |  R14        (+24)    |   |
+//!   |  R13        (+16)    |   |
+//!   |  R12        (+ 8)    |   |  Saved by trampoline (PUSH order: R15..RAX)
+//!   |  R11        (+ 0)    |   |
+//!   |  R10        (-8 )    |   |
+//!   |  R9         (-16)    |   |
+//!   |  R8         (-24)    |   |
+//!   |  RBP        (-32)    |   |
+//!   |  RDI        (-40)    |   |
+//!   |  RSI        (-48)    |   |
+//!   |  RDX        (-56)    |   |
+//!   |  RCX        (-64)    |   |
+//!   |  RBX        (-72)    |   |
+//!   |  RAX        (-80)    |  -+  <- RSP on handler entry, passed as &frame
+//!   +----------------------+
+//!   Lower addresses
+//!
+//! The `InterruptFrame` struct mirrors this layout in declaration order so
+//! that `&frame` (where frame: *const InterruptFrame = RSP) gives safe Rust
+//! access to every field.
+//!
+//! The double-fault handler (#DF, vector 8) is installed with IST=1, which
+//! points to the dedicated `DOUBLE_FAULT_STACK` defined in gdt.rs. All other
+//! handlers use IST=0 (no stack switch; they run on whatever stack was active
+//! when the exception fired).
 
 use core::arch::asm;        // used in non-naked handlers (cr2 read, cpu_halt)
 use core::arch::naked_asm;  // used inside #[naked] trampolines
 use crate::gdt::KERNEL_CS;
 use crate::globals::IDT;
 use crate::hardware_manager;
+use crate::system_routines::print_u64_field;
 
 // =============================================================================
 // InterruptFrame
@@ -451,8 +450,6 @@ pub unsafe extern "C" fn stub_irq_generic() {
 // than going through the SERIAL spinlock. We do this because the spinlock may
 // already be held on the faulting CPU, and, during a #DF, the heap and globals
 // may be in an inconsistent state
-//
-// 
 
 /// Prints a minimal exception diagnostic to the serial port (bypassing the
 /// spinlock) and halts the CPU forever. This helper macro centralises the
@@ -465,20 +462,6 @@ macro_rules! exception_halt {
         print_frame($frame);
         cpu_halt();
     }};
-}
-
-/// Formats and prints one `u64` value as a labelled hex line to the serial
-/// port, bypassing the spinlock.
-/// 
-/// # Arguments
-/// 
-/// * `label` - The label to accompany the given value.
-/// * `value` - The `u64`` value to print.
-fn print_u64_field(label: &str, value: u64) {
-    hardware_manager::sprint(label);
-    let hex = crate::system_routines::u64_to_hex_bytes(value);
-    hardware_manager::sprint(unsafe { core::str::from_utf8_unchecked(&hex) });
-    hardware_manager::sprint("\n");
 }
 
 /// Dumps the key fields of an `InterruptFrame` to the serial port.
@@ -533,9 +516,68 @@ fn cpu_halt() -> ! {
     }
 }
 
+/// Triage point for recoverable CPU exceptions. Determines whether the fault
+/// originated in a normal task context or in kernel/idle context, and responds
+/// accordingly.
+///
+/// If a normal task is to blame:
+///   - The fault details are logged;
+///   - The task is marked `Dead` via `kill_current_task()`;
+///   - The `dead_task_reaper` SystemTask is enqueued for tombstone cleanup;
+///   - `schedule()` is called to immediately switch to the next ready task, and
+///   this call never returns to the faulting task.
+///
+/// If the fault occurred in kernel or idle context:
+///   - The kernel halts unconditionally, as this indicates a kernel bug.
+///
+/// This function is diverging because all execution paths either switch away
+/// via `schedule()` or halt the CPU, and neither returns to the caller.
+/// 
+/// # Arguments
+/// 
+/// * `reason` - Message string detailing why the task is being killed.
+/// * `frame`  - The `InterruptFrame` from the calling exception handler.
+fn try_kill_current_task(reason: &str, frame: &InterruptFrame) -> ! {
+    let task_id = crate::task_scheduler::get_current_task_id();
+
+    if task_id != crate::task_scheduler::TaskId::IDLE {
+        // The fault came from a normal task, so we kill it and move on, while
+        // logging enough detail to diagnose the fault post-mortem if needed.
+        print_u64_field("\n[TASK FAULT] Task ", task_id.as_u64());
+        hardware_manager::sprint(" killed due to: ");
+        hardware_manager::sprint(reason);
+        hardware_manager::sprint("\n");
+        print_frame(frame);
+
+        // Mark the task as `Dead` and enqueue the reaper. This releases the
+        // scheduler lock before returning, so `schedule()` below does not
+        // deadlock trying to acquire it.
+        crate::task_scheduler::kill_current_task();
+
+        // Switch away from the faulting task immediately. The exception stub's
+        // iretq frame is orphaned on the dead task's stack, and the reaper will
+        // free that stack on the next timer tick, long after we have switched
+        // away from it.
+        unsafe { crate::task_scheduler::schedule() };
+
+        // `schedule()` switches the stack and never returns to a Dead task. If
+        // we ever land here, fault loudly.
+        unreachable!(
+            "try_kill_current_task: schedule() returned to a dead task");
+    } else {
+        // The fault occurred in kernel or idle context; this is a kernel bug,
+        // and not a task fault. We must halt unconditionally.
+        hardware_manager::sprint("\n[KERNEL FAULT] ");
+        hardware_manager::sprint(reason);
+        hardware_manager::sprint(" in kernel context. Halting...\n");
+        print_frame(frame);
+        cpu_halt();
+    }
+}
+
 /// Vector 0: #DE Divide Error
 extern "C" fn handler_divide_error(frame: &InterruptFrame) {
-    exception_halt!("#DE Divide Error", frame);
+    try_kill_current_task("#DE Divide Error", frame);
 }
 
 /// Vector 1: #DB Debug Exception
@@ -569,22 +611,22 @@ extern "C" fn handler_breakpoint(frame: &InterruptFrame) {
 
 /// Vector 4: #OF Overflow
 extern "C" fn handler_overflow(frame: &InterruptFrame) {
-    exception_halt!("#OF Overflow", frame);
+    try_kill_current_task("#OF Overflow", frame);
 }
 
 /// Vector 5: #BR BOUND Range Exceeded
 extern "C" fn handler_bound_range(frame: &InterruptFrame) {
-    exception_halt!("#BR BOUND Range Exceeded", frame);
+    try_kill_current_task("#BR BOUND Range Exceeded", frame);
 }
 
 /// Vector 6: #UD Invalid Opcode
 extern "C" fn handler_invalid_opcode(frame: &InterruptFrame) {
-    exception_halt!("#UD Invalid Opcode", frame);
+    try_kill_current_task("#UD Invalid Opcode", frame);
 }
 
 /// Vector 7: #NM Device Not Available (no FPU/coprocessor)
 extern "C" fn handler_device_not_available(frame: &InterruptFrame) {
-    exception_halt!("#NM Device Not Available (FPU)", frame);
+    try_kill_current_task("#NM Device Not Available (FPU)", frame);
 }
 
 /// Vector 8: #DF Double Fault
@@ -629,10 +671,10 @@ extern "C" fn handler_segment_not_present(frame: &InterruptFrame) {
 /// Vector 12: #SS Stack-Segment Fault
 extern "C" fn handler_stack_fault(frame: &InterruptFrame) {
     hardware_manager::sprint("\n[EXCEPTION] #SS Stack-Segment Fault\n");
-    hardware_manager::sprint("  Selector = ");
-    print_u64_field("", frame.error_code);
-    print_frame(frame);
-    cpu_halt();
+    print_u64_field("  Selector = ", frame.error_code);
+
+    // Will print the full frame
+    try_kill_current_task("#SS Stack-Segment Fault", frame);
 }
 
 /// Vector 13: #GP General Protection Fault
@@ -642,18 +684,17 @@ extern "C" fn handler_stack_fault(frame: &InterruptFrame) {
 /// LDT; bits 15:3 = selector index.
 extern "C" fn handler_general_protection(frame: &InterruptFrame) {
     hardware_manager::sprint("\n[EXCEPTION] #GP General Protection Fault\n");
-
     let ec = frame.error_code;
+
     if ec == 0 {
         hardware_manager::sprint("  (no specific segment involved)\n");
     }
     else {
-        hardware_manager::sprint("  Error code (selector info): ");
-        print_u64_field("", ec);
+        print_u64_field("  Error code (selector info): ", ec);
     }
 
-    print_frame(frame);
-    cpu_halt();
+    // Will print the full frame
+    try_kill_current_task("#GP General Protection Fault", frame);
 }
 
 /// Vector 14: #PF Page Fault
@@ -670,10 +711,9 @@ extern "C" fn handler_page_fault(frame: &InterruptFrame) {
     // Read the faulting virtual address from CR2
     let cr2: u64;
     unsafe { asm!("mov {}, cr2", out(reg) cr2, options(nomem, nostack)) };
+    let ec = frame.error_code;
 
     hardware_manager::sprint("\n[EXCEPTION] #PF Page Fault\n");
-
-    let ec = frame.error_code;
     hardware_manager::sprint("  Faulting address: ");
     print_u64_field("", cr2);
     hardware_manager::sprint("  Error code:       ");
@@ -709,8 +749,7 @@ extern "C" fn handler_page_fault(frame: &InterruptFrame) {
         hardware_manager::sprint("  Note:   instruction fetch\n");
     }
 
-    print_frame(frame);
-    cpu_halt();
+    try_kill_current_task("#PF Page Fault", frame); // Will print the full frame
 }
 
 /// Vector 15: Reserved
@@ -720,15 +759,16 @@ extern "C" fn handler_reserved(frame: &InterruptFrame) {
 
 /// Vector 16: #MF x87 FPU Floating-Point Error
 extern "C" fn handler_x87_fpu(frame: &InterruptFrame) {
-    exception_halt!("#MF x87 FPU Floating-Point Error", frame);
+    try_kill_current_task("#MF x87 FPU Floating-Point Error", frame);
 }
 
 /// Vector 17: #AC Alignment Check
 extern "C" fn handler_alignment_check(frame: &InterruptFrame) {
     hardware_manager::sprint("\n[EXCEPTION] #AC Alignment Check\n");
     print_u64_field("  Error code: ", frame.error_code);
-    print_frame(frame);
-    cpu_halt();
+
+    // Will print the full frame
+    try_kill_current_task("#AC Alignment Check", frame);
 }
 
 /// Vector 18: #MC Machine Check
@@ -743,7 +783,7 @@ extern "C" fn handler_machine_check(_frame: &InterruptFrame) {
 
 /// Vector 19: #XM SIMD Floating-Point Exception
 extern "C" fn handler_simd_exception(frame: &InterruptFrame) {
-    exception_halt!("#XM SIMD Floating-Point Exception", frame);
+    try_kill_current_task("#XM SIMD Floating-Point Exception", frame);
 }
 
 /// Vector 20: #VE Virtualization Exception (VMX EPT violation)
@@ -791,6 +831,12 @@ extern "C" fn handler_apic_timer(_frame: &InterruptFrame) {
 
     // Send EOI before schedule(). This re-arms the APIC for the next tick.
     unsafe { crate::hardware_manager::eoi(); }
+
+    // Drain all pending `SystemTask`s before yielding to the next normal task.
+    // This is the sole drain point; system tasks run here at elevated
+    // priority, with interrupts disabled (as we are inside an IRQ handler),
+    // before any normal task gets the CPU.
+    crate::system_core::drain_system_tasks();
 
     // Hand control to the scheduler. If there is another ready task, this
     // call does not return until we are scheduled again. If no other task is

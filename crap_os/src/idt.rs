@@ -838,10 +838,15 @@ extern "C" fn handler_apic_timer(_frame: &InterruptFrame) {
     // before any normal task gets the CPU.
     crate::system_core::drain_system_tasks();
 
-    // Hand control to the scheduler. If there is another ready task, this
-    // call does not return until we are scheduled again. If no other task is
-    // ready, it returns immediately and we fall through to iretq normally.
-    unsafe { crate::task_scheduler::schedule(); }
+    // Process the system clock tick and check if the task that is currently
+    // running has exhausted its quantum and should be preempted.
+    if crate::task_scheduler::on_timer_tick() {
+        // Hand control to the scheduler. If there is another ready task, this
+        // call does not return until we are scheduled again. If no other task
+        // is ready, it returns immediately and we fall through to iretq
+        // normally.
+        unsafe { crate::task_scheduler::schedule(); }
+    }
 }
 
 /// Vector 0x21: PS/2 Keyboard (routed via I/O APIC IRQ 1)

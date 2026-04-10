@@ -35,6 +35,7 @@
 //!     outgoing task's saved flags, thus corrupting the incoming task's
 //!     interrupt state.
 
+use core::sync::atomic::{Ordering};
 use super::switcher::switch_to;
 use super::task::{Task, TaskId, TaskState};
 use crate::spinlock::StaticIrqSpinLock;
@@ -549,6 +550,68 @@ pub unsafe fn schedule() {
     //   - Returns from a prior `switch_to` call (previously-run task), or
     //   - Enters `task_entry_stub` for the first time (brand-new task).
     unsafe { switch_to(old_rsp_ptr, new_rsp) };
+}
+
+/// Called from the APIC timer ISR on every tick. It performs two jobs:
+///
+/// Job 1: Accounting
+/// Increments the current task's `ticks_executed` counter unconditionally.
+/// This happens regardless of whether preemption follows, so the counter
+/// always accurately reflects total CPU time consumed by the task.
+///
+/// Job 2: Quantum management
+/// Decrements the current task's `ticks_remaining` counter. When it reaches
+/// 1 (not 0 - see below), the quantum is reset to `TASK_QUANTUM_TICKS`,
+/// and the function returns `true` to signal that the caller should invoke
+/// `schedule()` to preempt the current task.
+///
+/// We need to use `<= 1` (and not strictly `< 1`) as the preemption threshold,
+/// because, at `remaining = 1`, this is the last tick of the quantum.
+/// Decrementing to 0 and checking on the next tick would give the task one
+/// extra tick beyond its quantum. The logic flows as follows:
+///   - After tick 1: remaining = 4, 4 <= 1? No  → decrement → remaining = 3
+///   - After tick 2: remaining = 3, 3 <= 1? No  → decrement → remaining = 2
+///   - After tick 3: remaining = 2, 2 <= 1? No  → decrement → remaining = 1
+///   - After tick 4: remaining = 1, 1 <= 1? Yes → preempt, reset to 4
+///
+/// # Returns
+/// 
+/// Returns `true` if the scheduler should preempt the current task, `false` if
+/// the current task should continue running.
+///
+/// # SMP note
+/// Currently acquires the global SCHEDULER lock to access the current task.
+/// In a future SMP implementation, `ticks_remaining` should migrate to
+/// per-CPU state, so the hot timer path never needs the global lock, and only
+/// `schedule()` itself would acquire it when actually switching tasks.
+/// `ticks_executed` correctly stays in `Task` permanently, as it is
+/// per-task, not per-CPU.
+pub fn on_timer_tick() -> bool {
+    let mut scheduler = SCHEDULER.lock();
+    let current_id = scheduler.current;
+
+    if let Some(task) = scheduler.get_task_mut(current_id) {
+        // Always account for this tick regardless of preemption outcome
+        task.ticks_executed.fetch_add(1, Ordering::Relaxed);
+
+        // Check and decrement the quantum countdown
+        if task.ticks_remaining <= 1 {
+            // Quantum expired; reset to full quantum and request preemption.
+            // The reset happens here rather than in `schedule()`, so the task
+            // gets a fresh full quantum the next time it runs, regardless of
+            // how `schedule()` selects the next task.
+            task.ticks_remaining = crate::globals::TASK_QUANTUM_TICKS;
+            return true;
+        }
+
+        // Quantum still has time remaining, so we decrement it and continue.
+        task.ticks_remaining -= 1;
+        false
+    }
+    else {
+        // No current task registered. Signal `schedule()` to find one.
+        true
+    }
 }
 
 /// Blocks the calling task and immediately yields the CPU to the next ready

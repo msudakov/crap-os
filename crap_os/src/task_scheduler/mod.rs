@@ -11,6 +11,6 @@ mod switcher;
 pub mod scheduler;
 
 // Re-export public APIs
-pub use scheduler::{init, schedule, spawn, wake, yield_blocked,
+pub use scheduler::{init, on_timer_tick, schedule, spawn, wake, yield_blocked,
     get_current_task_id, tombstone_cleanup, kill_current_task};
 pub use task::TaskId;

@@ -152,9 +152,12 @@ const LAPIC_LVT_TIMER: u32 = 0x320;
 /// Writing this register (re-)starts the countdown.
 const LAPIC_TIMER_INITIAL_COUNT: u32 = 0x380;
 
-/// Timer Current Count register (read-only).
-/// Decrements every (bus clock / DCR divisor) period.
-const _LAPIC_TIMER_CURRENT_COUNT: u32 = 0x390;
+/// APIC register offset for the timer's current (live countdown) value.
+/// 
+/// This is a read-only snapshot of how far the timer has counted down
+/// from its initial value. It is distinct from LAPIC_TIMER_INITIAL_COUNT
+/// (0x380), which is write-only and sets the starting value.
+const LAPIC_TIMER_CURRENT_COUNT: u32 = 0x390;
 
 /// Timer Divide Configuration Register (DCR).
 ///
@@ -162,6 +165,28 @@ const _LAPIC_TIMER_CURRENT_COUNT: u32 = 0x390;
 /// counter. The divisor controls the timer resolution vs. range trade-off:
 /// a larger divisor gives coarser ticks but a longer maximum interval.
 const LAPIC_TIMER_DCR: u32 = 0x3E0;
+
+/// LVT timer mode bits for one-shot operation.
+/// 
+/// In one-shot mode, the timer counts down from INITIAL_COUNT to zero once and
+/// then stops. We use this during calibration, so the counter never wraps or
+/// reloads, and we just measure how far it fell in a known wall-clock window.
+const LVT_TIMER_ONE_SHOT: u32 = 0;
+
+/// LVT mask bit (bit 16).
+/// 
+/// When set, the timer interrupt is suppressed, and the countdown still runs,
+/// but no interrupt vector is delivered. We mask during calibration, so the
+/// half-initialized one-shot timer doesn't accidentally fire into the normal
+/// timer ISR and corrupt scheduler state while we are mid-measurement.
+const LVT_TIMER_MASKED: u32 = 1 << 16;
+
+/// How many milliseconds to run the calibration measurement window.
+/// 
+/// 10ms is long enough that APIC counter granularity error is negligible (a
+/// few ticks of error over ~630,000 ticks is < 0.001%), and it is short enough
+/// to not meaningfully delay boot.
+const CALIBRATION_MS: u64 = 10;
 
 // =============================================================================
 // Local APIC register flag bits
@@ -625,6 +650,80 @@ pub unsafe fn configure_timer(initial_count: u32) {
         // Write the Initial Count register and start the timer
         lapic_write(LAPIC_TIMER_INITIAL_COUNT, initial_count);
     }
+}
+
+/// Calibrates the APIC timer against the HPET and returns the number of APIC
+/// timer ticks per millisecond.
+///
+/// The APIC timer runs from the CPU's internal bus or crystal clock, whose
+/// frequency is not standardized and varies across hardware and hypervisors.
+/// Without calibration, any hardcoded initial count value produces wildly
+/// different wall-clock intervals depending on the platform. For example, a
+/// count of 1,000,000 might be 1ms on one machine and 4ms on another.
+///
+/// The HPET counter period is reported in femtoseconds in the ACPI table and
+/// is guaranteed to be accurate by the hardware/firmware. We don't need to
+/// measure it, and we can trust it directly. This makes the HPET a good fixed
+/// reference against which to measure the APIC timer's unknown frequency.
+///
+/// # Arguments
+/// 
+/// * `hpet` - The HPET information structure.
+///
+/// # Returns
+/// 
+/// Returns APIC timer ticks per millisecond at divide-by-16.
+pub unsafe fn calibrate_timer(hpet: &crate::hardware_manager::HpetInfo) -> u32 {
+    // Match the divide configuration used by `configure_timer()`, so the
+    // returned value is directly usable without any post-calibration scaling.
+    unsafe { lapic_write(LAPIC_TIMER_DCR, TIMER_DIVIDE_BY_16) };
+
+    // Configure the APIC timer in one-shot mode, masked, divide-by-16. The
+    // counter runs down, but delivers no interrupt. This prevents a spurious
+    // vector 0x20 from firing into the scheduler ISR while we are mid-
+    // calibration with an otherwise uninitialized timer state.
+    unsafe {
+        lapic_write(
+            LAPIC_LVT_TIMER,
+            VECTOR_TIMER as u32 | LVT_TIMER_ONE_SHOT | LVT_TIMER_MASKED,
+        )
+    };
+
+    // Arm it with the maximum possible initial count (0xFFFF_FFFF), so it will
+    // not expire during the measurement window. At ~63,000 ticks/ms, this gives
+    // us roughly 68 seconds before the counter would reach zero, which is more
+    // than enough.
+    unsafe { lapic_write(LAPIC_TIMER_INITIAL_COUNT, 0xFFFF_FFFF) };
+
+    // Convert the calibration window from milliseconds to HPET ticks, which
+    // are measured in femtoseconds (1ms = 1_000_000_000_000 fs).
+    // This is exact - no floating point, no approximation.
+    let hpet_ticks_per_cal =
+        (CALIBRATION_MS * 1_000_000_000_000) / hpet.period_fs as u64;
+
+    // Spin on the HPET main counter until CALIBRATION_MS has elapsed. The
+    // `wrapping_sub` handles the theoretically possible (but practically
+    // irrelevant at 100MHz+) case of the counter wrapping mid-spin.
+    let hpet_start = unsafe { hpet.read_counter() };
+    loop {
+        let elapsed = unsafe { hpet.read_counter() }.wrapping_sub(hpet_start);
+        if elapsed >= hpet_ticks_per_cal {
+            break;
+        }
+    }
+
+    // Read the APIC timer's current countdown value. Since it started at
+    // 0xFFFFFFFF and has been counting down, the number of ticks elapsed
+    // is the difference between the initial value and the current value.
+    let apic_end = unsafe { lapic_read(LAPIC_TIMER_CURRENT_COUNT) };
+    let apic_ticks_elapsed = 0xFFFF_FFFF_u32.wrapping_sub(apic_end);
+    let apic_ticks_per_ms = apic_ticks_elapsed / CALIBRATION_MS as u32;
+
+    // Disarm the timer, and `configure_timer()` will re-arm it in periodic
+    // mode with the calibrated value once we return to main.
+    unsafe { lapic_write(LAPIC_TIMER_INITIAL_COUNT, 0) };
+
+    apic_ticks_per_ms
 }
 
 /// Signals End-Of-Interrupt (EOI) to the Local APIC by writing 0 to the EOI

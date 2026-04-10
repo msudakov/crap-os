@@ -32,6 +32,25 @@ impl TaskId {
     /// counter starts at 1.
     pub const IDLE: TaskId = TaskId(0);
 
+    /// Allocates the next unique `TaskId`.
+    ///
+    /// Each call atomically increments this counter and wraps the previous
+    /// valuein a `TaskId`. Called exactly once per `Task::new` invocation.
+    /// 
+    /// # Returns
+    /// 
+    /// Returns the next unique `TaskId`.
+    pub fn next() -> Self {
+        // This only gets initialized once per kernel lifetime
+        static COUNTER: AtomicU64 = AtomicU64::new(1);
+
+        // `Relaxed` ordering is intentional and sufficient. We only need each
+        // `fetch_add` to return a distinct value, and we do not need to
+        // synchronize any other memory operations with respect to the counter
+        // itself.
+        Self(COUNTER.fetch_add(1, Ordering::Relaxed))
+    }
+
     /// Unwraps the `u64` value. Mainly used for debug output and logging.
     /// 
     /// # Returns
@@ -42,27 +61,6 @@ impl TaskId {
     pub fn as_u64(self) -> u64 {
         self.0
     }
-}
-
-/// Global monotonically increasing counter used to mint unique `TaskId`s. It
-/// starts at 1, so that 0 is always reserved for `TaskId::IDLE`.
-static NEXT_TASK_ID: AtomicU64 = AtomicU64::new(1);
-
-/// Allocates the next unique `TaskId`.
-///
-/// Each call atomically increments `NEXT_TASK_ID` and wraps the previous value
-/// in a `TaskId`. Called exactly once per `Task::new` invocation.
-/// 
-/// # Returns
-/// 
-/// Returns the next unique `TaskId`.
-#[inline]
-fn alloc_task_id() -> TaskId {
-    // `Relaxed` ordering is intentional and sufficient. We only need each
-    // `fetch_add` to return a distinct value, and we do not need to synchronize
-    // any other memory operations with respect to the counter itself. No other
-    // thread observes the counter value for anything other than its uniqueness.
-    TaskId(NEXT_TASK_ID.fetch_add(1, Ordering::Relaxed))
 }
 
 // The `TaskState` defined below tracks the following state transitions:
@@ -448,7 +446,7 @@ impl Task {
         let saved_rsp = frame_ptr as u64;
 
         Task {
-            id:              alloc_task_id(),
+            id:              TaskId::next(),
             state:           TaskState::Ready,
             saved_rsp,
             ticks_remaining: crate::globals::TASK_QUANTUM_TICKS,

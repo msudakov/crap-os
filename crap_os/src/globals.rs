@@ -10,6 +10,7 @@ use crate::hardware_manager::{SerialWriter, FramebufferWriter};
 use crate::memory_manager::{MemoryManager, LockedHeap};
 use crate::gdt::{Gdt, GdtEntry, Tss, IstStack, DOUBLE_FAULT_IST_SIZE};
 use crate::idt::{Idt, IdtEntry};
+use crate::hardware_manager::hpet::HpetInfo;
 
 // =============================================================================
 // Basic Globals
@@ -38,6 +39,11 @@ unsafe extern "C" {
     pub static __kernel_phys_start: u8;
     pub static __kernel_phys_end: u8;
 }
+
+/// This defines task quantum (runtime duration before preemption) for use in
+/// the Task Scheduler. It is the number of system clock ticks for each task
+/// quantum.
+pub const TASK_QUANTUM_TICKS: u32 = 4;  // 4ms at 1ms tick rate
 
 
 // =============================================================================
@@ -116,3 +122,9 @@ pub static mut IDT: Idt = Idt {
 /// for reads because the counter is not used to establish a happens-before
 /// relationship with other shared data, so callers only need the numeric value.
 pub static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
+
+
+/// Global High Precision Event Timer (HPET) information structure, used in
+/// calibrating the system clock timer.
+pub static HPET: StaticIrqSpinLock<Option<HpetInfo>> =
+    StaticIrqSpinLock::new(None);

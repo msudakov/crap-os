@@ -300,6 +300,21 @@ pub struct Task {
     /// switch-away and will be overwritten by the next `switch_to`).
     pub saved_rsp: u64,
 
+    /// The number of system clock ticks remaining in the quantum of this task.
+    /// 
+    /// This starts out at max quantum ticks and gets decremented every clock
+    /// tick. When it reaches 1 (not 0, because that check happens at the end
+    /// of the task's tick period), the task is scheduled for preemption.
+    /// 
+    /// TODO: migrate this to Process Control structure when per-CPU storage is
+    /// implemented. On SMP, this should live on the running core, not the task,
+    /// to avoid needing the scheduler lock in the timer ISR hot path.
+    pub ticks_remaining: u32,
+
+    /// The total number of system clock ticks this task has consumed; used for
+    /// accounting purposes.
+    pub ticks_executed: AtomicU64,
+
     /// Heap-allocated stack storage.
     ///
     /// `Box<[u8]>` is used rather than `Box<[u8; TASK_STACK_SIZE]>` because:
@@ -346,10 +361,12 @@ impl Task {
         // initialized to `Running` because this task is the currently
         // executing context at the time `new_idle` is called.
         Task {
-            id:        TaskId::IDLE,
-            state:     TaskState::Running,
-            saved_rsp: 0,
-            _stack:    stack,
+            id:              TaskId::IDLE,
+            state:           TaskState::Running,
+            saved_rsp:       0,
+            ticks_remaining: crate::globals::TASK_QUANTUM_TICKS,
+            ticks_executed:  AtomicU64::new(0),
+            _stack:          stack,
         }
     }
 
@@ -431,10 +448,12 @@ impl Task {
         let saved_rsp = frame_ptr as u64;
 
         Task {
-            id:        alloc_task_id(),
-            state:     TaskState::Ready,
+            id:              alloc_task_id(),
+            state:           TaskState::Ready,
             saved_rsp,
-            _stack:    stack,
+            ticks_remaining: crate::globals::TASK_QUANTUM_TICKS,
+            ticks_executed:  AtomicU64::new(0),
+            _stack:          stack,
         }
     }
 }

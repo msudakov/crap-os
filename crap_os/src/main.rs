@@ -98,6 +98,10 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     let apic_info = unsafe {
         hardware_manager::parse_acpi(rsdp_virt).expect("ACPI/MADT not found")
     };
+    let hpet_info = unsafe {
+        hardware_manager::parse_hpet(rsdp_virt).expect(
+            "HPET not found or invalid. Cannot calibrate APIC timer...")
+    };
 
     // Initialize the physical memory manager. This enumerates and maps physical
     // pages to enable page tables in the next step.
@@ -125,6 +129,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     let framebuffer = framebuffer;
     let memory_map = memory_map;
     let apic_info = apic_info;
+    let hpet_info = hpet_info;
 
     // Properly initialize the memory manager from the higher-half kernel space.
     // This uses the physical manager passed as a struct and the PML4 address of
@@ -180,22 +185,35 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     unsafe { hardware_manager::disable_pic_8259() };
     sprint_debug!(DebugLevel::DEBUG, "[INFO] Disabled legacy PIC 8259");
 
-    // Initialize and configure APICs
+    // Initialize Local APIC and I/O APIC; also needed for timer calibration
     unsafe {
-        // Initialize Local APIC and I/O APIC
         hardware_manager::init_apic(apic_info.local_apic_phys,
             apic_info.io_apic_phys,
         );
         sprint_debug!(DebugLevel::DEBUG, "[DEBUG] APICs have been initialized");
-
-        // Configure the APIC timer (tune initial_count as needed for testing)
-        hardware_manager::configure_timer(1_000_000);
-        sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Timer interrupt initialized");
-
-        // Unmask the keyboard IRQ in the I/O APIC
-        hardware_manager::ioapic_unmask_irq(1);
-        sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Keyboard interrupts ready");
     }
+
+    // Initialize High Precision Event Timer (HPET) and calibrate APIC timer
+    {
+        // Initialize HPET
+        let mut hpet = globals::HPET.lock();
+        *hpet = Some(hpet_info);
+
+        // Calculate the number of APIC timer ticks per millisecond
+        let apic_ticks_per_ms = unsafe {
+            hardware_manager::calibrate_timer(hpet.as_ref().unwrap())
+        };
+        sprint_debug!(DebugLevel::INFO, "[INFO] Calibrated APIC timer");
+        sprintln!("[INFO] APIC timer: {} ticks/ms", apic_ticks_per_ms);
+
+        // Configure the APIC timer (currently 1ms tick rate)
+        unsafe { hardware_manager::configure_timer(apic_ticks_per_ms) };
+        sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Timer interrupt initialized");
+    }
+
+    // Unmask the keyboard IRQ in the I/O APIC
+    unsafe { hardware_manager::ioapic_unmask_irq(1) };
+    sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Keyboard interrupts ready");
 
     // Initialize the Task Scheduler, and register the main kernel _start
     // routine as the idle task for the scheduler.
@@ -284,7 +302,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     sprintln!("[*] Testing keyboard interrupts. Type some stuff...");
     fbprintln!("[*] Testing keyboard interrupts. Type some stuff...");
 
-    // Halt until the next interrupt to avoid spinning the CPU at 100%
+    // Enter halt loop on the idle task
     loop {
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
     } 

@@ -555,6 +555,15 @@ pub fn build_direct_map(pmm: &mut PhysicalMemoryManager, pml4: *mut u64,
             phys += PAGE_SIZE;
         }
     }
+
+    // Map HPET MMIO region through the direct physical map. It is also not in
+    // the UEFI memory map as conventional memory, so we need to map it
+    // separately. One entire page is enough for what we need out of it.
+    let hpet_mmio_addr = 0xFED00000;
+    unsafe {
+        map_page(pmm, pml4, KERNEL_PHYSICAL_MAP_BASE + hpet_mmio_addr,
+            hpet_mmio_addr, PRESENT | WRITABLE | PWT | PCD)
+    };
 }
 
 /// Maps the linear GPU framebuffer to its permanent virtual address in the

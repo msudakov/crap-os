@@ -39,6 +39,7 @@ use core::sync::atomic::{Ordering};
 use super::switcher::switch_to;
 use super::task::{Task, TaskId, TaskState};
 use crate::spinlock::StaticIrqSpinLock;
+use crate::globals::KERNEL_INIT_COMPLETE;
 
 /// Maximum number of simultaneously live tasks (both ready and blocked).
 ///
@@ -424,29 +425,26 @@ pub fn spawn(entry: fn(u64), arg: u64) -> Result<TaskId, SchedulerError> {
 /// the head of the round-robin queue.
 ///
 /// This is the core of the scheduler. It is called at the end of every timer
-/// interrupt tick. The sequence is:
-///   1. Lock the scheduler state.
-///   2. Pop the next `TaskId` from the ready queue. If the queue is empty,
-///      return immediately (keep running the current task).
-///   3. Re-enqueue the outgoing task at the tail if it is still `Running`.
-///      (If it is `Blocked` or `Dead`, do not re-enqueue.)
-///   4. Transition the incoming task to `Running` state, and update `current`.
-///   5. Extract the raw RSP pointer/value needed for `switch_to`.
-///   6. Release the lock before calling `switch_to`; this is critical.
-///   7. Call `switch_to(old_rsp_ptr, new_rsp)`.
-///
-/// From the outgoing task's perspective, step 7 is a function call that simply
-/// takes a long time to return. It returns the next time that task is selected
-/// by the scheduler and step 7 executes again with it as the incoming task.
-///
-/// # Safety
-/// 
-/// Must only be called from the timer ISR, with interrupts already disabled
-/// by the ISR entry. The `IrqSpinLock` keeps them disabled throughout the
-/// critical section. `switch_to` itself runs without any lock held.
+/// interrupt tick. From the outgoing task's perspective, it is a function call
+/// that simply takes a long time to return. It returns the next time that task
+/// is selected by the scheduler, and the task switch executes again with it as
+/// the incoming task.
 pub unsafe fn schedule() {
-    // Step 1: Critical section - read and update scheduler state
-    //--------------------------------------------------------------------------
+    // First, we must disable interrupts. This is technically unnecessary when
+    // called from the timer ISR, as the interrupts are already disabled in
+    // that context. It is a safe no-op in that case, and we save on passing a
+    // special flag argument to track the call site. However, this is critical
+    // when the call site is `task::task_exit` or `scheduler::yield_blocked`.
+    // When called from a task context, if the interrupts are left enabled and
+    // a timer interrupt fires while we're inside `switch_to`, we'll be risking
+    // a re-entrance deadlock. That may be very difficult to troubleshoot. We
+    // disable interrupts for the entire duration. This prevents a timer IRQ
+    // from firing between the lock drop and switch_to, which would cause a
+    // recursive schedule() call with stale RSP values and corrupt scheduler
+    // state.
+    let flags = crate::system_routines::disable_interrupts_save();
+
+    // Critical section: read and update scheduler state.
     // We compute everything `switch_to` needs while the lock is held, extract
     // raw values (pointer + integer), then release the lock before the switch.
     // We have to use raw values instead of references because a reference into
@@ -455,18 +453,16 @@ pub unsafe fn schedule() {
     let (old_rsp_ptr, new_rsp) = {
         let mut scheduler = SCHEDULER.lock();
 
-        // Step 2: Dequeue the next ready task
-        //----------------------------------------------------------------------
+        // Dequeue the next ready task.
         // `queue_pop` returns `None` if no tasks are in the ready queue,
         // meaning every other task is either `Blocked`, `Dead`, or there is
-        // only the idle task. In that case, we keep running the current task.
+        // only the idle task. In that case, we switch to the idle task.
         let next_id = match scheduler.queue_pop() {
             Some(id) => id,
-            None => return,  // Nothing to switch to; stay on the current task
+            None => TaskId::IDLE,  // Run the idle task if there is nothing else
         };
 
-        // Step 3: Handle the outgoing task
-        //----------------------------------------------------------------------
+        // Handle the outgoing task.
         // If the outgoing task is still `Running` (i.e., it has not blocked
         // or terminated itself during this time slice), move it to `Ready`
         // and push it to the tail of the queue, so it will run again after all
@@ -477,30 +473,37 @@ pub unsafe fn schedule() {
         if let Some(outgoing) = scheduler.get_task_mut(outgoing_id) {
             if outgoing.state == TaskState::Running {
                 outgoing.state = TaskState::Ready;
+                
+                // Only re-insert the idle task if the kernel initialization
+                // has not yet finished, as the idle task may have more steps
+                // to execute and must be re-queued to run again.
+                let queue_idle_task = !KERNEL_INIT_COMPLETE.load(
+                    Ordering::Relaxed);
+                
                 // If the push fails (queue full), we silently drop the outgoing
                 // task from the ready set rather than panic inside an ISR. The
                 // task remains in the task table with state `Ready` and can be
                 // re-enqueued the next time `wake()` or another scheduling pass
                 // processes it. This is a last-resort defence; it should not
                 // occur under normal operation if QUEUE_SIZE == MAX_TASKS.
-                let _ = scheduler.queue_push(outgoing_id);
+                if outgoing_id != TaskId::IDLE || queue_idle_task {
+                    let _ = scheduler.queue_push(outgoing_id);
+                }
             }
             // Blocked or Dead: do not re-enqueue. The task will be woken or
             // cleaned up through separate mechanisms (`wake`, `remove_task`).
         }
 
-        // Step 4: Transition the incoming task to Running
+        // Transition the incoming task to Running
         if let Some(next_task) = scheduler.get_task_mut(next_id) {
             next_task.state = TaskState::Running;
         }
         scheduler.current = next_id;
 
-        // Step 5: Extract raw RSP data for calling `switch_to`
-        //----------------------------------------------------------------------
-        // `switch_to` needs:
-        //   old_rsp_ptr - a *mut u64 pointing at outgoing_task.saved_rsp,
+        // Extract raw RSP data for calling `switch_to`, which needs:
+        //   old_rsp_ptr - a *mut u64 pointing at `outgoing_task.saved_rsp`,
         //                 so it can write the outgoing RSP there.
-        //   new_rsp     - the incoming_task.saved_rsp value to restore.
+        //   new_rsp     - the `incoming_task.saved_rsp` value to restore.
         //
         // We obtain a raw pointer to `saved_rsp` rather than a reference, so
         // we can use it after the lock guard is dropped. The pointer remains
@@ -519,13 +522,7 @@ pub unsafe fn schedule() {
 
         (old_rsp_ptr, new_rsp)
 
-        // Step 6: The lock is released here
-        //----------------------------------------------------------------------
-        // The guard's `drop` calls `restore_interrupts(saved_flags)`. Since
-        // we are inside the timer ISR, interrupts were already disabled on
-        // entry; `saved_flags` has IF=0, so they remain disabled after the
-        // guard drops. We must not re-enable interrupts before `switch_to`
-        // completes.
+        // The lock is released here.
     };
 
     // Under normal operation, these can never be null/zero. Just a sanity check
@@ -535,9 +532,9 @@ pub unsafe fn schedule() {
         return;
     }
 
-    // Step 7: Perform the context switch
-    //--------------------------------------------------------------------------
-    // No lock is held at this point. The assembly code in `switch_to` will:
+    // Perform the context switch. No lock is held at this point, but the
+    // interrupts must still be disabled across the call to `switch_to`.
+    //  The assembly code in `switch_to` will:
     //   1. Push callee-saved registers onto the outgoing task's stack;
     //   2. Write RSP into the outgoing task's `saved_rsp`;
     //   3. Load RSP from the incoming task's stack;
@@ -550,6 +547,11 @@ pub unsafe fn schedule() {
     //   - Returns from a prior `switch_to` call (previously-run task), or
     //   - Enters `task_entry_stub` for the first time (brand-new task).
     unsafe { switch_to(old_rsp_ptr, new_rsp) };
+
+    // Finally, when the outgoing task gets back here, the interrupts are
+    // restored to what they were. And if the task doesn't return here (i.e., it
+    // finishes and exits or faults and gets reaped that way), that is fine too.
+    crate::system_routines::restore_interrupts(flags);
 }
 
 /// Called from the APIC timer ISR on every tick. It performs two jobs:
@@ -743,8 +745,8 @@ pub fn tombstone_cleanup() {
         // Log how many tasks were cleaned up, so we can verify during testing.
         if crate::globals::DEBUG_LEVEL == crate::DebugLevel::INFO {
             crate::system_routines::print_u64_field(
-                "[REAPER] Tombstone cleanup: reaped ", tasks_reaped);
-            crate::hardware_manager::sprint(" dead task(s)\n");
+                "\n[REAPER] Tombstone cleanup reaped dead task(s): ",
+                tasks_reaped);
         }
     }
 }

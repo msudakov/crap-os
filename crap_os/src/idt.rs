@@ -829,9 +829,6 @@ extern "C" fn handler_apic_timer(_frame: &InterruptFrame) {
     crate::globals::TIMER_TICKS.fetch_add(
         1, core::sync::atomic::Ordering::Relaxed);
 
-    // Send EOI before schedule(). This re-arms the APIC for the next tick.
-    unsafe { crate::hardware_manager::eoi(); }
-
     // Drain all pending `SystemTask`s before yielding to the next normal task.
     // This is the sole drain point; system tasks run here at elevated
     // priority, with interrupts disabled (as we are inside an IRQ handler),
@@ -840,7 +837,12 @@ extern "C" fn handler_apic_timer(_frame: &InterruptFrame) {
 
     // Process the system clock tick and check if the task that is currently
     // running has exhausted its quantum and should be preempted.
-    if crate::task_scheduler::on_timer_tick() {
+    let should_schedule = crate::task_scheduler::on_timer_tick();
+
+    // Send EOI before schedule(). This re-arms the APIC for the next tick.
+    unsafe { crate::hardware_manager::eoi(); }
+
+    if should_schedule {
         // Hand control to the scheduler. If there is another ready task, this
         // call does not return until we are scheduled again. If no other task
         // is ready, it returns immediately and we fall through to iretq

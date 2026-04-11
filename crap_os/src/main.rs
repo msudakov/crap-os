@@ -265,30 +265,6 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     sprintln!("[+] All MM heap allocator tests passed!\n");
     fbprintln!("[+] All MM heap allocator tests passed!\n");
 
-    // Testing timer interrupts
-    sprintln!("[*] Testing IRQ timer interrupts...");
-    fbprintln!("[*] Testing IRQ timer interrupts...");
-    let mut last_tick = system_routines::get_timer_ticks();
-    let mut counter = 0;
-    loop {
-        let current = system_routines::get_timer_ticks();
-        if current != last_tick {
-            sprint!(".");
-            fbprint!(".");
-            last_tick = current;
-            counter += 1
-        }
-
-        if counter > 30 {
-            break;
-        }
-
-        // Halt until the next interrupt to avoid spinning the CPU at 100%
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
-    }
-    sprintln!("\n[+] IRQ timer interrupt test complete!\n");
-    fbprintln!("\n[+] IRQ timer interrupt test complete!\n");
-
     // Register keyboard buffer reader task
     task_scheduler::spawn(task_keyboard, 0).expect(
         "failed to spawn keyboard task");
@@ -297,10 +273,17 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     task_scheduler::spawn(task_a, 0).expect("failed to spawn task A");
     task_scheduler::spawn(task_b, 0).expect("failed to spawn task B");
     task_scheduler::spawn(task_fault, 0).expect("failed to spawn Fault Task");
+    task_scheduler::spawn(task_c, 0).expect("failed to spawn task C");
     
     // Testing keyboard interrupts
     sprintln!("[*] Testing keyboard interrupts. Type some stuff...");
     fbprintln!("[*] Testing keyboard interrupts. Type some stuff...");
+
+    // Signal the Task Scheduler that the kernel has completed its
+    // initialization sequence. After this, the idle task (this task) will only
+    // be selected to run if no other tasks are available and ready to run.
+    globals::KERNEL_INIT_COMPLETE.store(true,
+        core::sync::atomic::Ordering::SeqCst);
 
     // Enter halt loop on the idle task
     loop {
@@ -382,7 +365,8 @@ fn task_keyboard(_arg: u64) {
 fn task_a(_arg: u64) {
     loop {
         crate::hardware_manager::sprint("A");
-        for _ in 0..2_000_000 {
+        //fbprint!("A");
+        for _ in 0..1_000_000 {
             unsafe { core::arch::asm!("nop"); }
         }
     }
@@ -391,14 +375,14 @@ fn task_a(_arg: u64) {
 fn task_b(_arg: u64) {
     for _ in 0..10 {
         crate::hardware_manager::sprint("Hello, world!");
-        for _ in 0..2_000_000 {
+        for _ in 0..1_000_000 {
             unsafe { core::arch::asm!("nop"); }
         }
     }
 }
 
 fn task_fault(_arg: u64) {
-    for _ in 0..2_000_000 {
+    for _ in 0..1_000_000 {
         unsafe { core::arch::asm!("nop"); }
     }
     // Deliberately trigger a #DE divide by zero
@@ -410,5 +394,15 @@ fn task_fault(_arg: u64) {
             "div rcx",
             options(nomem, nostack)
         );
+    }
+}
+
+fn task_c(_arg: u64) {
+    loop {
+        crate::hardware_manager::sprint(".");
+        //fbprint!(".");
+        for _ in 0..1_000_000 {
+            unsafe { core::arch::asm!("nop"); }
+        }
     }
 }

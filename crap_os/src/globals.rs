@@ -3,7 +3,7 @@
 //! This file contains global system resources, some of which must be
 //! synchronized and protected from races and deadlocks.
 
-use core::sync::atomic::AtomicU64;
+use core::sync::atomic::{AtomicU64, AtomicBool};
 use crate::{DebugLevel};
 use crate::spinlock::StaticIrqSpinLock;
 use crate::hardware_manager::{SerialWriter, FramebufferWriter};
@@ -128,3 +128,11 @@ pub static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 /// calibrating the system clock timer.
 pub static HPET: StaticIrqSpinLock<Option<HpetInfo>> =
     StaticIrqSpinLock::new(None);
+
+/// Atomic boolean flag to track if the kernel's initialization sequence has
+/// finished or still ongoing. This is used when deciding whether the
+/// idle task should be re-inserted into the `Ready` task queue to be re-
+/// scheduled when the timer ISR fires and task preemption occurs. After the
+/// kernel is initialized, the idle task only ever runs if no other task is
+/// ready to be executed in the Task Scheduler's queue.
+pub static KERNEL_INIT_COMPLETE: AtomicBool = AtomicBool::new(false);

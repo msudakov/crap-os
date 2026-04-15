@@ -5,18 +5,23 @@
 //! that the generic context switcher (`switcher.rs`) can resume it for the very
 //! first time without any special handling.
 //!
-//! A task is an independent thread of kernel execution. Each task has:
+//! A task is an independent unit of kernel execution. Each task has:
 //!   - A unique numeric ID (`TaskId`);
 //!   - A lifecycle state (`TaskState`) visible to the scheduler;
 //!   - A private stack, heap-allocated as a `Box<[u8]>`;
 //!   - A saved stack pointer (`saved_rsp`) that the context switcher uses to
-//!     restore the task's register state when it is next scheduled.
+//!     restore the task's register state when it is next scheduled;
+//!   - A `Thread` object as a `Weak` back-reference that ties this execution
+//!     unit to a `Process` object in the Process Manager.
 //!
 //! All tasks run at ring 0, for now, with interrupts enabled once they start
 //! executing.
 
 use core::sync::atomic::{AtomicU64, Ordering};
+use alloc::sync::Weak;
 use alloc::boxed::Box;
+use crate::spinlock::IrqSpinLock;
+use crate::process_manager::thread::{Thread, ThreadState};
 
 /// TaskId is an opaque, unique identifier for a kernel task.
 ///
@@ -27,19 +32,18 @@ pub struct TaskId(u64);
 
 impl TaskId {
     /// The ID of the idle task, which is the pseudo-task representing the
-    /// initial kernel execution context that exists before `scheduler::init`
-    /// is called. This ID is never issued by `alloc_task_id`, where the
-    /// counter starts at 1.
+    /// initial kernel execution context.
     pub const IDLE: TaskId = TaskId(0);
 
     /// Allocates the next unique `TaskId`.
     ///
     /// Each call atomically increments this counter and wraps the previous
-    /// valuein a `TaskId`. Called exactly once per `Task::new` invocation.
+    /// value in a `TaskId`. Called exactly once per `Task::new` invocation.
     /// 
     /// # Returns
     /// 
     /// Returns the next unique `TaskId`.
+    #[inline]
     pub fn next() -> Self {
         // This only gets initialized once per kernel lifetime
         static COUNTER: AtomicU64 = AtomicU64::new(1);
@@ -69,17 +73,17 @@ impl TaskId {
 //   |         |   scheduler picks it   |         |
 //   |  Ready  | ---------------------> | Running |
 //   |         | <--------------------- |         |
-//   +---------+  preempted / yields    +----|----+
+//   +---------+   preempted / yields   +----|----+
 //        ^                                  | blocks on event
 //        |                                  v
-//        |    event arrives (wake)    +---------+
-//        ---------------------------- | Blocked |
-//                                     +----|----+
-//                                          | (and eventually...)
-//                                          v
-//                                    +----------+
-//                                    |   Dead   |
-//                                    +----------+
+//        |    event arrives (wake)     +---------+
+//        ----------------------------- | Blocked |
+//                                      +----|----+
+//                                           | (and eventually...)
+//                                           v
+//                                     +----------+
+//                                     |   Dead   |
+//                                     +----------+
 
 /// The lifecycle state of a task as tracked by the scheduler.
 #[allow(dead_code)]
@@ -100,10 +104,10 @@ pub enum TaskState {
     Blocked,
 
     /// The task has finished executing (its entry function returned, or it
-    /// explicitly terminated itself). The `Task` struct (and its stack
-    /// allocation) remains alive until the scheduler performs a "tombstone
-    /// cleanup" on the next scheduling pass, at which point the `Task` is
-    /// dropped and the stack is freed.
+    /// explicitly terminated itself) or faulted. The `Task` struct (and its
+    /// stack allocation) remains alive until the scheduler performs a
+    /// "tombstone cleanup" on the next scheduling pass, at which point the
+    /// `Task` is dropped and the stack is freed.
     Dead,
 }
 
@@ -252,10 +256,10 @@ unsafe extern "C" fn task_entry_stub() {
     );
 }
 
-/// A kernel task (kernel-mode cooperative/preemptive thread).
+/// A kernel task (kernel-mode cooperative/preemptive execution unit).
 ///
 /// Each `Task` owns its execution stack for its entire lifetime. The stack
-/// is heap-allocated so the kernel heap must be initialized before any task
+/// is heap-allocated, so the kernel heap must be initialized before any task
 /// (other than the idle task) is created.
 ///
 /// Tasks are created via `Task::new` and managed by the scheduler in
@@ -313,6 +317,14 @@ pub struct Task {
     /// accounting purposes.
     pub ticks_executed: AtomicU64,
 
+    /// Back-reference to the `Thread` object that "owns" this `Task` for
+    /// process management purposes.
+    /// 
+    /// This is a `Weak` reference to avoid an ownership cycle. It is set
+    /// atomically during `Process::spawn_thread` before the thread is
+    /// published to the process thread list.
+    pub thread: Weak<IrqSpinLock<Thread>>,
+
     /// Heap-allocated stack storage.
     ///
     /// `Box<[u8]>` is used rather than `Box<[u8; TASK_STACK_SIZE]>` because:
@@ -342,7 +354,7 @@ impl Task {
     /// context (the thread that runs the `_start` routine). Unlike `Task::new`,
     /// this does not allocate a real stack. The idle task's "stack" is the
     /// kernel's own boot stack.
-    pub(crate) fn new_idle() -> Self {
+    pub(crate) fn new_idle(thread: Weak<IrqSpinLock<Thread>>) -> Self {
         // A minimal placeholder allocation so `_stack` is never a null Box.
         // The idle task's real stack is the kernel's higher-half boot stack,
         // which the bootloader set up and which persists for the kernel's
@@ -364,12 +376,13 @@ impl Task {
             saved_rsp:       0,
             ticks_remaining: crate::globals::TASK_QUANTUM_TICKS,
             ticks_executed:  AtomicU64::new(0),
+            thread,
             _stack:          stack,
         }
     }
 
     /// Creates a new kernel task that will call `entry(arg)` when first
-    /// scheduled.
+    /// scheduled; the task is immediately associated with its parent `Thread`.
     ///
     /// Allocates a `TASK_STACK_SIZE`-byte stack from the kernel heap, writes
     /// an `InitialFrame` at the top of the stack, and sets `saved_rsp` to point
@@ -380,17 +393,22 @@ impl Task {
     ///
     /// # Arguments
     /// 
-    /// * `entry` - The task's entry function.
-    /// * `arg`   - An opaque `u64` passed as the sole argument to `entry`. We
-    ///   can use it as a type-erased pointer, an integer, or ignore it if the
-    ///   task needs no parameter.
+    /// * `entry`  - The task's entry function.
+    /// * `arg`    - An opaque `u64` passed as the sole argument to `entry`. We
+    ///              can use it as a type-erased pointer, an integer, or ignore
+    ///              it if the task needs no parameter.
+    /// * `thread` - `Weak` back-reference to the task's parent `Thread`.
     ///
     /// # Panics
     /// 
     /// Panics if the kernel heap cannot satisfy the stack allocation. This may
     /// happen if `TASK_STACK_SIZE` bytes are unavailable, and the heap cannot
     /// grow.
-    pub fn new(entry: fn(u64), arg: u64) -> Self {
+    pub fn new(
+        entry: fn(u64),
+        arg: u64,
+        thread: Weak<IrqSpinLock<Thread>>,
+    ) -> Self {
         // This allocates the stack for the new task.
         // We use Vec::with_capacity + resize + into_boxed_slice rather than
         // `vec![0u8; TASK_STACK_SIZE]` because the latter may not zero-
@@ -409,7 +427,8 @@ impl Task {
         // pops the frame and executes `ret`, RSP lands on a 16-byte aligned
         // address as required by the ABI. The `& !0xF` mask clears the low 4
         // bits, rounding down to 16 bytes.
-        let stack_top = stack.as_mut_ptr() as usize + TASK_STACK_SIZE;
+        //let stack_top = stack.as_mut_ptr() as usize + TASK_STACK_SIZE;
+        let stack_top = (stack.as_mut_ptr() as usize + TASK_STACK_SIZE) & !0xF;
         let frame_ptr = ((stack_top - core::mem::size_of::<InitialFrame>())
             & !0xF) as *mut InitialFrame;
 
@@ -451,6 +470,7 @@ impl Task {
             saved_rsp,
             ticks_remaining: crate::globals::TASK_QUANTUM_TICKS,
             ticks_executed:  AtomicU64::new(0),
+            thread,
             _stack:          stack,
         }
     }
@@ -459,11 +479,11 @@ impl Task {
 /// Handles a task's normal return and exit.
 /// 
 /// This gets called automatically by `task_entry_stub` when a task's entry
-/// function returns normally. It marks the current task as `Dead` and
-/// immediately yields to the scheduler. The actual stack and task table
-/// cleanup (tombstone cleanup) is deferred to the `dead_task_reaper`
-/// `SystemTask`, which runs at the next timer tick. This function never
-/// returns.
+/// function returns normally. It marks the current task as `Dead`, marks its
+/// parent `Thread` as `Dying`, and immediately yields to the scheduler. The
+/// actual stack and task table cleanup (tombstone cleanup) is deferred to the
+/// `dead_task_reaper` `SystemTask`, which runs at the next timer tick. This
+/// function never returns.
 pub fn task_exit() -> ! {
     // Mark this task as `Dead`. We do this in a block, so the scheduler lock
     // is dropped before we call `schedule()` (which will acquire it again
@@ -473,6 +493,10 @@ pub fn task_exit() -> ! {
         let this_id = scheduler.current;
         if let Some(task) = scheduler.get_task_mut(this_id) {
             task.state = TaskState::Dead;
+
+            // We also mark the task's parent thread as dying; the `Option`
+            // result from `upgrade()` should never be None here.
+            task.thread.upgrade().unwrap().lock().state = ThreadState::Dying;
         }
         // The lock is dropped here
     }

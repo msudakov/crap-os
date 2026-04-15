@@ -11,13 +11,19 @@ mod hardware_manager;
 mod memory_manager;
 mod system_core;
 mod task_scheduler;
+mod process_manager;
 pub mod gdt;
 pub mod idt;
 mod tests;
 
+
+
+
+
 use hardware_manager::FramebufferInfo;
 use memory_manager::MemoryManager;
 use memory_manager::GlobalHeapAllocator;
+use process_manager::nop_thread_stub;
 
 // Need to explicitly link the built-in alloc crate in a no_std environment
 extern crate alloc;
@@ -130,6 +136,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     let memory_map = memory_map;
     let apic_info = apic_info;
     let hpet_info = hpet_info;
+    let cr3: u64 = pml4 as u64;
 
     // Properly initialize the memory manager from the higher-half kernel space.
     // This uses the physical manager passed as a struct and the PML4 address of
@@ -215,9 +222,10 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     unsafe { hardware_manager::ioapic_unmask_irq(1) };
     sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Keyboard interrupts ready");
 
-    // Initialize the Task Scheduler, and register the main kernel _start
-    // routine as the idle task for the scheduler.
-    task_scheduler::init();
+    // Initialize the Task Scheduler, register the main kernel _start
+    // routine as the idle task for the scheduler, and create the system idle
+    // process and the first idle thread (this thread).
+    let _idle_process = globals::PROCESS_MANAGER.init_idle_process(cr3);
 
     // IDT is initialized, and the APIC is set up with the registered interrupt
     // handlers. It is now safe to re-enable maskable hardware interrupts.
@@ -265,25 +273,42 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     sprintln!("[+] All MM heap allocator tests passed!\n");
     fbprintln!("[+] All MM heap allocator tests passed!\n");
 
-    // Register keyboard buffer reader task
-    task_scheduler::spawn(task_keyboard, 0).expect(
-        "failed to spawn keyboard task");
+    // Create and initialize the System process
+    let system_process = globals::PROCESS_MANAGER.create_process(
+        "System",
+        cr3,
+        nop_thread_stub,
+        0
+    ).expect("[FATAL ERROR] Failed to create System process");
 
-    // Spawn test tasks
-    task_scheduler::spawn(task_a, 0).expect("failed to spawn task A");
-    task_scheduler::spawn(task_b, 0).expect("failed to spawn task B");
-    task_scheduler::spawn(task_fault, 0).expect("failed to spawn Fault Task");
-    task_scheduler::spawn(task_c, 0).expect("failed to spawn task C");
+    // Spawn keyboard buffer reader thread in the System process
+    system_process.spawn_thread("Keyboard reader", task_keyboard, 0).expect(
+        "Failed to spawn keyboard thread");
     
     // Testing keyboard interrupts
     sprintln!("[*] Testing keyboard interrupts. Type some stuff...");
     fbprintln!("[*] Testing keyboard interrupts. Type some stuff...");
+
+    // Create Test process
+    let test_process = globals::PROCESS_MANAGER.create_process(
+        "Test",
+        cr3,
+        task_a,
+        0
+    ).expect("Failed to create test process");
+    test_process.spawn_thread("Task B", task_b, 0).expect("failed to spawn task B");
+    test_process.spawn_thread("Fault task", task_fault, 0).expect("failed to spawn Fault Task");
+    test_process.spawn_thread("Task C", task_c, 0).expect("failed to spawn task C");
+
 
     // Signal the Task Scheduler that the kernel has completed its
     // initialization sequence. After this, the idle task (this task) will only
     // be selected to run if no other tasks are available and ready to run.
     globals::KERNEL_INIT_COMPLETE.store(true,
         core::sync::atomic::Ordering::SeqCst);
+    
+
+    globals::PROCESS_MANAGER.print_processes();
 
     // Enter halt loop on the idle task
     loop {

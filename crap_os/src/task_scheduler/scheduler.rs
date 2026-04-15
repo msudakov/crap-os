@@ -35,11 +35,13 @@
 //!     outgoing task's saved flags, thus corrupting the incoming task's
 //!     interrupt state.
 
-use core::sync::atomic::{Ordering};
+use core::sync::atomic::Ordering;
+use alloc::sync::Weak;
 use super::switcher::switch_to;
 use super::task::{Task, TaskId, TaskState};
-use crate::spinlock::StaticIrqSpinLock;
+use crate::spinlock::{IrqSpinLock, StaticIrqSpinLock};
 use crate::globals::KERNEL_INIT_COMPLETE;
+use crate::process_manager::thread::{Thread, ThreadState};
 
 /// Maximum number of simultaneously live tasks (both ready and blocked).
 ///
@@ -330,11 +332,14 @@ pub(super) static SCHEDULER: StaticIrqSpinLock<Scheduler> =
 ///   - Save its RSP the first time the timer ISR preempts it;
 ///   - Resume it later when needed by restoring that RSP.
 /// 
+/// # Arguments
+/// TODO:
+/// 
 /// Call this exactly once from the `_start` routine, before enabling
 /// interrupts, but after:
 ///   - The kernel heap is initialized, as task spawning needs heap allocation;
 ///   - The GDT and IDT are loaded.
-pub fn init() {
+pub fn init_idle(thread: Weak<IrqSpinLock<Thread>>) {
     let mut scheduler = SCHEDULER.lock();
 
     // Create the idle task descriptor.
@@ -350,7 +355,7 @@ pub fn init() {
     // task's RSP. When the idle task is eventually scheduled again,
     // `switch_to` will restore that RSP, and `_start` will resume as if
     // `schedule()` had simply returned.
-    let idle_task = Task::new_idle();
+    let idle_task = Task::new_idle(thread);
 
     // `current` is set to IDLE here because the idle task is currently running
     scheduler.current = TaskId::IDLE;
@@ -362,44 +367,42 @@ pub fn init() {
         .expect("[SCHEDULER] Failed to insert idle task: task table full");
 }
 
-/// Creates a new kernel task that will execute `entry(arg)` and enqueues it
+
+
+
+/*pub fn init_idle(thread: Weak<IrqSpinLock<Thread>>) -> TaskId {
+    let mut scheduler = SCHEDULER.lock();
+    let idle_task = Task::new_idle(thread);
+    scheduler.current = TaskId::IDLE;
+    let task_id = idle_task.id;
+    scheduler.insert_task(idle_task)
+        .expect("[SCHEDULER] Failed to insert idle task: task table full");
+    task_id
+}*/
+
+
+
+
+/// Inserts a new kernel task into the Scheduler's tasks table, and enqueues it
 /// on the ready queue.
-///
-/// Allocates a `TASK_STACK_SIZE` bytes of stack from the kernel heap,
-/// writes the initial context frame, and makes the task immediately eligible
-/// for scheduling. The task will not actually begin executing until the timer
-/// ISR next calls `schedule()` and selects it from the head of the queue.
 ///
 /// # Arguments
 /// 
-/// * `entry` - The task's entry function.
-/// * `arg`   - An opaque `u64` passed as the sole argument to `entry` function.
+/// * `task` - New `Task` to schedule for execution.
 ///
 /// # Returns
 /// 
-/// Returns the `TaskId` of the newly-spawned task on success, or a
-/// `SchedulerError` if either the task table or the ready queue is full.
+/// Returns `SchedulerError` if either the task table or the ready queue is
+/// full.
 ///
 /// # Panics
 /// 
 /// Panics if the kernel heap cannot satisfy the stack allocation.
-///
-/// # Locking
-/// 
-/// `Task::new` (the heap allocation) is done before acquiring the scheduler
-/// lock, minimizing the time the lock is held. The lock is only held for the
-/// brief table-insertion and queue-push operations.
-pub fn spawn(entry: fn(u64), arg: u64) -> Result<TaskId, SchedulerError> {
-    // Allocate the task and its stack outside the lock. Heap allocation may
-    // block briefly (if the heap needs to grow) or involve page-mapping
-    // operations. Doing this with the scheduler lock held would block the
-    // timer ISR and any other task trying to call `wake()` or `spawn()` for
-    // the duration, which would unnecessarily increase interrupt latency.
-    let task = Task::new(entry, arg);
+pub fn queue_task(task: Task) -> Result<(), SchedulerError> {
     let task_id = task.id;
-
+    
     {
-        let mut scheduler = SCHEDULER.lock();  // Acquire lock here
+        let mut scheduler = SCHEDULER.lock();  // Acquire scheduler lock here
 
         // Insert the task into the table first; if the table is full, we want
         // to return an error before modifying the queue.
@@ -418,7 +421,7 @@ pub fn spawn(entry: fn(u64), arg: u64) -> Result<TaskId, SchedulerError> {
         }
     }  // Lock released here
 
-    Ok(task_id)
+    Ok(())
 }
 
 /// Performs a preemptive context switch, selecting the next `Ready` task from
@@ -459,7 +462,7 @@ pub unsafe fn schedule() {
         // only the idle task. In that case, we switch to the idle task.
         let next_id = match scheduler.queue_pop() {
             Some(id) => id,
-            None => TaskId::IDLE,  // Run the idle task if there is nothing else
+            None => TaskId::IDLE,
         };
 
         // Handle the outgoing task.
@@ -619,10 +622,11 @@ pub fn on_timer_tick() -> bool {
 /// Blocks the calling task and immediately yields the CPU to the next ready
 /// task.
 ///
-/// Transitions the current task to `TaskState::Blocked`, removes it from the
-/// ready queue, then calls `schedule()` as if a timer tick had just fired.
-/// Because the task's state is `Blocked`, `schedule()` will not re-enqueue it,
-/// and the task will remain suspended until `wake(id)` is called for it.
+/// Transitions the current task to `TaskState::Blocked` (and its parent thread
+/// to `ThreadState::Waiting`), removes it from the ready queue, then calls
+/// `schedule()` as if a timer tick had just fired. Because the task's state is
+/// `Blocked`, `schedule()` will not re-enqueue it, and the task will remain
+/// suspended until `wake(id)` is called for it.
 ///
 /// The calling task resumes from this function when another task or ISR calls
 /// `wake(id)`, and the scheduler eventually selects it from the ready queue.
@@ -639,7 +643,16 @@ pub fn yield_blocked() {
             // No queue removal is needed because the task was `Running`, so it
             // was not in the ready queue to begin with. `schedule()` will not
             // re-enqueue it because its state will not be `Running`.
+
+            // We also mark the task's parent thread as waiting
+            //if let Some(thread_ptr) = task.thread.as_mut() {
+                //if let Some(thread) = thread_ptr.upgrade() {
+                if let Some(thread) = task.thread.upgrade() {
+                    thread.lock().state = ThreadState::Waiting;
+                }
+            //}
         }
+
         this_id
         // Lock is released here
     };
@@ -652,7 +665,8 @@ pub fn yield_blocked() {
     unsafe { schedule() };
 }
 
-/// Transitions a `Blocked` task back to `Ready` and enqueues it for scheduling.
+/// Transitions a `Blocked` task back to `Ready` and enqueues it for scheduling,
+/// also marking its parent `Thread` as `ThreadState::Active`.
 ///
 /// Typically called by an ISR or another task when an event the blocked task
 /// was waiting for has occurred (e.g., data arrived in a ring buffer, a timer
@@ -683,7 +697,21 @@ pub fn wake(task_id: TaskId) -> Result<(), SchedulerError> {
         .ok_or(SchedulerError::UnknownTask)?;
 
     if task.state == TaskState::Blocked {
+        // Mark the task as ready
         task.state = TaskState::Ready;
+
+        // Mark the task's parent thread as active if it was set to waiting
+        //if let Some(thread_ptr) = task.thread.as_mut() {
+            //if let Some(thread) = thread_ptr.upgrade() {
+            if let Some(thread) = task.thread.upgrade() {
+                let mut locked_thread = thread.lock();
+                if locked_thread.state == ThreadState::Waiting {
+                    locked_thread.state = ThreadState::Active;
+                }
+                
+            }
+        //}
+
         // Enqueue the now-ready task at the tail of the round-robin queue.
         scheduler.queue_push(task_id)?;
     }

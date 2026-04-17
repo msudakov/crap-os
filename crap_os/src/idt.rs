@@ -52,6 +52,7 @@
 //! handlers use IST=0 (no stack switch; they run on whatever stack was active
 //! when the exception fired).
 
+use core::sync::atomic::Ordering;
 use core::arch::asm;        // used in non-naked handlers (cr2 read, cpu_halt)
 use core::arch::naked_asm;  // used inside #[naked] trampolines
 use crate::gdt::KERNEL_CS;
@@ -826,8 +827,11 @@ extern "C" fn handler_unhandled_irq(_frame: &InterruptFrame) {
 extern "C" fn handler_apic_timer(_frame: &InterruptFrame) {
     // Increment tick count first so any task that reads TIMER_TICKS after
     // being woken this tick sees the updated value.
-    crate::globals::TIMER_TICKS.fetch_add(
-        1, core::sync::atomic::Ordering::Relaxed);
+    crate::globals::TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
+
+    // Process the system clock tick and check if the task that is currently
+    // running has exhausted its quantum and should be preempted.
+    let mut should_schedule = crate::task_scheduler::on_timer_tick();
 
     // Drain all pending `SystemTask`s before yielding to the next normal task.
     // This is the sole drain point; system tasks run here at elevated
@@ -835,9 +839,12 @@ extern "C" fn handler_apic_timer(_frame: &InterruptFrame) {
     // before any normal task gets the CPU.
     crate::system_core::drain_system_tasks();
 
-    // Process the system clock tick and check if the task that is currently
-    // running has exhausted its quantum and should be preempted.
-    let should_schedule = crate::task_scheduler::on_timer_tick();
+    // Check if a SystemTask has set the force reschedule flag, and reset it
+    if crate::globals::SYS_FLAG_FORCE_RESCHEDULE.load(Ordering::Relaxed) {
+        should_schedule = true;
+        crate::globals::SYS_FLAG_FORCE_RESCHEDULE.store(
+            false, Ordering::SeqCst);
+    }
 
     // Send EOI before schedule(). This re-arms the APIC for the next tick.
     unsafe { crate::hardware_manager::eoi(); }

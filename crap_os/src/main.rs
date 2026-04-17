@@ -16,13 +16,8 @@ pub mod gdt;
 pub mod idt;
 mod tests;
 
-
-
-
-
 use hardware_manager::FramebufferInfo;
-use memory_manager::MemoryManager;
-use memory_manager::GlobalHeapAllocator;
+use memory_manager::{MemoryManager, GlobalHeapAllocator};
 use process_manager::nop_thread_stub;
 
 // Need to explicitly link the built-in alloc crate in a no_std environment
@@ -227,9 +222,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // process and the first idle thread (this thread).
     let _idle_process = globals::PROCESS_MANAGER.init_idle_process(cr3);
 
-    // IDT is initialized, and the APIC is set up with the registered interrupt
-    // handlers. It is now safe to re-enable maskable hardware interrupts.
-    unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+    
 
     // Draw OS banner
     fbprintln!("Hello and welcome to:\n");
@@ -298,20 +291,39 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     ).expect("Failed to create test process");
     test_process.spawn_thread("Task B", task_b, 0).expect("failed to spawn task B");
     test_process.spawn_thread("Fault task", task_fault, 0).expect("failed to spawn Fault Task");
-    test_process.spawn_thread("Task C", task_c, 0).expect("failed to spawn task C");
+    let thread_c = test_process.spawn_thread("Task C", task_c, 0).expect("failed to spawn task C");
+
+    //crate::process_manager::thread::exit_thread(thread_c);
 
 
     // Signal the Task Scheduler that the kernel has completed its
     // initialization sequence. After this, the idle task (this task) will only
     // be selected to run if no other tasks are available and ready to run.
-    globals::KERNEL_INIT_COMPLETE.store(true,
+    globals::SYS_FLAG_KERNEL_INIT_COMPLETE.store(true,
         core::sync::atomic::Ordering::SeqCst);
     
+    // IDT is initialized, and the APIC is set up with the registered interrupt
+    // handlers. It is now safe to re-enable maskable hardware interrupts.
+    unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
 
+    //globals::PROCESS_MANAGER.print_processes();
+
+    //crate::process_manager::thread::exit_thread(thread_c);
+
+    //globals::PROCESS_MANAGER.print_processes();
+    
+    crate::process_manager::thread::exit_thread(thread_c);
     globals::PROCESS_MANAGER.print_processes();
 
     // Enter halt loop on the idle task
+    let mut count = 0;
     loop {
+        crate::hardware_manager::sprint("+");
+        count += 1;
+        if count == 10 {
+            count = 0;
+            //globals::PROCESS_MANAGER.print_processes();
+        }
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
     } 
 }
@@ -331,10 +343,19 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 /// Crashes the system and halts the CPU.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // Print this without acquiring the spinlock
     hardware_manager::sprint("\n!!! KERNEL PANIC !!!\n");
 
     if let Some(location) = info.location() {
+        hardware_manager::sprint("Panic occurred in file: ");
+        hardware_manager::sprint(location.file());
+        hardware_manager::sprint("\n");
+
+        if let Some(message) = info.message().as_str() {
+            hardware_manager::sprint("Panic Message: ");
+            hardware_manager::sprint(message);
+            hardware_manager::sprint("\n");
+        }
+
         sprintln!("Panic occurred in file '{}' at line {}", location.file(),
             location.line());
     }
@@ -390,7 +411,6 @@ fn task_keyboard(_arg: u64) {
 fn task_a(_arg: u64) {
     loop {
         crate::hardware_manager::sprint("A");
-        //fbprint!("A");
         for _ in 0..1_000_000 {
             unsafe { core::arch::asm!("nop"); }
         }

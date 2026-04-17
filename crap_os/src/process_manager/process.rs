@@ -75,18 +75,17 @@ impl Process {
         arg: u64,
     ) -> Result<Arc<IrqSpinLock<Thread>>, SchedulerError> {
         let thread = Thread::new(name, Arc::downgrade(self));
-
         let task = Task::new(entry, arg, Arc::downgrade(&thread));
+        let task_id = task.id;
         
-        thread.lock().task_id = Some(task.id);
-
-        self.threads.lock().push(Arc::clone(&thread));
-
         // Make the new task immediately eligible for scheduling, but the task
         // will not actually begin executing until the timer ISR next calls
         // `schedule()` and selects it from the head of the ready queue.
         queue_task(task)?;
         
+        thread.lock().task_id = Some(task_id);
+        self.threads.lock().push(Arc::clone(&thread));
+
         Ok(thread)
     }
 

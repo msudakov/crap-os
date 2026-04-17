@@ -68,8 +68,6 @@ impl Thread {
     /// For threads that need no argument, pass `0`.
     pub fn new(
         name: &'static str,
-        //entry: fn(u64),
-        //arg: u64,
         process: Weak<Process>,
     ) -> Arc<IrqSpinLock<Thread>> {
         let thread = Arc::new(IrqSpinLock::new(Thread {
@@ -93,4 +91,29 @@ impl Thread {
         }));
         thread
     }
+
+    fn exit(&mut self) {
+        if self.state == ThreadState::Dead || self.state == ThreadState::Dying {
+            return
+        }
+
+        let task_id = self.task_id.unwrap().as_u64();
+
+        crate::system_core::queue_system_task(
+            crate::system_core::system_tasks::task_killer, task_id);
+
+        // Here we always want to enqueue a reaper run even if one is already in
+        // the queue in front of us. This is because here we want the reaper
+        // to run again behind us, after the call to kill a task. So, we use
+        // the regular queue function instead of the helper
+        // `queue_dead_task_reaper_no_dupe`.
+        crate::system_core::queue_system_task(
+            crate::system_core::system_tasks::dead_task_reaper, 0);
+    }
+}
+
+pub fn exit_thread(thread: Arc<IrqSpinLock<Thread>>) {
+    let mut locked_thread = thread.lock();
+
+    locked_thread.exit();
 }

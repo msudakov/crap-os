@@ -26,4 +26,5 @@ pub use thread::Thread;
 /// 
 /// * `_arg` - Unused, present only to satisfy the `fn(u64)` signature required
 ///            by `Task::new` and the scheduler entry point convention.
+#[allow(dead_code)]
 pub(crate) fn nop_thread_stub(_arg: u64) {}

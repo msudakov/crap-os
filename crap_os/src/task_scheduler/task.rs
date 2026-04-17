@@ -28,7 +28,7 @@ use crate::process_manager::thread::{Thread, ThreadState};
 /// Wraps a `u64` for copy and comparison. The only reserved value is `0`,
 /// which is held by `TaskId::IDLE` for the bootstrap execution context.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct TaskId(u64);
+pub struct TaskId(pub u64);
 
 impl TaskId {
     /// The ID of the idle task, which is the pseudo-task representing the
@@ -354,6 +354,10 @@ impl Task {
     /// context (the thread that runs the `_start` routine). Unlike `Task::new`,
     /// this does not allocate a real stack. The idle task's "stack" is the
     /// kernel's own boot stack.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `thread` - `Weak` back-reference to the task's parent `Thread`.
     pub(crate) fn new_idle(thread: Weak<IrqSpinLock<Thread>>) -> Self {
         // A minimal placeholder allocation so `_stack` is never a null Box.
         // The idle task's real stack is the kernel's higher-half boot stack,
@@ -494,8 +498,7 @@ pub fn task_exit() -> ! {
         if let Some(task) = scheduler.get_task_mut(this_id) {
             task.state = TaskState::Dead;
 
-            // We also mark the task's parent thread as dying; the `Option`
-            // result from `upgrade()` should never be None here.
+            // We also mark the task's parent thread as dying
             task.thread.upgrade().unwrap().lock().state = ThreadState::Dying;
         }
         // The lock is dropped here
@@ -504,8 +507,7 @@ pub fn task_exit() -> ! {
     // Enqueue the `dead_task_reaper` `SystemTask`, so tombstone cleanup runs
     // on the next timer tick. The reaper will find this task's slot marked
     // `Dead` and free it.
-    crate::system_core::queue_system_task(
-        crate::system_core::system_tasks::dead_task_reaper, 0);
+    crate::system_routines::queue_dead_task_reaper_no_dupe();
 
     // With the status set to `Dead`, we now hand off to the next ready task.
     // This task will never be rescheduled, because `Dead` tasks are not

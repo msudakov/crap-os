@@ -293,7 +293,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     test_process.spawn_thread("Fault task", task_fault, 0).expect("failed to spawn Fault Task");
     let thread_c = test_process.spawn_thread("Task C", task_c, 0).expect("failed to spawn task C");
 
-    //crate::process_manager::thread::exit_thread(thread_c);
+    crate::process_manager::thread::exit_thread(thread_c);
 
 
     // Signal the Task Scheduler that the kernel has completed its
@@ -312,13 +312,13 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     //globals::PROCESS_MANAGER.print_processes();
     
-    crate::process_manager::thread::exit_thread(thread_c);
-    globals::PROCESS_MANAGER.print_processes();
+    //crate::process_manager::thread::exit_thread(thread_c);
+    //globals::PROCESS_MANAGER.print_processes();
 
     // Enter halt loop on the idle task
     let mut count = 0;
     loop {
-        crate::hardware_manager::sprint("+");
+        //crate::hardware_manager::sprint("+");
         count += 1;
         if count == 10 {
             count = 0;

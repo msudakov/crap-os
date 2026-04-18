@@ -1,12 +1,8 @@
-use alloc::sync::{Arc, Weak};
 use core::sync::atomic::{AtomicU64, Ordering};
+use alloc::sync::{Arc, Weak};
 use crate::spinlock::IrqSpinLock;
 use super::process::Process;
 use crate::task_scheduler::TaskId;
-
-// ————————————————————————————————————————————————————————————————————
-// ThreadId
-// ————————————————————————————————————————————————————————————————————
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ThreadId(u64);
@@ -31,10 +27,6 @@ impl ThreadId {
     }
 }
 
-// ————————————————————————————————————————————————————————————————————
-// ThreadState
-// ————————————————————————————————————————————————————————————————————
-
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ThreadState {
     Active,    // alive and schedulable (Ready or Running lives in Task)
@@ -42,10 +34,6 @@ pub enum ThreadState {
     Dying,     // has called thread_exit, awaiting reaper
     Dead,      // reaper has finished, safe to drop
 }
-
-// ————————————————————————————————————————————————————————————————————
-// Thread
-// ————————————————————————————————————————————————————————————————————
 
 pub struct Thread {
     
@@ -97,10 +85,11 @@ impl Thread {
             return
         }
 
-        let task_id = self.task_id.unwrap().as_u64();
+        let task_id_u64 = crate::system_routines::compress_task_id(
+            self.task_id.unwrap());
 
         crate::system_core::queue_system_task(
-            crate::system_core::system_tasks::task_killer, task_id);
+            crate::system_core::system_tasks::task_killer, task_id_u64);
 
         // Here we always want to enqueue a reaper run even if one is already in
         // the queue in front of us. This is because here we want the reaper

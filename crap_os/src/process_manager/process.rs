@@ -1,14 +1,10 @@
+use core::sync::atomic::{AtomicU64, Ordering};
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use core::sync::atomic::{AtomicU64, Ordering};
 use crate::spinlock::IrqSpinLock;
 use super::thread::{Thread, ThreadId};
-use crate::task_scheduler::{queue_task, SchedulerError};
+use crate::task_scheduler::{insert_and_queue_task, SchedulerError};
 use crate::task_scheduler::task::Task;
-
-// ————————————————————————————————————————————————————————————————————
-// ProcessId
-// ————————————————————————————————————————————————————————————————————
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct ProcessId(u64);
@@ -27,10 +23,6 @@ impl ProcessId {
         self.0
     }
 }
-
-// ————————————————————————————————————————————————————————————————————
-// Process
-// ————————————————————————————————————————————————————————————————————
 
 pub struct Process {
     pub id: ProcessId,
@@ -62,9 +54,6 @@ impl Process {
         })
     }
 
-    //pub fn add_idle_thread()
-    
-
     /// Spawn a new kernel thread in this process and return a reference to it.
     /// The returned Arc is also stored in self.threads — the process owns it,
     /// the caller gets a shared view.
@@ -76,12 +65,11 @@ impl Process {
     ) -> Result<Arc<IrqSpinLock<Thread>>, SchedulerError> {
         let thread = Thread::new(name, Arc::downgrade(self));
         let task = Task::new(entry, arg, Arc::downgrade(&thread));
-        let task_id = task.id;
-        
+
         // Make the new task immediately eligible for scheduling, but the task
         // will not actually begin executing until the timer ISR next calls
         // `schedule()` and selects it from the head of the ready queue.
-        queue_task(task)?;
+        let task_id = insert_and_queue_task(task)?;
         
         thread.lock().task_id = Some(task_id);
         self.threads.lock().push(Arc::clone(&thread));

@@ -1,7 +1,7 @@
 use alloc::sync::Arc;
 use alloc::vec::Vec;
-use crate::spinlock::IrqSpinLock;
 use super::process::Process;
+use crate::spinlock::IrqSpinLock;
 use crate::task_scheduler::{SchedulerError, TaskId};
 use crate::{sprintln, fbprintln};
 
@@ -58,8 +58,8 @@ impl ProcessManager {
                 fbprintln!("Threads: {}", threads.len());
                 for thread in threads.iter() {
                     let locked_thread = thread.lock();
-                    sprintln!("    Thread {} (ID: {}, Task: {}, State: {:?})", locked_thread.name, locked_thread.id.as_u64(), locked_thread.task_id.unwrap().as_u64(), locked_thread.state);
-                    fbprintln!("    Thread {} (ID: {}, Task: {}, State: {:?})", locked_thread.name, locked_thread.id.as_u64(), locked_thread.task_id.unwrap().as_u64(), locked_thread.state);
+                    sprintln!("    Thread {} (ID: {}, Task: {}, State: {:?})", locked_thread.name, locked_thread.id.as_u64(), locked_thread.task_id.unwrap().slot_index, locked_thread.state);
+                    fbprintln!("    Thread {} (ID: {}, Task: {}, State: {:?})", locked_thread.name, locked_thread.id.as_u64(), locked_thread.task_id.unwrap().slot_index, locked_thread.state);
                 }
             }
         }

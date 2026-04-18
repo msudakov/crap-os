@@ -17,54 +17,25 @@
 //! All tasks run at ring 0, for now, with interrupts enabled once they start
 //! executing.
 
-use core::sync::atomic::{AtomicU64, Ordering};
+use core::sync::atomic::AtomicU64;
 use alloc::sync::Weak;
 use alloc::boxed::Box;
 use crate::spinlock::IrqSpinLock;
 use crate::process_manager::thread::{Thread, ThreadState};
 
-/// TaskId is an opaque, unique identifier for a kernel task.
-///
-/// Wraps a `u64` for copy and comparison. The only reserved value is `0`,
-/// which is held by `TaskId::IDLE` for the bootstrap execution context.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub struct TaskId(pub u64);
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct TaskId {
+    pub slot_index: usize,
+    pub slot_generation: u8,
+}
 
 impl TaskId {
     /// The ID of the idle task, which is the pseudo-task representing the
     /// initial kernel execution context.
-    pub const IDLE: TaskId = TaskId(0);
-
-    /// Allocates the next unique `TaskId`.
-    ///
-    /// Each call atomically increments this counter and wraps the previous
-    /// value in a `TaskId`. Called exactly once per `Task::new` invocation.
-    /// 
-    /// # Returns
-    /// 
-    /// Returns the next unique `TaskId`.
-    #[inline]
-    pub fn next() -> Self {
-        // This only gets initialized once per kernel lifetime
-        static COUNTER: AtomicU64 = AtomicU64::new(1);
-
-        // `Relaxed` ordering is intentional and sufficient. We only need each
-        // `fetch_add` to return a distinct value, and we do not need to
-        // synchronize any other memory operations with respect to the counter
-        // itself.
-        Self(COUNTER.fetch_add(1, Ordering::Relaxed))
-    }
-
-    /// Unwraps the `u64` value. Mainly used for debug output and logging.
-    /// 
-    /// # Returns
-    /// 
-    /// Returns the underlying `u64` value.
-    #[allow(dead_code)]
-    #[inline]
-    pub fn as_u64(self) -> u64 {
-        self.0
-    }
+    pub const IDLE: TaskId = TaskId {
+        slot_index: 0,
+        slot_generation: 0
+    };
 }
 
 // The `TaskState` defined below tracks the following state transitions:
@@ -469,7 +440,7 @@ impl Task {
         let saved_rsp = frame_ptr as u64;
 
         Task {
-            id:              TaskId::next(),
+            id:              TaskId::IDLE,  // Temporary placeholder, gets replaced with proper ID immediately during insertion
             state:           TaskState::Ready,
             saved_rsp,
             ticks_remaining: crate::globals::TASK_QUANTUM_TICKS,

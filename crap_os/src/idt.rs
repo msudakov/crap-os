@@ -544,7 +544,7 @@ fn try_kill_current_task(reason: &str, frame: &InterruptFrame) -> ! {
     if task_id != crate::task_scheduler::TaskId::IDLE {
         // The fault came from a normal task, so we kill it and move on, while
         // logging enough detail to diagnose the fault post-mortem if needed.
-        print_u64_field("\n[TASK FAULT] Task ", task_id.as_u64());
+        print_u64_field("\n[TASK FAULT] Task ", task_id.slot_index as u64);
         hardware_manager::sprint(" killed due to: ");
         hardware_manager::sprint(reason);
         hardware_manager::sprint("\n");

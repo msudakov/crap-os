@@ -1,7 +1,7 @@
 //! This file contains system helper routines
 
 use core::sync::atomic::Ordering;
-use crate::globals::HEX_CHARS_UPPER;
+use crate::{globals::HEX_CHARS_UPPER, task_scheduler::TaskId};
 
 /// Converts a u64 to a fixed-width hex byte string.
 /// 
@@ -195,4 +195,77 @@ pub fn restore_interrupts(flags: usize) {
 #[allow(dead_code)]
 pub fn get_timer_ticks() -> u64 {
     crate::globals::TIMER_TICKS.load(Ordering::Relaxed)
+}
+
+/// Queues the dead task reaper SystemTask if its global system flag shows that
+/// it is not currently in the system task queue. Since that SystemTask can be
+/// enqueued from several locations, this function helps avoid double-queueing
+/// that would otherwise waste the CPU time in the middle of the timer tick
+/// processing and task scheduling.
+/// 
+/// # Returns
+/// 
+/// Returns true if the SystemTask was not in queue and has been successfully
+/// enqueued, and false if it was already enqueued judging by its system flag.
+pub fn queue_dead_task_reaper_no_dupe() -> bool {
+    let mut reaper_queued = false;
+    let flags = crate::system_routines::disable_interrupts_save();
+
+    if !crate::globals::SYS_FLAG_TASK_REAPER_QUEUED.load(Ordering::Relaxed) {
+        crate::globals::SYS_FLAG_TASK_REAPER_QUEUED.store(
+            true, core::sync::atomic::Ordering::SeqCst);
+        crate::system_core::queue_system_task(
+            crate::system_core::system_tasks::dead_task_reaper, 0);
+        reaper_queued = true;
+    }
+
+    crate::system_routines::restore_interrupts(flags);
+    reaper_queued
+}
+
+/// Encodes the `slot_index` and `slot_generation` fields of `TaskId` into a
+/// single u64 value.
+/// 
+/// This is useful when we need to pass a `TaskId` struct as a single u64
+/// function argument value into a `SystemTask`. This works by encoding the u8
+/// value of `slot_generation` into the highest 8 bits of the u64, whose lower
+/// bits contain the `slot_index` value. Because the number of `TaskSlot`
+/// elements in the task table will never be this high, there is no possibility
+/// of practical collision of the two values in the middle.
+/// 
+/// First, we cast the u8 to u64. Then, we shift left by 56 bits (64 total bits
+/// - 8 bits). And lastly, we bitwise OR with target slot index value.
+/// 
+/// # Arguments
+/// 
+/// * `task_id` - The `TaskId` struct to encode.
+/// 
+/// # Returns
+/// 
+/// Returns the single u64 value with encoded components of `TaskId` inside it.
+pub fn compress_task_id(task_id: TaskId) -> u64 {
+    (task_id.slot_index as u64) | ((task_id.slot_generation as u64) << 56)
+}
+
+/// Does the opposite of `compress_task_id` and expands it back to the proper
+/// `TaskId` struct.
+/// 
+/// # Arguments
+/// 
+/// * `encoded_task_id` - The u64 value with encoded components of a `TaskId`.
+/// 
+/// # Returns
+/// 
+/// Decoded `TaskId` structure.
+pub fn expand_task_id(encoded_task_id: u64) -> TaskId {
+    let mut slot_index = encoded_task_id as usize;
+
+    // Extract slot generation from the highest 8 bits of the value
+    let slot_generation = (slot_index >> (usize::BITS - 8)) as u8;
+
+    // Shift left 8 to discard the top, then right 8 to restore position.
+    slot_index = (slot_index << 8) >> 8;
+
+    // Restore the original task id
+    TaskId {slot_index, slot_generation}
 }

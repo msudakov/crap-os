@@ -52,6 +52,7 @@
 //! handlers use IST=0 (no stack switch; they run on whatever stack was active
 //! when the exception fired).
 
+use core::sync::atomic::Ordering;
 use core::arch::asm;        // used in non-naked handlers (cr2 read, cpu_halt)
 use core::arch::naked_asm;  // used inside #[naked] trampolines
 use crate::gdt::KERNEL_CS;
@@ -543,7 +544,7 @@ fn try_kill_current_task(reason: &str, frame: &InterruptFrame) -> ! {
     if task_id != crate::task_scheduler::TaskId::IDLE {
         // The fault came from a normal task, so we kill it and move on, while
         // logging enough detail to diagnose the fault post-mortem if needed.
-        print_u64_field("\n[TASK FAULT] Task ", task_id.as_u64());
+        print_u64_field("\n[TASK FAULT] Task ", task_id.slot_index as u64);
         hardware_manager::sprint(" killed due to: ");
         hardware_manager::sprint(reason);
         hardware_manager::sprint("\n");
@@ -826,11 +827,11 @@ extern "C" fn handler_unhandled_irq(_frame: &InterruptFrame) {
 extern "C" fn handler_apic_timer(_frame: &InterruptFrame) {
     // Increment tick count first so any task that reads TIMER_TICKS after
     // being woken this tick sees the updated value.
-    crate::globals::TIMER_TICKS.fetch_add(
-        1, core::sync::atomic::Ordering::Relaxed);
+    crate::globals::TIMER_TICKS.fetch_add(1, Ordering::Relaxed);
 
-    // Send EOI before schedule(). This re-arms the APIC for the next tick.
-    unsafe { crate::hardware_manager::eoi(); }
+    // Process the system clock tick and check if the task that is currently
+    // running has exhausted its quantum and should be preempted.
+    let mut should_schedule = crate::task_scheduler::on_timer_tick();
 
     // Drain all pending `SystemTask`s before yielding to the next normal task.
     // This is the sole drain point; system tasks run here at elevated
@@ -838,9 +839,17 @@ extern "C" fn handler_apic_timer(_frame: &InterruptFrame) {
     // before any normal task gets the CPU.
     crate::system_core::drain_system_tasks();
 
-    // Process the system clock tick and check if the task that is currently
-    // running has exhausted its quantum and should be preempted.
-    if crate::task_scheduler::on_timer_tick() {
+    // Check if a SystemTask has set the force reschedule flag, and reset it
+    if crate::globals::SYS_FLAG_FORCE_RESCHEDULE.load(Ordering::Relaxed) {
+        should_schedule = true;
+        crate::globals::SYS_FLAG_FORCE_RESCHEDULE.store(
+            false, Ordering::SeqCst);
+    }
+
+    // Send EOI before schedule(). This re-arms the APIC for the next tick.
+    unsafe { crate::hardware_manager::eoi(); }
+
+    if should_schedule {
         // Hand control to the scheduler. If there is another ready task, this
         // call does not return until we are scheduled again. If no other task
         // is ready, it returns immediately and we fall through to iretq

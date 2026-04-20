@@ -18,3 +18,7 @@
 pub fn dead_task_reaper(_arg: u64) {
     crate::task_scheduler::tombstone_cleanup();
 }
+
+pub fn task_killer(task_id: u64) {
+    crate::task_scheduler::scheduler::kill_task(task_id);
+}

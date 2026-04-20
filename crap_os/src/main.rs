@@ -11,13 +11,14 @@ mod hardware_manager;
 mod memory_manager;
 mod system_core;
 mod task_scheduler;
+mod process_manager;
 pub mod gdt;
 pub mod idt;
 mod tests;
 
 use hardware_manager::FramebufferInfo;
-use memory_manager::MemoryManager;
-use memory_manager::GlobalHeapAllocator;
+use memory_manager::{MemoryManager, GlobalHeapAllocator};
+use process_manager::nop_thread_stub;
 
 // Need to explicitly link the built-in alloc crate in a no_std environment
 extern crate alloc;
@@ -130,6 +131,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     let memory_map = memory_map;
     let apic_info = apic_info;
     let hpet_info = hpet_info;
+    let cr3: u64 = pml4 as u64;
 
     // Properly initialize the memory manager from the higher-half kernel space.
     // This uses the physical manager passed as a struct and the PML4 address of
@@ -215,13 +217,10 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     unsafe { hardware_manager::ioapic_unmask_irq(1) };
     sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Keyboard interrupts ready");
 
-    // Initialize the Task Scheduler, and register the main kernel _start
-    // routine as the idle task for the scheduler.
-    task_scheduler::init();
-
-    // IDT is initialized, and the APIC is set up with the registered interrupt
-    // handlers. It is now safe to re-enable maskable hardware interrupts.
-    unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+    // Initialize the Task Scheduler, register the main kernel _start
+    // routine as the idle task for the scheduler, and create the system idle
+    // process and the first idle thread (this thread).
+    let _idle_process = globals::PROCESS_MANAGER.init_idle_process(cr3);
 
     // Draw OS banner
     fbprintln!("Hello and welcome to:\n");
@@ -265,45 +264,58 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     sprintln!("[+] All MM heap allocator tests passed!\n");
     fbprintln!("[+] All MM heap allocator tests passed!\n");
 
-    // Testing timer interrupts
-    sprintln!("[*] Testing IRQ timer interrupts...");
-    fbprintln!("[*] Testing IRQ timer interrupts...");
-    let mut last_tick = system_routines::get_timer_ticks();
-    let mut counter = 0;
-    loop {
-        let current = system_routines::get_timer_ticks();
-        if current != last_tick {
-            sprint!(".");
-            fbprint!(".");
-            last_tick = current;
-            counter += 1
-        }
+    // Create and initialize the System process
+    let system_process = globals::PROCESS_MANAGER.create_process(
+        "System",
+        cr3,
+        nop_thread_stub,
+        0
+    ).expect("[FATAL ERROR] Failed to create System process");
 
-        if counter > 30 {
-            break;
-        }
-
-        // Halt until the next interrupt to avoid spinning the CPU at 100%
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
-    }
-    sprintln!("\n[+] IRQ timer interrupt test complete!\n");
-    fbprintln!("\n[+] IRQ timer interrupt test complete!\n");
-
-    // Register keyboard buffer reader task
-    task_scheduler::spawn(task_keyboard, 0).expect(
-        "failed to spawn keyboard task");
-
-    // Spawn test tasks
-    task_scheduler::spawn(task_a, 0).expect("failed to spawn task A");
-    task_scheduler::spawn(task_b, 0).expect("failed to spawn task B");
-    task_scheduler::spawn(task_fault, 0).expect("failed to spawn Fault Task");
+    // Spawn keyboard buffer reader thread in the System process
+    system_process.spawn_thread("Keyboard reader", task_keyboard, 0).expect(
+        "Failed to spawn keyboard thread");
     
     // Testing keyboard interrupts
     sprintln!("[*] Testing keyboard interrupts. Type some stuff...");
     fbprintln!("[*] Testing keyboard interrupts. Type some stuff...");
 
+    // Create Test process
+    let test_process = globals::PROCESS_MANAGER.create_process(
+        "Test",
+        cr3,
+        task_a,
+        0
+    ).expect("Failed to create test process");
+    test_process.spawn_thread("Task B", task_b, 0).expect("failed to spawn task B");
+    test_process.spawn_thread("Fault task", task_fault, 0).expect("failed to spawn Fault Task");
+    let thread_c = test_process.spawn_thread("Task C", task_c, 0).expect("failed to spawn task C");
+
+    crate::process_manager::thread::exit_thread(thread_c);
+
+
+    // Signal the Task Scheduler that the kernel has completed its
+    // initialization sequence. After this, the idle task (this task) will only
+    // be selected to run if no other tasks are available and ready to run.
+    globals::SYS_FLAG_KERNEL_INIT_COMPLETE.store(true,
+        core::sync::atomic::Ordering::SeqCst);
+    
+    // IDT is initialized, and the APIC is set up with the registered interrupt
+    // handlers. The System process is also initialized, and it is now safe to
+    // re-enable maskable hardware interrupts.
+    unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+
+    //globals::PROCESS_MANAGER.print_processes();
+
     // Enter halt loop on the idle task
+    let mut count = 0;
     loop {
+        //crate::hardware_manager::sprint("+");
+        count += 1;
+        if count == 10 {
+            count = 0;
+            //globals::PROCESS_MANAGER.print_processes();
+        }
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
     } 
 }
@@ -323,10 +335,19 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 /// Crashes the system and halts the CPU.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // Print this without acquiring the spinlock
     hardware_manager::sprint("\n!!! KERNEL PANIC !!!\n");
 
     if let Some(location) = info.location() {
+        hardware_manager::sprint("Panic occurred in file: ");
+        hardware_manager::sprint(location.file());
+        hardware_manager::sprint("\n");
+
+        if let Some(message) = info.message().as_str() {
+            hardware_manager::sprint("Panic Message: ");
+            hardware_manager::sprint(message);
+            hardware_manager::sprint("\n");
+        }
+
         sprintln!("Panic occurred in file '{}' at line {}", location.file(),
             location.line());
     }
@@ -382,7 +403,7 @@ fn task_keyboard(_arg: u64) {
 fn task_a(_arg: u64) {
     loop {
         crate::hardware_manager::sprint("A");
-        for _ in 0..2_000_000 {
+        for _ in 0..1_000_000 {
             unsafe { core::arch::asm!("nop"); }
         }
     }
@@ -391,14 +412,14 @@ fn task_a(_arg: u64) {
 fn task_b(_arg: u64) {
     for _ in 0..10 {
         crate::hardware_manager::sprint("Hello, world!");
-        for _ in 0..2_000_000 {
+        for _ in 0..1_000_000 {
             unsafe { core::arch::asm!("nop"); }
         }
     }
 }
 
 fn task_fault(_arg: u64) {
-    for _ in 0..2_000_000 {
+    for _ in 0..1_000_000 {
         unsafe { core::arch::asm!("nop"); }
     }
     // Deliberately trigger a #DE divide by zero
@@ -410,5 +431,15 @@ fn task_fault(_arg: u64) {
             "div rcx",
             options(nomem, nostack)
         );
+    }
+}
+
+fn task_c(_arg: u64) {
+    loop {
+        crate::hardware_manager::sprint(".");
+        //fbprint!(".");
+        for _ in 0..1_000_000 {
+            unsafe { core::arch::asm!("nop"); }
+        }
     }
 }

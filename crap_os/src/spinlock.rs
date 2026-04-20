@@ -454,11 +454,13 @@ impl<T> DerefMut for IrqSpinLockGuard<'_, T> {
 /// lock before we've actually released it.
 impl<T> Drop for IrqSpinLockGuard<'_, T> {
     fn drop(&mut self) {
-        // `self.guard` will be dropped automatically after this function
-        // returns. Rust drops fields in declaration order, so `guard` first,
-        // then `flags` is just a usize and doesn't need dropping. We call
-        // restore_interrupts here, which runs after the guard's own Drop impl
-        // has released the lock.
+        // Explicitly drop the spinlock guard before re-enabling interrupts.
+        // If we restore interrupts first, a timer IRQ can fire and attempt
+        // to acquire the same spinlock before we've fully released it, causing
+        // a deadlock on a single-core system.
+        unsafe { core::ptr::drop_in_place(&mut self.guard) };
+
+        // With the guard dropped, it is now safe to restore interrupts
         crate::system_routines::restore_interrupts(self.flags);
     }
 }

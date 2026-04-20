@@ -1,5 +1,8 @@
-//! Process Manager Module
-//! 
+//! Process Manager Module - Top-Level Authority for Process Lifetime
+//!
+//! The [`ProcessManager`] is the single owner of all live [`Process`] instances
+//! in the kernel. It is responsible for creating processes, registering them
+//! in the global process list, and providing lookup facilities.
 
 pub mod process;
 pub mod thread;

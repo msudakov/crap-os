@@ -1,4 +1,4 @@
-//! Kernel Task Representation
+//! Kernel Task Representation Module
 //!
 //! This module defines the data types that represent a kernel task and the
 //! instrumentation needed to construct a new task's initial stack frame, so
@@ -6,7 +6,7 @@
 //! first time without any special handling.
 //!
 //! A task is an independent unit of kernel execution. Each task has:
-//!   - A unique numeric ID (`TaskId`);
+//!   - An ID struct (`TaskId`), which is explained below;
 //!   - A lifecycle state (`TaskState`) visible to the scheduler;
 //!   - A private stack, heap-allocated as a `Box<[u8]>`;
 //!   - A saved stack pointer (`saved_rsp`) that the context switcher uses to
@@ -23,18 +23,65 @@ use alloc::boxed::Box;
 use crate::spinlock::IrqSpinLock;
 use crate::process_manager::thread::{Thread, ThreadState};
 
+/// Uniquely identifies a task within the scheduler's task table.
+///
+/// A `TaskId` is a combination of a slot index and a generation counter,
+/// which together allow O(1) lookup while guarding against stale references
+/// to recycled slots (ABA problem).
+///
+/// A `TaskId` is considered valid iff:
+///   `tasks[slot_index].slot_generation == slot_generation`
+///   `tasks[slot_index].task.is_some()`
+///
+/// If either condition is false, the slot has been recycled since this
+/// `TaskId` was issued, and the reference is stale. This plays a part in dis-
+/// regarding stale task IDs that are in the scheduler's Ready queue after
+/// a task has been killed.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TaskId {
+    /// Index into the scheduler's `tasks: [TaskSlot; MAX_TASKS]` array.
+    /// Provides direct O(1) access without any search or hashing. Slot 0 is
+    /// permanently reserved for the idle task and is never reused.
     pub slot_index: usize,
+
+    /// Generation counter for the slot at the time this `TaskId` was issued.
+    /// Incremented (with wrapping) each time a task is removed from this slot,
+    /// invalidating all previously issued `TaskId`s that referenced it.
+    /// Since slot 0 is never freed, its generation stays at 0 permanently.
+    /// For slots 1..MAX_TASKS, wrapping after 255 reuses is considered safe
+    /// in practice; the probability of having 255 task lifetimes go through a
+    /// single slot while some references to it are still in the Ready queue is
+    /// negligible.
     pub slot_generation: u8,
 }
 
 impl TaskId {
-    /// The ID of the idle task, which is the pseudo-task representing the
-    /// initial kernel execution context.
+    /// The `TaskId` of the idle task.
+    ///
+    /// The idle task occupies slot 0 with generation 0 permanently. It
+    /// represents the initial kernel execution context and is created once
+    /// during scheduler initialization. Its slot is never freed, so no other
+    /// task will ever be assigned `slot_index: 0`, and the generation on
+    /// slot 0 will never be incremented.
     pub const IDLE: TaskId = TaskId {
         slot_index: 0,
-        slot_generation: 0
+        slot_generation: 0,
+    };
+
+    /// A sentinel `TaskId` representing a task that has been created but not
+    /// yet inserted into the scheduler's task table.
+    ///
+    /// `Task::new` cannot know its slot index at construction time, as the slot
+    /// is assigned by `insert_and_queue_task` during insertion. Until then,
+    /// the task's `id` field holds this sentinel to make the uninitialized
+    /// state explicit and distinguishable from any real task, including idle.
+    ///
+    /// `slot_index: usize::MAX` is used as the sentinel because it is not a
+    /// valid index into `tasks[MAX_TASKS]`, so any accidental lookup will
+    /// safely return `None` rather than aliasing a real slot.
+    pub const PENDING: TaskId = TaskId {
+        slot_index: usize::MAX,
+        slot_generation: 0,
     };
 }
 
@@ -231,7 +278,7 @@ unsafe extern "C" fn task_entry_stub() {
 ///
 /// Each `Task` owns its execution stack for its entire lifetime. The stack
 /// is heap-allocated, so the kernel heap must be initialized before any task
-/// (other than the idle task) is created.
+/// is created.
 ///
 /// Tasks are created via `Task::new` and managed by the scheduler in
 /// `scheduler.rs`. The scheduler holds `Task` values behind an `IrqSpinLock`
@@ -241,8 +288,21 @@ unsafe extern "C" fn task_entry_stub() {
 /// its allocation, freeing the stack back to the kernel heap. The scheduler
 /// must ensure the task is not currently running on any CPU when it is dropped.
 pub struct Task {
-    /// Unique, immutable identifier for this task. It is assigned at creation
-    /// time and never changed.
+    /// The unique identifier for this task within the scheduler's task table.
+    ///
+    /// It gets nitialized to [`TaskId::PENDING`] by [`Task::new`] at
+    /// construction time, since the slot index is not yet known. The real
+    /// `TaskId` is assigned by `insert_and_queue_task` once the task has been
+    /// placed into a slot:
+    ///
+    /// After insertion, `id` is stable and never changes for the lifetime of
+    /// the task. On removal, the slot's generation is incremented, rendering
+    /// this `TaskId` stale and causing any subsequent lookup via
+    /// [`Scheduler::get_task`] to return `None`.
+    ///
+    /// The idle task is the only exception to the above, and its `id` is set
+    /// directly to [`TaskId::IDLE`] by [`Task::new_idle`] and inserted via
+    /// `insert_idle_task`, bypassing the normal pending-to-assigned lifecycle.
     pub id: TaskId,
 
     /// Current scheduler-visible lifecycle state. It is modified by the
@@ -384,7 +444,7 @@ impl Task {
         arg: u64,
         thread: Weak<IrqSpinLock<Thread>>,
     ) -> Self {
-        // This allocates the stack for the new task.
+        // Allocate the stack for the new task.
         // We use Vec::with_capacity + resize + into_boxed_slice rather than
         // `vec![0u8; TASK_STACK_SIZE]` because the latter may not zero-
         // initialize in all Rust versions/configurations, while resize(N, 0u8)
@@ -440,13 +500,13 @@ impl Task {
         let saved_rsp = frame_ptr as u64;
 
         Task {
-            id:              TaskId::IDLE,  // Temporary placeholder, gets replaced with proper ID immediately during insertion
-            state:           TaskState::Ready,
+            id: TaskId::PENDING, // Gets replaced with proper ID after insertion
+            state: TaskState::Ready,
             saved_rsp,
             ticks_remaining: crate::globals::TASK_QUANTUM_TICKS,
-            ticks_executed:  AtomicU64::new(0),
+            ticks_executed: AtomicU64::new(0),
             thread,
-            _stack:          stack,
+            _stack: stack,
         }
     }
 }

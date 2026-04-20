@@ -4,11 +4,28 @@
 //! scheduling, maintains a table of all live tasks and a round-robin ready
 //! queue, and performs context switches in response to timer interrupts.
 //!
-//! The task table (`tasks: [Option<Task>; MAX_TASKS]`) is a flat array of
-//! optional `Task` values; a `Some` slot holds a live task, regardless of its
-//! state, while a `None` slot is free. The ready queue is a power-of-two ring
-//! buffer (`queue: [TaskId; QUEUE_SIZE]`) of `TaskId` values representing tasks
-//! in the `Ready` state.
+//! The task table (`tasks: [TaskSlot; MAX_TASKS]`) is a flat array of
+//! [`TaskSlot`] entries. The task table has the following structure:
+//! 
+//! +----------------------------------------------------------+
+//! | Task | Task | Task | Task | Task | ... |      Task       |
+//! | Slot | Slot | Slot | Slot | Slot | ... |      Slot       |
+//! |  0   |  1   |  2   |  3   |  4   | ... | (MAX_TASKS - 1) |
+//! +------/      \--------------------------------------------+
+//!       /        \
+//!      /          \
+//!     /            \
+//!    /              \
+//!   /                \   
+//!   | Option<Task>   |
+//!   | Generation (u8)|
+//! 
+//! Each `TaskSlot` contains an optional `Task`, where a `Some` slot holds a
+//! live task, regardless of its state, while a `None` slot is free. It also
+//! tracks its generation value; generation here means "life cycle" rather than
+//! "creation". This is explained in more detail in the struct itself. The ready
+//! queue is a power-of-two ring buffer (`queue:[TaskId; QUEUE_SIZE]`) of
+//! [`TaskId`]s representing tasks in the `Ready` state.
 //!
 //! The scheduling algorithm is a first-in-first-out round robin: the task at
 //! the head of the queue gets the next time slice. After the slice, if the task
@@ -44,13 +61,8 @@ use crate::spinlock::{IrqSpinLock, StaticIrqSpinLock};
 use crate::globals::SYS_FLAG_KERNEL_INIT_COMPLETE;
 use crate::process_manager::thread::{Thread, ThreadState};
 
-/// Maximum number of simultaneously live tasks (both ready and blocked).
-///
-/// Each occupied slot in the task table costs one `Option<Task>` (~48 bytes of
-/// BSS), plus the task's 16 KB heap-allocated stack. With 256 tasks, it gives:
-///   - 256 * 48 = ~12 KB of BSS;
-///   - Up to 256 * 16 KB = 4 MB of heap, which is only actually allocated
-///     when a task is spawned, not all at initialization time.
+/// Maximum number of simultaneously live tasks (in any [`TaskState`]) in
+/// [`TaskSlot`]s.
 const MAX_TASKS: usize = 256;
 
 /// Capacity of the ready-queue ring buffer; measured in entries, where each
@@ -68,12 +80,51 @@ const QUEUE_SIZE: usize = 256;
 /// than a division.
 const QUEUE_MASK: usize = QUEUE_SIZE - 1;
 
+/// A single slot in the scheduler's task table.
+///
+/// The task table is a fixed-size array of [`TaskSlot`]s. Each slot either
+/// holds a live [`Task`] or is empty, and carries a generation counter that
+/// is incremented each time the slot is freed. This allows [`TaskId`]s to
+/// be validated against the current generation, making stale references to
+/// recycled slots safely detectable.
+///
+/// The layout of the task table (tasks: [TaskSlot; MAX_TASKS]) is as follows:
+///
+///  Index | slot_generation | task
+/// -------|-----------------|--------------------------------------
+///    0   |        0        | Some(idle_task)  <--- permanent, never freed
+///    1   |        g        | Some(Task { id: {1, g}, ... })  <--- occupied
+///    2   |        g        | None                            <--- available
+///    3   |        g        | Some(Task { id: {3, g}, ... })  <--- occupied
+///   ...  |       ...       | ...                             ...
+///   255  |        g        | None                            <--- available
+///
+/// When a task is removed from a slot, `slot_generation` is incremented with
+/// wrapping arithmetic. Any [`TaskId`] referencing this slot with the old
+/// generation will no longer match and will be treated as stale by [`get_task`]
+/// and [`get_task_mut`]. Wrapping after 255 removals from a single slot is
+/// considered safe in practice. Slot 0 is permanently occupied by the idle
+/// task, and its generation never changes. All other slots are fair game for
+/// the rest of the system.
 struct TaskSlot {
+    /// The task currently occupying this slot, or `None` if the slot is free.
     task: Option<Task>,
+
+    /// Generation counter for this slot.
+    ///
+    /// Compared against [`TaskId::slot_generation`] during every lookup to
+    /// detect stale references. Incremented with [`u8::wrapping_add`] each
+    /// time a task is removed from this slot. Initialized to 0 for all slots,
+    /// matching [`TaskId::IDLE`] for slot 0 and [`TaskId::PENDING`] sentinel
+    /// detection for all others.
     slot_generation: u8,
 }
 
 impl TaskSlot {
+    /// Creates a new empty slot with generation 0.
+    ///
+    /// This is `const fn` to allow use in the static [`Scheduler::tasks`] array
+    /// initializer.
     const fn new() -> Self {
         Self {
             task: None,
@@ -89,7 +140,7 @@ impl TaskSlot {
 ///   - Every task in `queue` has state `Ready` and exists in `tasks`.
 ///   - Exactly one task has state `Running` at any time; its ID is `current`.
 ///   - A task that is `Blocked` or `Dead` is not in `queue`.
-///   - A `Dead` task remains in `tasks` until `schedule()` performs tombstone
+///   - A `Dead` task remains in `tasks` until the scheduler performs tombstone
 ///     cleanup (drops it and frees its stack).
 ///   - `queue_len` always equals the number of IDs between `head` and `tail`
 ///     in the ring. Specifically: `queue_len == 0` when the queue is empty;
@@ -99,18 +150,14 @@ impl TaskSlot {
 /// it must never held across `switch_to`. We define it as `pub(super)` because
 /// it needs to be accessible from `task_exit` in `task.rs`.
 pub(super) struct Scheduler {
-    /// Flat array of optional tasks, where each index is a storage slot with no
-    /// semantic meaning; tasks are located by scanning for a matching `TaskId`,
-    /// not by indexing directly.
-    ///
-    /// Slot occupancy:
-    ///   `None`     - free slot, available for a new task.
-    ///   `Some(t)`  - live task `t`; may be in any `TaskState`.
+    /// Flat array of [`TaskSlot`]s, where each slot either holds a live
+    /// [`Task`] or is empty, and carries a generation counter that is
+    /// incremented each time the slot is freed.
     tasks: [TaskSlot; MAX_TASKS],
 
     /// Round-robin ready queue, implemented as a power-of-two ring buffer.
     ///
-    /// Contains the `TaskId`s of all tasks currently in `TaskState::Ready`,
+    /// Contains the [`TaskId`]s of all tasks currently in `TaskState::Ready`,
     /// ordered by how long they have been waiting (oldest task is at `head`).
     /// Tasks are dequeued/consumed from `head` and enqueued/produced at `tail`.
     queue: [TaskId; QUEUE_SIZE],
@@ -147,22 +194,13 @@ pub(super) struct Scheduler {
 #[allow(dead_code)]
 impl Scheduler {
     /// Creates the initial empty scheduler state at compile time.
-    ///
-    /// # `const fn` and non-`Copy` arrays
-    /// 
-    /// `Option<Task>` is not `Copy` (because `Task` contains a `Box`), so we
-    /// cannot write `[None; MAX_TASKS]` in a `const` context with a runtime
-    /// value. The `[const { None }; MAX_TASKS]` syntax evaluates `None` as a
-    /// constant expression per-element, which is allowed because `Option<Task>`
-    /// has a valid all-zeros `None` representation at compile time.
-    /// `[TaskId::IDLE; QUEUE_SIZE]` works because `TaskId` is `Copy`.
     const fn new() -> Self {
         Self {
             // Each slot is independently initialized to `None`.
             tasks: [const { TaskSlot::new() }; MAX_TASKS],
 
-            // Fill the queue with `IDLE` as a safe placeholder value.
-            // Entries are only meaningful between `head` and `head+queue_len`.
+            // Fill the queue with `IDLE` as a safe placeholder value. Entries
+            // are only meaningful between `head` and `head + queue_len`.
             queue: [TaskId::IDLE; QUEUE_SIZE],
             head: 0,
             tail: 0,
@@ -200,8 +238,7 @@ impl Scheduler {
     /// # Returns
     /// 
     /// Returns `None` if the queue is empty (i.e., no tasks are `Ready`).
-    /// In that case, the caller should keep the current task running rather
-    /// than attempting a context switch.
+    /// In that case, the scheduler will switch to the idle task.
     fn queue_pop(&mut self) -> Option<TaskId> {
         if self.queue_len == 0 {
             return None;
@@ -214,68 +251,70 @@ impl Scheduler {
         Some(task_id)
     }
 
-    /// Inserts a `Task` into the first available `None` slot in `tasks`.
+    /// Inserts the idle task directly into slot 0 of the task table.
+    ///
+    /// Slot 0 is permanently reserved for the idle task and is never freed
+    /// or reassigned. This bypasses the normal [`insert_and_queue_task`] path
+    /// entirely. The idle task is not queued in the Ready queue, since it is
+    /// only switched to when the queue is empty.
     /// 
     /// # Arguments
     /// 
-    /// * `task` - The `Task` to be inserted.
-    /// 
-    /// # Returns
-    ///
-    /// Returns the slot index on success, or `Err(TaskTableFull)` if every
-    /// slot is already occupied. The slot index is not meaningful outside of
-    /// this function, as tasks are later found by ID scan instead of an index.
-    /// 
-    /// This runs in time O(MAX_TASKS) to scan the table linearly for a free
-    /// slot. It's acceptable here, because spawning is not on the hot path.
-    fn insert_idle_task(&mut self, task: Task) {
-        /*for (i, slot) in self.tasks.iter_mut().enumerate() {
-            if slot.is_none() {
-                *slot = Some(task);
-                return Ok(());
-            }
-        }
-        Err(SchedulerError::TaskTableFull)*/
-        
+    /// * `idle_task` - Idle task to insert into the task table.
+    fn insert_idle_task(&mut self, idle_task: Task) {
         self.tasks[0].slot_generation = 0;
-        self.tasks[0].task = Some(task);
-
-        
-        /*for (i, slot) in self.tasks.iter_mut().enumerate() {
-            if slot.task.is_none() {
-                let task_id = TaskId{slot_index: i, slot_generation: slot.slot_generation};
-                task.id = task_id.clone();
-                task.state = TaskState::Ready;
-                slot.task = Some(task);
-                return Ok(());
-            }
-        }
-        Err(SchedulerError::TaskTableFull)*/
+        self.tasks[0].task = Some(idle_task);
     }
 
-    /// Inserts a `Task` into the first available `None` slot in `tasks`.
-    /// 
+    /// Finds a free slot, assigns a [`TaskId`], marks the task `Ready`,
+    /// inserts it into the task table, and enqueues it for scheduling.
+    ///
+    /// This is the single entry point for making a new task known to the
+    /// scheduler and immediately eligible for scheduling. The slot index and
+    /// current slot generation together form the task's [`TaskId`], which is
+    /// written into [`Task::id`] before insertion.
+    ///
     /// # Arguments
     /// 
-    /// * `task` - The `Task` to be inserted.
-    /// 
+    /// * `task` - The [`Task`] to be inserted and added to the Ready queue.
+    ///
     /// # Returns
     ///
-    /// Returns the slot index on success, or `Err(TaskTableFull)` if every
-    /// slot is already occupied. The slot index is not meaningful outside of
-    /// this function, as tasks are later found by ID scan instead of an index.
-    /// 
-    /// This runs in time O(MAX_TASKS) to scan the table linearly for a free
-    /// slot. It's acceptable here, because spawning is not on the hot path.
-    /// TODO: Check comments ^^^
-    fn insert_and_queue_task(&mut self, mut task: Task) -> Result<TaskId, SchedulerError> {
+    /// Returns the [`TaskId`] assigned to the task on success (so the caller
+    /// can store it in [`Thread::task_id`]), [`SchedulerError::TaskTableFull`]
+    /// if all 255 non-idle slots are occupied, or [`SchedulerError::QueueFull`]
+    /// if the run queue has no space. The latter error should never happen.
+    fn insert_and_queue_task(
+        &mut self,
+        mut task: Task,
+    ) -> Result<TaskId, SchedulerError> {
+        // We loop over every slot, looking for the first empty one
         for (i, slot) in self.tasks.iter_mut().enumerate() {
+            // Once a free slot is located, we proceed to use it
             if slot.task.is_none() {
-                let task_id = TaskId{slot_index: i, slot_generation: slot.slot_generation};
+                // The new `TaskId` gets comprised of the slot index and the
+                // current generation value of the slot.
+                let task_id = TaskId {
+                    slot_index: i,
+                    slot_generation: slot.slot_generation
+                };
+
+                // Clone the new ID value and assign it to the mutable Task
                 task.id = task_id.clone();
+
+                // Mark the new task as `Ready`
                 task.state = TaskState::Ready;
+
+                // Populate this slot with the new task
                 slot.task = Some(task);
-                self.queue_push(task_id)?;
+
+                // Push the new task to the Ready queue. This should never fail
+                // because the length of the queue is the same as the size of
+                // the task table, so there can never be more tasks in the queue
+                // than there are in the table. If this fails for any reason,
+                // we want to fault loudly.
+                self.queue_push(task_id).expect(
+                    "[SCHEDULER] Task inserted, but failed to enqueue...");
 
                 return Ok(task_id);
             }
@@ -285,7 +324,9 @@ impl Scheduler {
 
     /// Obtains a shared reference to a `Task` by its ID.
     /// 
-    /// The linear scan runs in time O(MAX_TASKS).
+    /// Because of how [`TaskSlot`]s are implemented with slot index and slot
+    /// generation, this fetch operation is very efficient and executes in
+    /// constant time (O(1)).
     /// 
     /// # Arguments
     /// 
@@ -305,9 +346,10 @@ impl Scheduler {
 
     /// Obtains a mutable reference to a `Task` by its ID.
     /// 
-    /// The linear scan runs in time O(MAX_TASKS). We declare it as `pub(super)`
-    /// because this function needs to be accessible from `task_exit` in
-    /// `task.rs`.
+    /// Because of how [`TaskSlot`]s are implemented with slot index and slot
+    /// generation, this fetch operation is very efficient and executes in
+    /// constant time (O(1)). We declare it as `pub(super)` because this
+    /// function needs to be accessible from `task_exit` in `task.rs`.
     /// 
     /// # Arguments
     /// 
@@ -326,8 +368,7 @@ impl Scheduler {
     }
 
     /// Removes a `Task` by its ID from the table, dropping it and freeing its
-    /// heap-allocated stack. The linear scan runs in time O(MAX_TASKS). It is
-    /// a no-op if no task with the ID exists.
+    /// heap-allocated stack. The linear scan runs in time O(MAX_TASKS). 
     /// 
     /// # Arguments
     /// 
@@ -338,24 +379,59 @@ impl Scheduler {
     /// The caller is responsible for ensuring the task is not currently running
     /// on any CPU before calling this; dropping a task whose stack is in use
     /// would result in a use-after-free bug and vulnerability.
+    
+
+    /// Removes a task from its slot (dropping it and freeing its heap-allocated
+    /// stack), updates its backing thread, and increments the slot's generation
+    /// counter.
+    /// 
+    /// Because of how [`TaskSlot`]s are implemented with slot index and slot
+    /// generation, this fetch operation is very efficient and executes in
+    /// constant time (O(1)). It is a no-op if no task with the ID exists.
+    /// Called by [`tombstone_cleanup`] during reaper execution to free slots
+    /// occupied by [`TaskState::Dead`] tasks.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `task_id` - ID of the [`Task`] to remove from the task table.
+    /// 
+    /// # Caution
+    /// 
+    /// The caller is responsible for ensuring the task is not currently running
+    /// on any CPU before calling this; dropping a task whose stack is in use
+    /// would result in a use-after-free bug and vulnerability.
+    /// 
+    /// # Panics
+    ///
+    /// Panics if the task's [`Weak`] thread reference cannot be upgraded.
+    /// A task being reaped must still have a live thread, as a dangling `Weak`
+    /// at this point indicates a lifecycle ordering violation.
     fn remove_task(&mut self, task_id: TaskId) {
         // Double check that the task is still current and is not stale
         if let Some(task) = self.get_task_mut(task_id) {
+            // Upgrade the thread reference or panic if the `Weak` is dangling
             let thread = task.thread.upgrade().unwrap();
             {
+                // Acquire thread lock
                 let mut locked_thread = thread.lock();
-                // Unset the `task_id` link field on the parent thread
+
+                // Unset the `task_id` link field on the parent thread,
+                // signaling that the task has been fully unregistered from the
+                // scheduler.
                 locked_thread.task_id = None;
+
                 // Mark the parent thread as dead before dropping the task
                 locked_thread.state = ThreadState::Dead;
             }
 
             // Dropping the Task here drops its Box<[u8]> stack allocation.
             // This is safe because the task is Dead, and schedule() has
-            // already switched away from it and will never switch back.
+            // already switched away from it and will never switch back. This
+            // makes the slot available for future insertions.
             self.tasks[task_id.slot_index].task = None;
 
-            // Increment the slot's generation for the next Task that would occupy it.
+            // Increment the slot's generation, invalidating all existing
+            // `TaskId`s that referenced this slot
             self.tasks[task_id.slot_index].slot_generation =
                 self.tasks[task_id.slot_index].slot_generation.wrapping_add(1);
         }
@@ -403,7 +479,7 @@ pub(super) static SCHEDULER: StaticIrqSpinLock<Scheduler> =
 // =============================================================================
 
 /// Initializes the scheduler and registers the current execution context as
-/// the "idle task" (`TaskId::IDLE`).
+/// the idle task (`TaskId::IDLE`).
 ///
 /// The idle task is the kernel's own `_start` routine that is already running
 /// on the higher-half stack. We register it as `TaskId::IDLE`, so that the
@@ -446,16 +522,12 @@ pub fn init_idle(thread: Weak<IrqSpinLock<Thread>>) {
 ///
 /// # Arguments
 /// 
-/// * `task` - New `Task` to schedule for execution.
+/// * `task` - New [`Task`] to insert and schedule for execution.
 ///
 /// # Returns
 /// 
-/// Returns `SchedulerError` if either the task table or the ready queue is
-/// full.
-///
-/// # Panics
-/// 
-/// Panics if the kernel heap cannot satisfy the stack allocation.
+/// Returns the inserted task's new [`TaskId`] on success or [`SchedulerError`]
+/// if either the task table or the ready queue is full.
 pub fn insert_and_queue_task(task: Task) -> Result<TaskId, SchedulerError> {
     let mut scheduler = SCHEDULER.lock();
 
@@ -536,7 +608,7 @@ pub unsafe fn schedule() {
         // or terminated itself during this time slice), move it to `Ready`
         // and push it to the tail of the queue, so it will run again after all
         // currently-queued tasks have had their turn. If the task is `Blocked`,
-        // it will be re-enqueued by `wake()` when  the awaited event fires. If
+        // it will be re-enqueued by `wake()` when the awaited event fires. If
         // the task is `Dead`, tombstone cleanup will drop it on a future pass.
         let outgoing_id = scheduler.current;
         if let Some(outgoing) = scheduler.get_task_mut(outgoing_id) {
@@ -775,7 +847,7 @@ pub fn wake(task_id: TaskId) -> Result<(), SchedulerError> {
 /// Looks up the ID of the task currently executing on the CPU.
 /// 
 /// The returned ID is a snapshot; by the time the caller inspects it, a context
-/// switch may have occurred and a different task may be running.
+/// switch may have occurred, and a different task may be running.
 ///
 /// # Returns
 /// 
@@ -808,14 +880,14 @@ pub fn tombstone_cleanup() {
         let mut scheduler = SCHEDULER.lock();
         let mut dead_task_count = 0u64;
 
-        // 1. Find all dead task IDs
+        // Find all dead task IDs first
         let dead_task_ids: Vec<_> = scheduler.tasks.iter()
             .filter_map(|slot| slot.task.as_ref())
             .filter(|task| task.state == TaskState::Dead)
             .map(|task| task.id)
             .collect();
 
-        // 2. Remove them
+        // Remove the located dead tasks
         for id in dead_task_ids {
             scheduler.remove_task(id);
             dead_task_count += 1;
@@ -835,22 +907,52 @@ pub fn tombstone_cleanup() {
     }
 }
 
+/// Marks a task as [`TaskState::Dead`], marks the backing thread as
+/// [`ThreadState::Dying`] to signal to the process manager that this thread is
+/// on its way out, and queues a forced reschedule if the task is currently
+/// running.
+///
+/// Dead tasks are not re-enqueued by [`schedule`], so the task will not run
+/// again after being switched out. Slot cleanup is deferred to the reaper
+/// via [`tombstone_cleanup`].
+/// 
+/// # Arguments
+/// 
+/// * `task_id_u64` - Encoded index and generation components of a [`TaskId`].
+///
+/// # Panics
+///
+/// Panics if the task's [`Weak`] thread reference cannot be upgraded.
+/// A task being killed must still have a live thread, as a dangling `Weak`
+/// at this point indicates a lifecycle ordering violation.
 pub fn kill_task(task_id_u64: u64) {
+    // `SystemTask`routines accept a single u64 argument, so we use a helper
+    // function to decode and expand the two components of `TaskId`, which were
+    // encoded by the caller into the u64 parameter to this function.
     let task_id = crate::system_routines::expand_task_id(task_id_u64);
     
+    // This checks if the task is currently executing on this CPU
     let is_current = {
         let mut scheduler = SCHEDULER.lock();
+
+        // Make sure the task is not stale
         if let Some(task) = scheduler.get_task_mut(task_id) {
+            // Set the task state to dead
             task.state = TaskState::Dead;
 
             // We also mark the task's parent thread as dying
             task.thread.upgrade().unwrap().lock().state = ThreadState::Dying;
+
+            // Fill `is_current`
+            scheduler.current == task_id
         }
-        scheduler.current == task_id
+        else {
+            false
+        }
     };  // The lock is released here
 
     if is_current {
-        // Signal the timer ISR to reschedule regardless of task quentum once
+        // Signal the timer ISR to reschedule regardless of task quantum once
         // the system task queue is fully drained.
         crate::globals::SYS_FLAG_FORCE_RESCHEDULE.store(
             true, core::sync::atomic::Ordering::SeqCst);

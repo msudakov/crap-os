@@ -222,8 +222,6 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // process and the first idle thread (this thread).
     let _idle_process = globals::PROCESS_MANAGER.init_idle_process(cr3);
 
-    
-
     // Draw OS banner
     fbprintln!("Hello and welcome to:\n");
     globals::FRAMEBUFFER.lock().as_mut().unwrap().draw_banner();
@@ -303,16 +301,10 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         core::sync::atomic::Ordering::SeqCst);
     
     // IDT is initialized, and the APIC is set up with the registered interrupt
-    // handlers. It is now safe to re-enable maskable hardware interrupts.
+    // handlers. The System process is also initialized, and it is now safe to
+    // re-enable maskable hardware interrupts.
     unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
 
-    //globals::PROCESS_MANAGER.print_processes();
-
-    //crate::process_manager::thread::exit_thread(thread_c);
-
-    //globals::PROCESS_MANAGER.print_processes();
-    
-    //crate::process_manager::thread::exit_thread(thread_c);
     //globals::PROCESS_MANAGER.print_processes();
 
     // Enter halt loop on the idle task

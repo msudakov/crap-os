@@ -701,16 +701,19 @@ pub unsafe fn schedule() {
 
 /// Called from the APIC timer ISR on every tick. It performs two jobs:
 ///
-/// Job 1: Accounting
-/// Increments the current task's `ticks_executed` counter unconditionally.
-/// This happens regardless of whether preemption follows, so the counter
-/// always accurately reflects total CPU time consumed by the task.
+/// Job 1: Sleep queue advancement.
+/// Calls [`super::sleep_queue::tick_sleep_queue`] to decrement the head of the
+/// sleep delta queue and wake any tasks whose sleep duration has expired. This
+/// happens before quantum accounting, so that any task woken this tick is
+/// immediately [`TaskState::Ready`] and eligible to be scheduled in the same
+/// tick.
 ///
-/// Job 2: Quantum management
-/// Decrements the current task's `ticks_remaining` counter. When it reaches
-/// 1 (not 0 - see below), the quantum is reset to `TASK_QUANTUM_TICKS`,
-/// and the function returns `true` to signal that the caller should invoke
-/// `schedule()` to preempt the current task.
+/// Job 2: Quantum accounting and preemption signaling.
+/// Increments the current task's `ticks_executed` counter unconditionally,
+/// then decrements `ticks_remaining`. When `ticks_remaining` reaches 1 (the
+/// last tick of the quantum), it is reset to [`TASK_QUANTUM_TICKS`] and the
+/// function returns `true` to signal the ISR that it should invoke
+/// [`schedule`] to preempt the current task.
 ///
 /// We need to use `<= 1` (and not strictly `< 1`) as the preemption threshold,
 /// because, at `remaining = 1`, this is the last tick of the quantum.
@@ -734,6 +737,10 @@ pub unsafe fn schedule() {
 /// `ticks_executed` correctly stays in `Task` permanently, as it is
 /// per-task, not per-CPU.
 pub fn on_timer_tick() -> bool {
+    // Advance the sleep delta queue. Any tasks woken here will be Ready and
+    // eligible for scheduling within this same tick.
+    super::sleep_queue::tick_sleep_queue();
+
     let mut scheduler = SCHEDULER.lock();
     let current_id = scheduler.current;
 
@@ -756,7 +763,8 @@ pub fn on_timer_tick() -> bool {
         false
     }
     else {
-        // No current task registered. Signal `schedule()` to find one.
+        // No task is currently registered as running.
+        // Signal the ISR to call schedule(), so it can find one.
         true
     }
 }
@@ -781,6 +789,9 @@ pub fn yield_blocked() {
         let mut scheduler = SCHEDULER.lock();
         let this_id = scheduler.current;
         if let Some(task) = scheduler.get_task_mut(this_id) {
+            // Reset the quantum so the task gets a fresh timeslice on wakeup
+            task.ticks_remaining = crate::globals::TASK_QUANTUM_TICKS;
+
             task.state = TaskState::Blocked;
             // No queue removal is needed because the task was `Running`, so it
             // was not in the ready queue to begin with. `schedule()` will not
@@ -989,4 +1000,80 @@ pub fn kill_current_task() {
     // next timer tick, by which point `schedule()` will have switched us away,
     // and the stack will no longer be in use.
     crate::helper_functions::queue_dead_task_reaper_no_dupe();
+}
+
+/// Blocks the current task for at least `seconds` seconds.
+///
+/// The task is inserted into the global sleep delta queue with a tick countdown
+/// derived from `seconds`, then immediately marked [`TaskState::Blocked`]. It
+/// will be woken and re-enqueued automatically by the timer ISR once its delta
+/// expires.
+/// 
+/// The system sleep is only granular down to 1 second because the woken tasks
+/// are re-enqueued at the tail of the Ready queue and, depending on the size
+/// of the queue, they may be delayed in resuming execution by many milliseconds.
+/// E.g., with the current quantum of 4ms, if the queue contained 100 tasks, the
+/// woken task would be late by around 0.4 or 0.5 seconds. So, the smallest
+/// sleep timer allowed for granularity is 1 second, where the lateness wouldn't
+/// be as noticeable. Otherwise, if we tell a task to sleep for 100 ms, and it
+/// is always late by 400 ms (so it sleeps for 0.5 s), which is no good.
+///
+/// The task's `ticks_remaining` is reset to [`TASK_QUANTUM_TICKS`] before
+/// yielding. This ensures that when the task is eventually woken and
+/// rescheduled, it receives a fresh full quantum rather than whatever
+/// (potentially very small) remainder it had at the time it called `sleep()`.
+///
+/// # Arguments
+///
+/// * `seconds` - The number of seconds to sleep. Passing `seconds == 0` is a
+///               valid no-op sleep: the task simply yields the remainder of its
+///               current quantum and is immediately re-enqueued without ever
+///               entering the sleep queue.
+pub fn sleep(seconds: u32) {
+    let task_id = get_current_task_id();
+
+    if seconds == 0 {
+        // Zero-duration sleep: skip the queue entirely and just yield.
+        // The task remains Ready and will be re-enqueued normally.
+        unsafe { schedule() };
+        return;
+    }
+
+    // Acquiring both locks back-to-back with IRQs disabled across the entire
+    // window prevents a race condition that would make the task forever blocked
+    // if triggered. This way, the ISR cannot consume the queue entry before the
+    // task is marked Blocked.
+    {
+        // Lock the sleep queue first. This simultaneously disables IRQs via
+        // the StaticIrqSpinLock, opening the atomic window we need.
+        let mut sleep_guard = super::sleep_queue::SLEEP_QUEUE.lock();
+
+        // Insert directly through the guard rather than via a helper function
+        // to avoid a second acquisition of SLEEP_QUEUE.
+        sleep_guard.insert(task_id, (seconds * 1000) as u64);
+
+        // With IRQs still disabled, acquire the scheduler lock and transition
+        // the task to Blocked. The ISR cannot fire between these two steps,
+        // so the queue entry we just inserted is guaranteed to still be live
+        // when the task's state becomes Blocked.
+        let mut sched = SCHEDULER.lock();
+        if let Some(task) = sched.get_task_mut(task_id) {
+            // Reset the quantum so the task gets a fresh timeslice on wakeup
+            task.ticks_remaining = crate::globals::TASK_QUANTUM_TICKS;
+
+            // Mark the task Blocked so schedule() will not re-enqueue it
+            task.state = TaskState::Blocked;
+
+            // Mirror the block in the owning Thread, so any code inspecting
+            // thread state sees a consistent view in the Process Manager.
+            task.thread.upgrade().unwrap().lock().state =
+                crate::process_manager::thread::ThreadState::Waiting;
+        }
+        // Both guards drop here, restoring IRQs
+    }
+
+    // Yield the CPU. Because the task is now Blocked, schedule() will not
+    // push it back onto the run queue, and it will remain off the queue until
+    // `tick_sleep_queue()` calls `wake()` on the task when its delta expires.
+    unsafe { schedule() };
 }

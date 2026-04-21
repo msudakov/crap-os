@@ -19,6 +19,7 @@ mod tests;
 use hardware_manager::FramebufferInfo;
 use memory_manager::{MemoryManager, GlobalHeapAllocator};
 use process_manager::nop_thread_stub;
+use crate::task_scheduler::sleep;
 
 // Need to explicitly link the built-in alloc crate in a no_std environment
 extern crate alloc;
@@ -247,13 +248,13 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     }
     fbprintln!("  - Kernel framebuffer address is: 0x{:X}\n", fb_ptr);
 
-    sprintln!("[+] ACPI and APICs initialized successfully!");
+    /*sprintln!("[+] ACPI and APICs initialized successfully!");
     fbprintln!("[+] ACPI and APICs initialized successfully!\n");
     sprintln!("[+] IDT ready, interrupts enabled...");
-    fbprintln!("[+] IDT ready, interrupts enabled...\n");
+    fbprintln!("[+] IDT ready, interrupts enabled...\n");*/
 
     // Testing memory manager and heap allocator
-    sprintln!("[*] Running general Memory Manager tests...");
+    /*sprintln!("[*] Running general Memory Manager tests...");
     fbprintln!("[*] Running general Memory Manager tests...");
     tests::memory::test_memory_manager();
     sprintln!("[+] All Memory Manager tests passed!\n");
@@ -262,7 +263,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     fbprintln!("[*] Running MM heap allocator tests...");
     tests::memory::test_heap_allocator();
     sprintln!("[+] All MM heap allocator tests passed!\n");
-    fbprintln!("[+] All MM heap allocator tests passed!\n");
+    fbprintln!("[+] All MM heap allocator tests passed!\n");*/
 
     // Create and initialize the System process
     let system_process = globals::PROCESS_MANAGER.create_process(
@@ -281,16 +282,22 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     fbprintln!("[*] Testing keyboard interrupts. Type some stuff...");
 
     // Create Test process
-    let test_process = globals::PROCESS_MANAGER.create_process(
-        "Test",
+    let test_process_1 = globals::PROCESS_MANAGER.create_process(
+        "Test Proc 1",
         cr3,
         task_a,
         0
     ).expect("Failed to create test process");
-    test_process.spawn_thread("Task B", task_b, 0).expect("failed to spawn task B");
-    test_process.spawn_thread("Fault task", task_fault, 0).expect("failed to spawn Fault Task");
-    let thread_c = test_process.spawn_thread("Task C", task_c, 0).expect("failed to spawn task C");
-
+    test_process_1.spawn_thread("P1 T2", task_b, 0).expect("failed to spawn task B");
+    
+    let test_process_2 = globals::PROCESS_MANAGER.create_process(
+        "Test Proc 2",
+        cr3,
+        task_c,
+        0
+    ).expect("Failed to create test process");
+    test_process_2.spawn_thread("Fault task", task_fault, 0).expect("failed to spawn Fault Task");
+    let thread_c = test_process_2.spawn_thread("Task C", task_c, 0).expect("failed to spawn task C");
     crate::process_manager::thread::exit_thread(thread_c);
 
 
@@ -305,7 +312,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // re-enable maskable hardware interrupts.
     unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
 
-    //globals::PROCESS_MANAGER.print_processes();
+    globals::PROCESS_MANAGER.print_processes();
 
     // Enter halt loop on the idle task
     let mut count = 0;
@@ -402,19 +409,18 @@ fn task_keyboard(_arg: u64) {
 
 fn task_a(_arg: u64) {
     loop {
-        crate::hardware_manager::sprint("A");
-        for _ in 0..1_000_000 {
-            unsafe { core::arch::asm!("nop"); }
-        }
+        crate::hardware_manager::sprint("\n* HELLO from Process 1 Thread 1");
+        fbprint!("\n* HELLO from Process 1 Thread 1");
+        sleep(2);
     }
 }
 
 fn task_b(_arg: u64) {
-    for _ in 0..10 {
-        crate::hardware_manager::sprint("Hello, world!");
-        for _ in 0..1_000_000 {
-            unsafe { core::arch::asm!("nop"); }
-        }
+    loop {
+    //for _ in 0..10 {
+        crate::hardware_manager::sprint("\n# HOWDY from Process 1 Thread 2");
+        fbprint!("\n# HOWDY from Process 1 Thread 2");
+        sleep(2);
     }
 }
 
@@ -436,10 +442,8 @@ fn task_fault(_arg: u64) {
 
 fn task_c(_arg: u64) {
     loop {
-        crate::hardware_manager::sprint(".");
-        //fbprint!(".");
-        for _ in 0..1_000_000 {
-            unsafe { core::arch::asm!("nop"); }
-        }
+        crate::hardware_manager::sprint("\n% HOLA from Process 2 Thread 1");
+        fbprint!("\n% HOLA from Process 2 Thread 1");
+        sleep(2);
     }
 }

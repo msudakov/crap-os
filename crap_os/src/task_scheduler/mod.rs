@@ -9,9 +9,10 @@
 mod switcher;
 pub mod task;
 pub mod scheduler;
+pub(super) mod sleep_queue;
 
 // Re-export public APIs
 pub use scheduler::{SchedulerError, init_idle, on_timer_tick, schedule, wake,
     insert_and_queue_task, yield_blocked, get_current_task_id,
-    tombstone_cleanup, kill_current_task};
+    tombstone_cleanup, kill_current_task, sleep};
 pub use task::TaskId;

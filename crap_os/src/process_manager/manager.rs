@@ -35,6 +35,7 @@ use super::process::Process;
 use crate::spinlock::IrqSpinLock;
 use crate::task_scheduler::{SchedulerError, TaskId};
 use crate::sprintln;
+use crate::fbprintln;
 
 /// The top-level manager for all processes.
 ///
@@ -157,14 +158,18 @@ impl ProcessManager {
         let processes = self.processes.lock();
         for proc in processes.iter() {
             sprintln!("\n========== PROCESS INFORMATION ==========");
+            fbprintln!("\n========== PROCESS INFORMATION ==========");
             sprintln!("Process: {} (ID: {}, PML4: {:#X})", proc.name, proc.id.as_u64(), proc.cr3);
+            fbprintln!("Process: {} (ID: {}, PML4: {:#X})", proc.name, proc.id.as_u64(), proc.cr3);
 
             {
                 let threads = proc.threads.lock();
                 sprintln!("Threads: {}", threads.len());
+                fbprintln!("Threads: {}", threads.len());
                 for thread in threads.iter() {
                     let locked_thread = thread.lock();
                     sprintln!("    Thread {} (ID: {}, State: {:?})", locked_thread.name, locked_thread.id.as_u64(), locked_thread.state);
+                    fbprintln!("    Thread {} (ID: {}, State: {:?})", locked_thread.name, locked_thread.id.as_u64(), locked_thread.state);
                 }
             }
         }

@@ -1,54 +1,55 @@
-// =============================================================================
-// ACPI (Advanced Configuration and Power Interface) Table Parser
-// =============================================================================
-//
-// This module walks the ACPI table hierarchy to locate the two physical
-// addresses the APIC driver needs to initialize interrupt routing:
-// - Local APIC base address, which is usually at 0xFEE00000:
-//     The Local APIC (LAPIC) is a per-CPU controller. Each core uses its own
-//     LAPIC to receive interrupts, send inter-processor interrupts (IPIs), and
-//     manage the local timer. The base address is the same for all CPU cores.
-//
-// - I/O APIC base address, which is usually at 0xFEC00000:
-//     The I/O APIC is a single chip (or one per cluster) that receives
-//     external hardware interrupts (PCI, PS/2, timers, etc.) and routes
-//     them to one or more LAPICs. We'll only track the first I/O APIC.
-//
-// The ACPI table hierarchy is comprised of the following components: RSDP,
-// XSDT/RSDT, MADT (the APIC), and others. Visually, it looks like this:
-//   RSDP
-//    |_ XSDT or RSDT
-//         |- FACP (Fixed ACPI Description Table)
-//         |- APIC <- this is the MADT, and it contains what we need
-//         |- HPET
-//         |_ ... (other tables, which we can ignore for now)
-// 
-//  - RSDP (Root System Description Pointer):
-//      Supplied by the firmware and passed through by our bootloader.
-//      Contains the physical address of either the XSDT (for ACPI 2.0+) or
-//      RSDT (for ACPI 1.0), depending on the revision field.
-//
-//  - XSDT/RSDT (Extended/Root System Description Table)
-//      An array of physical pointers (64-bit for XSDT, 32-bit for RSDT),
-//      each pointing to another SDT. We scan this array looking for "APIC",
-//      which is the MADT signature.
-//
-//  - MADT (Multiple APIC Description Table, signature "APIC")
-//      Contains the default Local APIC address, followed by a variable-length
-//      list of interrupt controller structures - one per LAPIC, I/O APIC,
-//      interrupt source override, NMI source, etc. We scan these entries to
-//      find the first I/O APIC entry (type 1).
-//
-// All ACPI structures are defined as `repr(C, packed)`. The ACPI spec lays
-// them out with no implicit padding, and they may be placed at arbitrary byte
-// offsets in firmware-provided memory, so alignment cannot be assumed.
-//
-// Rust forbids creating a reference (`&T`) to an unaligned field of a packed
-// struct, because the reference itself would be misaligned and any read through
-// it is undefined behaviour on architectures that require alignment. To avoid
-// this, we always use `ptr::read_unaligned` (via `addr_of!`) when reading
-// multi-byte fields from packed structs. Single `u8` fields can be read
-// through a field access because they are always aligned.
+//! ACPI (Advanced Configuration and Power Interface) Table Parser
+//!
+//! This module walks the ACPI table hierarchy to locate the two physical
+//! addresses the APIC driver needs to initialize interrupt routing:
+//! - Local APIC base address, which is usually at 0xFEE00000:
+//!     The Local APIC (LAPIC) is a per-CPU controller. Each core uses its own
+//!     LAPIC to receive interrupts, send inter-processor interrupts (IPIs), and
+//!     manage the local timer. The base address is the same for all CPU cores.
+//!
+//! - I/O APIC base address, which is usually at 0xFEC00000:
+//!     The I/O APIC is a single chip (or one per cluster) that receives
+//!     external hardware interrupts (PCI, PS/2, timers, etc.) and routes
+//!     them to one or more LAPICs. We'll only track the first I/O APIC.
+//! 
+//! The `find_acpi_table` function also helps locate other needed ACPI tables,
+//! such as HPET that is used for APIC timer calibration.
+//!
+//! The ACPI table hierarchy is comprised of the following components: RSDP,
+//! XSDT/RSDT, MADT (the APIC), and others. Visually, it looks like this:
+//!   RSDP
+//!    |_ XSDT or RSDT
+//!         |- FACP (Fixed ACPI Description Table)
+//!         |- APIC <- this is the MADT, and it contains what we need
+//!         |- HPET
+//!         |_ ... (other tables, which we can ignore for now)
+//! 
+//!  - RSDP (Root System Description Pointer):
+//!      Supplied by the firmware and passed through by our bootloader.
+//!      Contains the physical address of either the XSDT (for ACPI 2.0+) or
+//!      RSDT (for ACPI 1.0), depending on the revision field.
+//!
+//!  - XSDT/RSDT (Extended/Root System Description Table)
+//!      An array of physical pointers (64-bit for XSDT, 32-bit for RSDT),
+//!      each pointing to another SDT. We scan this array looking for "APIC",
+//!      which is the MADT signature.
+//!
+//!  - MADT (Multiple APIC Description Table, signature "APIC")
+//!      Contains the default Local APIC address, followed by a variable-length
+//!      list of interrupt controller structures - one per LAPIC, I/O APIC,
+//!      interrupt source override, NMI source, etc. We scan these entries to
+//!      find the first I/O APIC entry (type 1).
+//!
+//! All ACPI structures are defined as `repr(C, packed)`. The ACPI spec lays
+//! them out with no implicit padding, and they may be placed at arbitrary byte
+//! offsets in firmware-provided memory, so alignment cannot be assumed.
+//!
+//! Rust forbids creating a reference (`&T`) to an unaligned field of a packed
+//! struct, because the reference itself would be misaligned and any read
+//! through it is undefined behaviour on architectures that require alignment.
+//! To avoid this, we always use `ptr::read_unaligned` (via `addr_of!`) when
+//! reading multi-byte fields from packed structs. Single `u8` fields can be
+//! read through a field access because they are always aligned.
 
 use core::ptr;
 use crate::memory_manager::MemoryManager;
@@ -113,39 +114,39 @@ struct Rsdp {
 /// We cast raw virtual pointers to `*const SdtHeader` to identify a table by
 /// its signature before deciding how to parse the rest.
 #[repr(C, packed)]
-struct SdtHeader {
+pub(super) struct SdtHeader {
     /// 4-byte ASCII table identifier:
     ///   `b"APIC"` = MADT (Multiple APIC Description Table)
     ///   `b"FACP"` = FADT (Fixed ACPI Description Table)
     ///   `b"XSDT"` = Extended System Description Table
     ///   `b"RSDT"` = Root System Description Table
-    signature: [u8; 4],
+    pub signature: [u8; 4],
 
     /// Total length of this table in bytes, including this header and all
     /// following data. Used to compute the end address when walking entries.
-    length: u32,
+    pub length: u32,
 
     /// Table-specific revision number. Its meaning varies per table type.
-    revision: u8,
+    pub revision: u8,
 
     /// Checksum such that the sum of all bytes in the table equals 0 mod 256.
     /// It is not verified by this implementation.
-    checksum: u8,
+    pub checksum: u8,
 
     /// OEM identifier (not null-terminated, padded with spaces or zeros).
-    oem_id: [u8; 6],
+    pub oem_id: [u8; 6],
 
     /// OEM-assigned table identifier (e.g., the system model name).
-    oem_table_id: [u8; 8],
+    pub oem_table_id: [u8; 8],
 
     /// OEM-assigned revision number for this specific table instance.
-    oem_revision: u32,
+    pub oem_revision: u32,
 
     /// Vendor ID of the tool that created the table (e.g., BIOS/UEFI vendor).
-    creator_id: u32,
+    pub creator_id: u32,
 
     /// Revision of the creation tool.
-    creator_revision: u32,
+    pub creator_revision: u32,
 }
 
 /// The MADT-specific header that immediately follows the generic `SdtHeader`.
@@ -240,8 +241,52 @@ pub struct ApicInfo {
     pub io_apic_gsi_base: u32,
 }
 
-/// This function serves as the public entry point, and it parses the ACPI
-/// tables starting from the RSDP.
+/// Walks the RSDP and searches the XSDT (ACPI 2.0+) or RSDT (ACPI 1.0) for a
+/// table matching the given 4-byte signature.
+/// 
+/// # Arguments
+/// 
+/// * `rsdp_virt` - RSDP virtual address from the bootloader (already translated
+///     through the kernel's direct physical map).
+/// * `sig`       - The 4-byte signature to search for.
+/// 
+/// # Returns
+/// 
+/// Returns a virtual pointer to the table's SdtHeader on success, or `None` if
+/// the RSDP signature is invalid or the MADT cannot be found.
+pub(super) unsafe fn find_acpi_table(
+    rsdp_virt: u64,
+    sig: &[u8; 4],
+) -> Option<*const SdtHeader> {
+    // Cast the virtual address to a reference to our Rsdp struct
+    let rsdp = unsafe { &*(rsdp_virt as *const Rsdp) };
+
+    // Verify the RSDP signature before trusting any other fields;
+    // `b"RSD PTR "` includes the trailing space, and all 8 bytes must match.
+    if &rsdp.signature != b"RSD PTR " {
+        return None;
+    }
+
+    // Choose between XSDT (64-bit pointers for ACPI 2.0+) and RSDT (32-bit
+    // pointers for ACPI 1.0) based on the revision field. We prefer XSDT when
+    // available because RSDT physical addresses are 32-bit and could fail to
+    // represent tables above 4 GiB (though this is very rare).
+    if rsdp.revision >= 2 && rsdp.xsdt_addr != 0 {
+        // ACPI 2.0+: use the 64-bit XSDT
+        unsafe {
+            find_table_in_xsdt(
+                MemoryManager::phys_to_virt(rsdp.xsdt_addr), sig)
+        }
+    } else {
+        // ACPI 1.0: use the 32-bit RSDT
+        unsafe {
+            find_table_in_rsdt(
+                MemoryManager::phys_to_virt(rsdp.rsdt_addr as u64), sig)
+        }
+    }
+}
+
+/// Parses the ACPI tables starting from the RSDP.
 ///
 /// # Arguments
 /// 
@@ -265,34 +310,9 @@ pub struct ApicInfo {
 ///     them). This is guaranteed as long as the physical map covers the first
 ///     4 GiB, as CPI tables are always below 4 GiB on x86-64.
 pub unsafe fn parse_acpi(rsdp_virt: u64) -> Option<ApicInfo> {
-    // Cast the virtual address to a reference to our Rsdp struct
-    let rsdp = unsafe { &*(rsdp_virt as *const Rsdp) };
-
-    // Verify the RSDP signature before trusting any other fields.
-    // `b"RSD PTR "` includes the trailing space, and all 8 bytes must match.
-    if &rsdp.signature != b"RSD PTR " {
-        return None;
-    }
-
-    // Choose between XSDT (64-bit pointers for ACPI 2.0+) and RSDT (32-bit
-    // pointers for ACPI 1.0) based on the revision field. We prefer XSDT when
-    // available because RSDT physical addresses are 32-bit and could fail to
-    // represent tables above 4 GiB (though this is very rare).
-    let madt_ptr: *const SdtHeader =if rsdp.revision >=2 && rsdp.xsdt_addr !=0 {
-        // ACPI 2.0+: use the 64-bit XSDT
-        unsafe {
-            find_table_in_xsdt(MemoryManager::phys_to_virt(
-                rsdp.xsdt_addr), b"APIC")?
-        }
-    }
-    else {
-        // ACPI 1.0: use the 32-bit RSDT
-        unsafe {
-            find_table_in_rsdt(MemoryManager::phys_to_virt(
-                rsdp.rsdt_addr as u64), b"APIC")?
-        }
-    };
-
+    // Locate the APIC table MADT pointer
+    let madt_ptr = unsafe { find_acpi_table(rsdp_virt, b"APIC")? };
+    
     // Parse the MADT we found and extract the LAPIC and I/O APIC addresses
     unsafe { parse_madt(madt_ptr) }
 }

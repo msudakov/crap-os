@@ -1,26 +1,24 @@
-// =============================================================================
-// Spinlock and IRQ Safety Module
-// =============================================================================
-//
-// This module contains spinlock implementations for synchronizing critical
-// globals. These are mutual-exclusion primitives that busy-wait (spin) until
-// the lock is available. They are suitable for short critical sections in a
-// kernel context. Plain spinlocks are not safe to use in both thread and
-// interrupt context simultaneously. If an interrupt fires while the lock is
-// held on a current CPU, and the interrupt handler also tries to acquire
-// the same lock, we would deadlock - bad news bear.
-//
-// SpinLock<T> is the core primitive here. It spins on an AtomicBool using a
-// test-and-test-and-set (TTAS) loop for cache efficiency. IrqSpinLock<T> then
-// wraps SpinLock and disables CPU hardware interrupts while held, preventing
-// deadlock between a thread and an interrupt service routine competing for
-// the same lock. StaticSpinLock<T> and StaticIrqSpinLock<T> are thin wrappers
-// that manually implement Sync so these can be safe to put in a static
-// variable.
-//
-// Each lock has a corresponding RAII (Resource Acquisition Is Initialization)
-// guard type that automatically releases the lock (for IrqSpinLock, it also
-// restores interrupt state) when it is dropped.
+//! Spinlock and IRQ Safety Module
+//!
+//! This module contains spinlock implementations for synchronizing critical
+//! globals. These are mutual-exclusion primitives that busy-wait (spin) until
+//! the lock is available. They are suitable for short critical sections in a
+//! kernel context. Plain spinlocks are not safe to use in both thread and
+//! interrupt context simultaneously. If an interrupt fires while the lock is
+//! held on a current CPU, and the interrupt handler also tries to acquire
+//! the same lock, we would deadlock - bad news bear.
+//!
+//! SpinLock<T> is the core primitive here. It spins on an AtomicBool using a
+//! test-and-test-and-set (TTAS) loop for cache efficiency. IrqSpinLock<T> then
+//! wraps SpinLock and disables CPU hardware interrupts while held, preventing
+//! deadlock between a thread and an interrupt service routine competing for
+//! the same lock. StaticSpinLock<T> and StaticIrqSpinLock<T> are thin wrappers
+//! that manually implement Sync so these can be safe to put in a static
+//! variable.
+//!
+//! Each lock has a corresponding RAII (Resource Acquisition Is Initialization)
+//! guard type that automatically releases the lock (for IrqSpinLock, it also
+//! restores interrupt state) when it is dropped.
 
 // Needed for interior mutability; it tells the compiler that the value inside
 // may be mutated through a shared reference.
@@ -361,7 +359,7 @@ impl<T> IrqSpinLock<T> {
         // Capture current interrupt state and disable interrupts atomically.
         // `flags` holds the x86 RFLAGS value before CLI; specifically bit 9
         // (IF) tells us whether interrupts were enabled.
-        let flags = crate::system_routines::disable_interrupts_save();
+        let flags = crate::helper_functions::disable_interrupts_save();
         
         // Now that interrupts are off, acquire the SpinLock normally. This way,
         // no interrupt handler can sneak in and try to acquire the same
@@ -388,14 +386,14 @@ impl<T> IrqSpinLock<T> {
     pub fn try_lock(&self) -> Option<IrqSpinLockGuard<'_, T>> {
         // Disable interrupts first; we must not be preempted by an ISR between
         // checking the lock and acquiring it.
-        let flags = crate::system_routines::disable_interrupts_save();
+        let flags = crate::helper_functions::disable_interrupts_save();
         
         match self.0.try_lock() {
             Ok(guard) => Some(IrqSpinLockGuard { guard, flags }),
             Err(_) => {
                 // Lock is busy. Restore interrupt state before returning so
                 // the caller is not stuck with interrupts disabled.
-                crate::system_routines::restore_interrupts(flags);
+                crate::helper_functions::restore_interrupts(flags);
                 None
             }
         }
@@ -456,12 +454,14 @@ impl<T> DerefMut for IrqSpinLockGuard<'_, T> {
 /// lock before we've actually released it.
 impl<T> Drop for IrqSpinLockGuard<'_, T> {
     fn drop(&mut self) {
-        // `self.guard` will be dropped automatically after this function
-        // returns. Rust drops fields in declaration order, so `guard` first,
-        // then `flags` is just a usize and doesn't need dropping. We call
-        // restore_interrupts here, which runs after the guard's own Drop impl
-        // has released the lock.
-        crate::system_routines::restore_interrupts(self.flags);
+        // Explicitly drop the spinlock guard before re-enabling interrupts.
+        // If we restore interrupts first, a timer IRQ can fire and attempt
+        // to acquire the same spinlock before we've fully released it, causing
+        // a deadlock on a single-core system.
+        unsafe { core::ptr::drop_in_place(&mut self.guard) };
+
+        // With the guard dropped, it is now safe to restore interrupts
+        crate::helper_functions::restore_interrupts(self.flags);
     }
 }
 

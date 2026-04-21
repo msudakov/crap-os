@@ -1,48 +1,46 @@
-// =============================================================================
-// Global Descriptor Table (GDT) and Task State Segment (TSS)
-// =============================================================================
-//
-// This module defines the systems's permanent GDT and TSS, which replace the
-// temporary 3-entry GDT set up by the Memory Manager as a placeholder.
-//
-// The permanent GDT adds a TSS descriptor, which gives us the following:
-//   1. A dedicated stack for the double-fault exception handler via Interrupt
-//      Stack Table (IST), so that a fault caused by a corrupted or overflowed
-//      stack does not cause an additional fault (which would lead to triple
-//      fault and imminent CPU reset).
-//   2. A kernel-mode stack pointer (RSP0) for transitions from ring 3 to
-//      ring 0, once user-mode space support is added.
-//
-// The GDT has the following layout:
-//
-//  Index | Offset | Selector | Description
-//  ----------------------------------------------------------------------------
-//  0     | 0x00   | 0x00     | Null descriptor (required; CPU ignores slot 0)
-//  1     | 0x08   | 0x08     | 64-bit ring 0 kernel code (execute/read)
-//  2     | 0x10   | 0x10     | 64-bit ring 0 kernel data (read/write)
-//  3     | 0x18   | 0x18     | TSS ring 0 descriptor (low 8 bytes)
-//  4     | 0x20   | -        | TSS ring 0 descriptor (high 8 bytes)
-//
-// The last two 8-byte slots form the single 16-byte TSS descriptor. The
-// selector 0x18 refers to both, and index 4 (0x20) is not itself a selector.
-//
-// The IST1 (Interrupt Stack Table 1) points to the top of DOUBLE_FAULT_STACK.
-// When a double-fault fires, the CPU atomically switches RSP to IST1 before
-// invoking the handler, guaranteeing a known-good stack even if the original
-// RSP was invalid.
-//
-// We need a static mut for the GDT and TSS because the CPU accesses both tables
-// by raw virtual address, via GDTR for the GDT and the TSS base field in the
-// GDT for the TSS. There is no Rust reference involved here; therefore, no
-// spinlock can protect them. But thankfully, spinlocks are not needed.
-//
-// Both tables are written exactly once, during single-threaded init before any
-// interrupts fire. They are read-only for the rest of the kernel's lifetime;
-// the CPU reads them on exception entry, but never writes through a Rust
-// reference. The GDT and TSS are required to have stable virtual addresses for
-// the lifetime of the kernel. A spinlock-protected heap allocation would
-// satisfy the stability requirement, but it would add unnecessary locking
-// overhead.
+//! Global Descriptor Table (GDT) and Task State Segment (TSS)
+//!
+//! This module defines the systems's permanent GDT and TSS, which replace the
+//! temporary 3-entry GDT set up by the Memory Manager as a placeholder.
+//!
+//! The permanent GDT adds a TSS descriptor, which gives us the following:
+//!   1. A dedicated stack for the double-fault exception handler via Interrupt
+//!      Stack Table (IST), so that a fault caused by a corrupted or overflowed
+//!      stack does not cause an additional fault (which would lead to triple
+//!      fault and imminent CPU reset).
+//!   2. A kernel-mode stack pointer (RSP0) for transitions from ring 3 to
+//!      ring 0, once user-mode space support is added.
+//!
+//! The GDT has the following layout:
+//!
+//!  Index | Offset | Selector | Description
+//!  ---------------------------------------------------------------------------
+//!  0     | 0x00   | 0x00     | Null descriptor (required; CPU ignores slot 0)
+//!  1     | 0x08   | 0x08     | 64-bit ring 0 kernel code (execute/read)
+//!  2     | 0x10   | 0x10     | 64-bit ring 0 kernel data (read/write)
+//!  3     | 0x18   | 0x18     | TSS ring 0 descriptor (low 8 bytes)
+//!  4     | 0x20   | -        | TSS ring 0 descriptor (high 8 bytes)
+//!
+//! The last two 8-byte slots form the single 16-byte TSS descriptor. The
+//! selector 0x18 refers to both, and index 4 (0x20) is not itself a selector.
+//!
+//! The IST1 (Interrupt Stack Table 1) points to the top of DOUBLE_FAULT_STACK.
+//! When a double-fault fires, the CPU atomically switches RSP to IST1 before
+//! invoking the handler, guaranteeing a known-good stack even if the original
+//! RSP was invalid.
+//!
+//! We need a static mut for the GDT and TSS because the CPU accesses both
+//! tables by raw virtual address, via GDTR for the GDT and the TSS base field
+//! in the GDT for the TSS. There is no Rust reference involved here; therefore,
+//! no spinlock can protect them. But thankfully, spinlocks are not needed.
+//!
+//! Both tables are written exactly once, during single-threaded init before any
+//! interrupts fire. They are read-only for the rest of the kernel's lifetime;
+//! the CPU reads them on exception entry, but never writes through a Rust
+//! reference. The GDT and TSS are required to have stable virtual addresses for
+//! the lifetime of the kernel. A spinlock-protected heap allocation would
+//! satisfy the stability requirement, but it would add unnecessary locking
+//! overhead.
 
 use crate::globals::{TSS, GDT, DOUBLE_FAULT_STACK};
 

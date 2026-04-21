@@ -1,28 +1,26 @@
-// =============================================================================
-// Virtual Memory Manager
-// =============================================================================
-//
-// On x86-64 systems with 4-level paging, the paging hierarchy is:
-//   PML4 -> PDPT -> PD -> PT -> physical page frame, where:
-//   * PML4 - Page Map Level 4, contains 512 PML4Es
-//   * PDPT - Page Directory Pointer Table, contains 512 PDPTEs 
-//   * PD   - Page Directory, contains 512 PDEs
-//   * PT   - Page Table, contains 512 64-bit PTEs
-//
-// Each of these tables is 4KB, containing 512 entries, with each entry being
-// 8 bytes.
-//
-// This structure maps 48-bit virtual addresses to physical addresses. A
-// 48-bit virtual address is split into 9-bit indices for each mapping level,
-// plus a 12-bit page offset: 9-bit PML4 index, 9-bit PDPT index, 9-bit PD
-// index, 9-bit PT index, and 12-bit offset. A single PML4 entry (PML4E) can
-// map 512 GB of memory, making the total addressable space per PML4 table 256
-// TB, which is more than enough for our purposes here. PML5 allows for larger
-// (57-bit) virtual address spaces.
-//
-// To facilitate address translation, the Memory Management Unit (MMU), located
-// in the CPU chip package, uses the CR3 register to locate the PML4. It then
-// traverses the levels to resolve the final physical address.
+//! Virtual Memory Manager
+//!
+//! On x86-64 systems with 4-level paging, the paging hierarchy is:
+//!   PML4 -> PDPT -> PD -> PT -> physical page frame, where:
+//!   * PML4 - Page Map Level 4, contains 512 PML4Es
+//!   * PDPT - Page Directory Pointer Table, contains 512 PDPTEs 
+//!   * PD   - Page Directory, contains 512 PDEs
+//!   * PT   - Page Table, contains 512 64-bit PTEs
+//!
+//! Each of these tables is 4KB, containing 512 entries, with each entry being
+//! 8 bytes.
+//!
+//! This structure maps 48-bit virtual addresses to physical addresses. A
+//! 48-bit virtual address is split into 9-bit indices for each mapping level,
+//! plus a 12-bit page offset: 9-bit PML4 index, 9-bit PDPT index, 9-bit PD
+//! index, 9-bit PT index, and 12-bit offset. A single PML4 entry (PML4E) can
+//! map 512 GB of memory, making the total addressable space per PML4 table 256
+//! TB, which is more than enough for our purposes here. PML5 allows for larger
+//! (57-bit) virtual address spaces.
+//!
+//! To facilitate address translation, the Memory Management Unit (MMU), located
+//! in the CPU chip package, uses the CR3 register to locate the PML4. It then
+//! traverses the levels to resolve the final physical address.
 
 use crate::memory_manager::{PRESENT, WRITABLE, PWT, PCD, NX};
 use crate::memory_manager::{MemoryMapInfo, EfiMemoryDescriptor, EfiMemoryType};
@@ -557,6 +555,15 @@ pub fn build_direct_map(pmm: &mut PhysicalMemoryManager, pml4: *mut u64,
             phys += PAGE_SIZE;
         }
     }
+
+    // Map HPET MMIO region through the direct physical map. It is also not in
+    // the UEFI memory map as conventional memory, so we need to map it
+    // separately. One entire page is enough for what we need out of it.
+    let hpet_mmio_addr = 0xFED00000;
+    unsafe {
+        map_page(pmm, pml4, KERNEL_PHYSICAL_MAP_BASE + hpet_mmio_addr,
+            hpet_mmio_addr, PRESENT | WRITABLE | PWT | PCD)
+    };
 }
 
 /// Maps the linear GPU framebuffer to its permanent virtual address in the

@@ -1,6 +1,4 @@
-// =============================================================================
-// CrapOS Main System Module
-// =============================================================================
+//! CrapOS Main System Module
 
 #![no_std]   // This is an OS kernel; there is no standard library for now
 #![no_main]  // Not depending on a runtime, so cannot use main as entry point
@@ -8,16 +6,20 @@
 mod globals;
 mod spinlock;
 mod macros;
-mod system_routines;
+mod helper_functions;
 mod hardware_manager;
 mod memory_manager;
+mod system_core;
+mod task_scheduler;
+mod process_manager;
 pub mod gdt;
 pub mod idt;
 mod tests;
 
 use hardware_manager::FramebufferInfo;
-use memory_manager::MemoryManager;
-use memory_manager::GlobalHeapAllocator;
+use memory_manager::{MemoryManager, GlobalHeapAllocator};
+use process_manager::nop_thread_stub;
+use crate::task_scheduler::sleep;
 
 // Need to explicitly link the built-in alloc crate in a no_std environment
 extern crate alloc;
@@ -98,6 +100,10 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     let apic_info = unsafe {
         hardware_manager::parse_acpi(rsdp_virt).expect("ACPI/MADT not found")
     };
+    let hpet_info = unsafe {
+        hardware_manager::parse_hpet(rsdp_virt).expect(
+            "HPET not found or invalid. Cannot calibrate APIC timer...")
+    };
 
     // Initialize the physical memory manager. This enumerates and maps physical
     // pages to enable page tables in the next step.
@@ -125,6 +131,8 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     let framebuffer = framebuffer;
     let memory_map = memory_map;
     let apic_info = apic_info;
+    let hpet_info = hpet_info;
+    let cr3: u64 = pml4 as u64;
 
     // Properly initialize the memory manager from the higher-half kernel space.
     // This uses the physical manager passed as a struct and the PML4 address of
@@ -180,26 +188,40 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     unsafe { hardware_manager::disable_pic_8259() };
     sprint_debug!(DebugLevel::DEBUG, "[INFO] Disabled legacy PIC 8259");
 
-    // Initialize and configure APICs
+    // Initialize Local APIC and I/O APIC; also needed for timer calibration
     unsafe {
-        // Initialize Local APIC and I/O APIC
         hardware_manager::init_apic(apic_info.local_apic_phys,
             apic_info.io_apic_phys,
         );
         sprint_debug!(DebugLevel::DEBUG, "[DEBUG] APICs have been initialized");
-
-        // Configure the APIC timer (tune initial_count as needed for testing)
-        hardware_manager::configure_timer(1000000);
-        sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Timer interrupt initialized");
-
-        // Unmask the keyboard IRQ in the I/O APIC
-        hardware_manager::ioapic_unmask_irq(1);
-        sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Keyboard interrupts ready");
     }
 
-    // IDT is initialized, and the APIC is set up with the registered interrupt
-    // handlers. It is now safe to re-enable maskable hardware interrupts.
-    unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+    // Initialize High Precision Event Timer (HPET) and calibrate APIC timer
+    {
+        // Initialize HPET
+        let mut hpet = globals::HPET.lock();
+        *hpet = Some(hpet_info);
+
+        // Calculate the number of APIC timer ticks per millisecond
+        let apic_ticks_per_ms = unsafe {
+            hardware_manager::calibrate_timer(hpet.as_ref().unwrap())
+        };
+        sprint_debug!(DebugLevel::INFO, "[INFO] Calibrated APIC timer");
+        sprintln!("[INFO] APIC timer: {} ticks/ms", apic_ticks_per_ms);
+
+        // Configure the APIC timer (currently 1ms tick rate)
+        unsafe { hardware_manager::configure_timer(apic_ticks_per_ms) };
+        sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Timer interrupt initialized");
+    }
+
+    // Unmask the keyboard IRQ in the I/O APIC
+    unsafe { hardware_manager::ioapic_unmask_irq(1) };
+    sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Keyboard interrupts ready");
+
+    // Initialize the Task Scheduler, register the main kernel _start
+    // routine as the idle task for the scheduler, and create the system idle
+    // process and the first idle thread (this thread).
+    let _idle_process = globals::PROCESS_MANAGER.init_idle_process(cr3);
 
     // Draw OS banner
     fbprintln!("Hello and welcome to:\n");
@@ -226,13 +248,13 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     }
     fbprintln!("  - Kernel framebuffer address is: 0x{:X}\n", fb_ptr);
 
-    sprintln!("[+] ACPI and APICs initialized successfully!");
+    /*sprintln!("[+] ACPI and APICs initialized successfully!");
     fbprintln!("[+] ACPI and APICs initialized successfully!\n");
     sprintln!("[+] IDT ready, interrupts enabled...");
-    fbprintln!("[+] IDT ready, interrupts enabled...\n");
+    fbprintln!("[+] IDT ready, interrupts enabled...\n");*/
 
     // Testing memory manager and heap allocator
-    sprintln!("[*] Running general Memory Manager tests...");
+    /*sprintln!("[*] Running general Memory Manager tests...");
     fbprintln!("[*] Running general Memory Manager tests...");
     tests::memory::test_memory_manager();
     sprintln!("[+] All Memory Manager tests passed!\n");
@@ -241,39 +263,67 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     fbprintln!("[*] Running MM heap allocator tests...");
     tests::memory::test_heap_allocator();
     sprintln!("[+] All MM heap allocator tests passed!\n");
-    fbprintln!("[+] All MM heap allocator tests passed!\n");
+    fbprintln!("[+] All MM heap allocator tests passed!\n");*/
 
-    // Testing timer interrupts
-    sprintln!("[*] Testing IRQ timer interrupts...");
-    fbprintln!("[*] Testing IRQ timer interrupts...");
-    let mut last_tick = system_routines::get_timer_ticks();
-    let mut counter = 0;
-    loop {
-        let current = system_routines::get_timer_ticks();
-        if current != last_tick {
-            sprint!(".");
-            fbprint!(".");
-            last_tick = current;
-            counter += 1
-        }
+    // Create and initialize the System process
+    let system_process = globals::PROCESS_MANAGER.create_process(
+        "System",
+        cr3,
+        nop_thread_stub,
+        0
+    ).expect("[FATAL ERROR] Failed to create System process");
 
-        if counter > 30 {
-            break;
-        }
-
-        // Halt until the next interrupt to avoid spinning the CPU at 100%
-        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
-    }
-    sprintln!("\n[+] IRQ timer interrupt test complete!\n");
-    fbprintln!("\n[+] IRQ timer interrupt test complete!\n");
-
+    // Spawn keyboard buffer reader thread in the System process
+    system_process.spawn_thread("Keyboard reader", task_keyboard, 0).expect(
+        "Failed to spawn keyboard thread");
+    
     // Testing keyboard interrupts
     sprintln!("[*] Testing keyboard interrupts. Type some stuff...");
     fbprintln!("[*] Testing keyboard interrupts. Type some stuff...");
 
-    // Halt until the next interrupt to avoid spinning the CPU at 100%
+    // Create Test process
+    let test_process_1 = globals::PROCESS_MANAGER.create_process(
+        "Test Proc 1",
+        cr3,
+        task_a,
+        0
+    ).expect("Failed to create test process");
+    test_process_1.spawn_thread("P1 T2", task_b, 0).expect("failed to spawn task B");
+    
+    let test_process_2 = globals::PROCESS_MANAGER.create_process(
+        "Test Proc 2",
+        cr3,
+        task_c,
+        0
+    ).expect("Failed to create test process");
+    test_process_2.spawn_thread("Fault task", task_fault, 0).expect("failed to spawn Fault Task");
+    let thread_c = test_process_2.spawn_thread("Task C", task_c, 0).expect("failed to spawn task C");
+    crate::process_manager::thread::exit_thread(thread_c);
+
+
+    // Signal the Task Scheduler that the kernel has completed its
+    // initialization sequence. After this, the idle task (this task) will only
+    // be selected to run if no other tasks are available and ready to run.
+    globals::SYS_FLAG_KERNEL_INIT_COMPLETE.store(true,
+        core::sync::atomic::Ordering::SeqCst);
+    
+    // IDT is initialized, and the APIC is set up with the registered interrupt
+    // handlers. The System process is also initialized, and it is now safe to
+    // re-enable maskable hardware interrupts.
+    unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+
+    globals::PROCESS_MANAGER.print_processes();
+
+    // Enter halt loop on the idle task
+    let mut count = 0;
     loop {
-        unsafe { core::arch::asm!("hlt") };
+        //crate::hardware_manager::sprint("+");
+        count += 1;
+        if count == 10 {
+            count = 0;
+            //globals::PROCESS_MANAGER.print_processes();
+        }
+        unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
     } 
 }
 
@@ -292,10 +342,19 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 /// Crashes the system and halts the CPU.
 #[panic_handler]
 fn panic(info: &core::panic::PanicInfo) -> ! {
-    // Print this without acquiring the spinlock
     hardware_manager::sprint("\n!!! KERNEL PANIC !!!\n");
 
     if let Some(location) = info.location() {
+        hardware_manager::sprint("Panic occurred in file: ");
+        hardware_manager::sprint(location.file());
+        hardware_manager::sprint("\n");
+
+        if let Some(message) = info.message().as_str() {
+            hardware_manager::sprint("Panic Message: ");
+            hardware_manager::sprint(message);
+            hardware_manager::sprint("\n");
+        }
+
         sprintln!("Panic occurred in file '{}' at line {}", location.file(),
             location.line());
     }
@@ -305,5 +364,86 @@ fn panic(info: &core::panic::PanicInfo) -> ! {
     loop {
         // Halt the CPU
         unsafe { core::arch::asm!("hlt"); }
+    }
+}
+
+/// Registers a keyboard buffer reader task with the ISR, then loops through
+/// the buffer and processes all scancodes in it; finally, blocks itself via
+/// `yield_blocked()` until the next it is it woken.
+/// 
+/// # Arguments
+///
+/// * `_arg` - Unused argument; accepted for conformity.
+fn task_keyboard(_arg: u64) {
+    // Register this task, so the keyboard ISR knows who to wake
+    hardware_manager::keyboard_set_task_id(
+        task_scheduler::get_current_task_id());
+
+    loop {
+        // Drain everything currently in the ring buffer
+        while let Some(scancode) = hardware_manager::keyboard_pop_scancode() {
+            if let Some(ascii) = hardware_manager::process_scancode(scancode) {
+                // TODO:
+                // Placeholder system shutdown control sequence (CTRL+ALT+ESC),
+                // which returns as 0xFF for now.
+                if ascii == 0xFF {
+                    fbprint!("SHUTDOWN...");
+                    continue;
+                }
+
+                // Convert the single byte to a str slice and print it to
+                // serial and framebuffer for now.
+                let buf = [ascii];
+                if let Ok(s) = core::str::from_utf8(&buf) {
+                    sprint!("{}", s);
+                    fbprint!("{}", s);
+                }
+            }
+        }
+
+        // Buffer is empty, block until the ISR wakes us on the next key event
+        task_scheduler::yield_blocked();
+    }
+}
+
+
+fn task_a(_arg: u64) {
+    loop {
+        crate::hardware_manager::sprint("\n* HELLO from Process 1 Thread 1");
+        fbprint!("\n* HELLO from Process 1 Thread 1");
+        sleep(2);
+    }
+}
+
+fn task_b(_arg: u64) {
+    loop {
+    //for _ in 0..10 {
+        crate::hardware_manager::sprint("\n# HOWDY from Process 1 Thread 2");
+        fbprint!("\n# HOWDY from Process 1 Thread 2");
+        sleep(2);
+    }
+}
+
+fn task_fault(_arg: u64) {
+    for _ in 0..1_000_000 {
+        unsafe { core::arch::asm!("nop"); }
+    }
+    // Deliberately trigger a #DE divide by zero
+    unsafe {
+        core::arch::asm!(
+            "xor rdx, rdx",
+            "xor rax, rax",
+            "xor rcx, rcx",
+            "div rcx",
+            options(nomem, nostack)
+        );
+    }
+}
+
+fn task_c(_arg: u64) {
+    loop {
+        crate::hardware_manager::sprint("\n% HOLA from Process 2 Thread 1");
+        fbprint!("\n% HOLA from Process 2 Thread 1");
+        sleep(2);
     }
 }

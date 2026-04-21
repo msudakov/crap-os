@@ -1,9 +1,7 @@
-// =============================================================================
-// Framebuffer Printer Module
-// =============================================================================
-// 
-// This module contains the needed functionality to draw pixels in the
-// framebuffer.
+//! Framebuffer Printer Module
+//! 
+//! This module contains the needed functionality to draw pixels in the
+//! framebuffer.
 
 // Simple 8x12 bitmap font for ASCII characters 32-126, used for drawing text
 const FONT: [[u8; 12]; 95] = [

@@ -1,22 +1,20 @@
-// =============================================================================
-// Memory Manager Module
-// =============================================================================
-// 
-// The Memory Manager module is responsible for all physical and virtual memory
-// operations in the system.
-//
-// Higher-half virtual address space layout:
-//
-//   0xFFFF800000000000  Physical direct map base (64TB window, covers all RAM)
-//   0xFFFF900000000000  Framebuffer              (permanent virtual window)
-//   0xFFFFA00000000000  Kernel heap              64 MB max heap size
-//   0xFFFFFFFF80000000  Kernel image + stack     Sits in the top 2GB of the
-//                                                48-bit canonical address space
-//
-// UEFI runtime services are intentionally NOT mapped. ExitBootServices() was
-// already called in the bootloader, making SetVirtualAddressMap() illegal.
-// Shutdown and reset will be handled via ACPI and legacy port 0x64,
-// respectively, with zero firmware involvement at runtime.
+//! Memory Manager Module
+//! 
+//! The Memory Manager module is responsible for all physical and virtual memory
+//! operations in the system.
+//!
+//! Higher-half virtual address space layout:
+//!
+//!  0xFFFF800000000000  Physical direct map base (64TB window, covers all RAM)
+//!  0xFFFF900000000000  Framebuffer              (permanent virtual window)
+//!  0xFFFFA00000000000  Kernel heap              64 MB max heap size
+//!  0xFFFFFFFF80000000  Kernel image + stack     Sits in the top 2GB of the
+//!                                               48-bit canonical address space
+//!
+//! UEFI runtime services are intentionally NOT mapped. ExitBootServices() was
+//! already called in the bootloader, making SetVirtualAddressMap() illegal.
+//! Shutdown and reset will be handled via ACPI and legacy port 0x64,
+//! respectively, with zero firmware involvement at runtime.
 
 pub mod pmm;
 pub mod vmm;

@@ -9,6 +9,7 @@ macro_rules! mm {
     };
 }
 
+#[allow(dead_code)]
 pub fn test_memory_manager() {
     unsafe {
         let virt1: u64 = 0xFFFF_C000_0000_0000;
@@ -105,6 +106,7 @@ pub fn test_memory_manager() {
     }
 }
 
+#[allow(dead_code)]
 pub fn test_heap_allocator() {
     use alloc::vec::Vec;
     use alloc::boxed::Box;

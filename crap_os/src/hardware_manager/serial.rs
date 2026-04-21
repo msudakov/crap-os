@@ -1,9 +1,7 @@
-// =============================================================================
-// Serial Printer Module
-// =============================================================================
-// 
-// This module contains the needed functionality to write messages to a serial
-// port, mainly used for development and debugging.
+//! Serial Printer Module
+//! 
+//! This module contains the needed functionality to write messages to a serial
+//! port, mainly used for development and debugging.
 
 pub struct SerialWriter {
     pub port: u16,

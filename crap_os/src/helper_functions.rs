@@ -134,7 +134,7 @@ pub fn u64_to_dec_str(mut value: u64, buffer: &mut [u8; 20]) -> &str {
 /// * `value` - The `u64`` value to print.
 pub fn print_u64_field(label: &str, value: u64) {
     crate::hardware_manager::sprint(label);
-    let hex = crate::system_routines::u64_to_hex_bytes(value);
+    let hex = u64_to_hex_bytes(value);
     crate::hardware_manager::sprint(
         unsafe { 
             core::str::from_utf8_unchecked(&hex)
@@ -209,7 +209,7 @@ pub fn get_timer_ticks() -> u64 {
 /// enqueued, and false if it was already enqueued judging by its system flag.
 pub fn queue_dead_task_reaper_no_dupe() -> bool {
     let mut reaper_queued = false;
-    let flags = crate::system_routines::disable_interrupts_save();
+    let flags = disable_interrupts_save();
 
     if !crate::globals::SYS_FLAG_TASK_REAPER_QUEUED.load(Ordering::Relaxed) {
         crate::globals::SYS_FLAG_TASK_REAPER_QUEUED.store(
@@ -219,7 +219,7 @@ pub fn queue_dead_task_reaper_no_dupe() -> bool {
         reaper_queued = true;
     }
 
-    crate::system_routines::restore_interrupts(flags);
+    restore_interrupts(flags);
     reaper_queued
 }
 

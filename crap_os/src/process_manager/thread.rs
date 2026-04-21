@@ -251,7 +251,7 @@ impl Thread {
 
         // `SystemTask`routines accept a single u64 argument, so we use a helper
         // function to encode the two components of `TaskId` into a single u64.
-        let task_id_u64 = crate::system_routines::compress_task_id(
+        let task_id_u64 = crate::helper_functions::compress_task_id(
             self.task_id.unwrap());
 
         // Queue the task killer `SystemTask` to prepare the thread's task for

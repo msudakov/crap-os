@@ -58,7 +58,7 @@ use core::arch::naked_asm;  // used inside #[naked] trampolines
 use crate::gdt::KERNEL_CS;
 use crate::globals::IDT;
 use crate::hardware_manager;
-use crate::system_routines::print_u64_field;
+use crate::helper_functions::print_u64_field;
 
 // =============================================================================
 // InterruptFrame

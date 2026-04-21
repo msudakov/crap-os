@@ -538,7 +538,7 @@ pub fn task_exit() -> ! {
     // Enqueue the `dead_task_reaper` `SystemTask`, so tombstone cleanup runs
     // on the next timer tick. The reaper will find this task's slot marked
     // `Dead` and free it.
-    crate::system_routines::queue_dead_task_reaper_no_dupe();
+    crate::helper_functions::queue_dead_task_reaper_no_dupe();
 
     // With the status set to `Dead`, we now hand off to the next ready task.
     // This task will never be rescheduled, because `Dead` tasks are not

@@ -561,7 +561,7 @@ pub unsafe fn schedule() {
     // from firing between the lock drop and switch_to, which would cause a
     // recursive schedule() call with stale RSP values and corrupt scheduler
     // state.
-    let flags = crate::system_routines::disable_interrupts_save();
+    let flags = crate::helper_functions::disable_interrupts_save();
 
     // Critical section: read and update scheduler state.
     // We compute everything `switch_to` needs while the lock is held, extract
@@ -696,7 +696,7 @@ pub unsafe fn schedule() {
     // Finally, when the outgoing task gets back here, the interrupts are
     // restored to what they were. And if the task doesn't return here (i.e., it
     // finishes and exits or faults and gets reaped that way), that is fine too.
-    crate::system_routines::restore_interrupts(flags);
+    crate::helper_functions::restore_interrupts(flags);
 }
 
 /// Called from the APIC timer ISR on every tick. It performs two jobs:
@@ -900,7 +900,7 @@ pub fn tombstone_cleanup() {
         // TODO: for debugging purposes; can clean up later on.
         // Log how many tasks were cleaned up, so we can verify during testing.
         if crate::globals::DEBUG_LEVEL == crate::DebugLevel::INFO {
-            crate::system_routines::print_u64_field(
+            crate::helper_functions::print_u64_field(
                 "\n[REAPER] Tombstone cleanup reaped dead task(s): ",
                 tasks_reaped);
         }
@@ -929,7 +929,7 @@ pub fn kill_task(task_id_u64: u64) {
     // `SystemTask`routines accept a single u64 argument, so we use a helper
     // function to decode and expand the two components of `TaskId`, which were
     // encoded by the caller into the u64 parameter to this function.
-    let task_id = crate::system_routines::expand_task_id(task_id_u64);
+    let task_id = crate::helper_functions::expand_task_id(task_id_u64);
     
     // This checks if the task is currently executing on this CPU
     let is_current = {
@@ -988,5 +988,5 @@ pub fn kill_current_task() {
     // Enqueue the reaper, so the dead task's slot and stack are freed on the
     // next timer tick, by which point `schedule()` will have switched us away,
     // and the stack will no longer be in use.
-    crate::system_routines::queue_dead_task_reaper_no_dupe();
+    crate::helper_functions::queue_dead_task_reaper_no_dupe();
 }

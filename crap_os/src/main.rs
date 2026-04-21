@@ -6,7 +6,7 @@
 mod globals;
 mod spinlock;
 mod macros;
-mod system_routines;
+mod helper_functions;
 mod hardware_manager;
 mod memory_manager;
 mod system_core;

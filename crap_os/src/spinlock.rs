@@ -359,7 +359,7 @@ impl<T> IrqSpinLock<T> {
         // Capture current interrupt state and disable interrupts atomically.
         // `flags` holds the x86 RFLAGS value before CLI; specifically bit 9
         // (IF) tells us whether interrupts were enabled.
-        let flags = crate::system_routines::disable_interrupts_save();
+        let flags = crate::helper_functions::disable_interrupts_save();
         
         // Now that interrupts are off, acquire the SpinLock normally. This way,
         // no interrupt handler can sneak in and try to acquire the same
@@ -386,14 +386,14 @@ impl<T> IrqSpinLock<T> {
     pub fn try_lock(&self) -> Option<IrqSpinLockGuard<'_, T>> {
         // Disable interrupts first; we must not be preempted by an ISR between
         // checking the lock and acquiring it.
-        let flags = crate::system_routines::disable_interrupts_save();
+        let flags = crate::helper_functions::disable_interrupts_save();
         
         match self.0.try_lock() {
             Ok(guard) => Some(IrqSpinLockGuard { guard, flags }),
             Err(_) => {
                 // Lock is busy. Restore interrupt state before returning so
                 // the caller is not stuck with interrupts disabled.
-                crate::system_routines::restore_interrupts(flags);
+                crate::helper_functions::restore_interrupts(flags);
                 None
             }
         }
@@ -461,7 +461,7 @@ impl<T> Drop for IrqSpinLockGuard<'_, T> {
         unsafe { core::ptr::drop_in_place(&mut self.guard) };
 
         // With the guard dropped, it is now safe to restore interrupts
-        crate::system_routines::restore_interrupts(self.flags);
+        crate::helper_functions::restore_interrupts(self.flags);
     }
 }
 

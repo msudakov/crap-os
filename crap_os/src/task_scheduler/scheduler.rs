@@ -1029,6 +1029,7 @@ pub fn kill_current_task() {
 ///               valid no-op sleep: the task simply yields the remainder of its
 ///               current quantum and is immediately re-enqueued without ever
 ///               entering the sleep queue.
+#[allow(dead_code)]
 pub fn sleep(seconds: u32) {
     let task_id = get_current_task_id();
 

@@ -105,6 +105,8 @@ pub static mut GDT: Gdt = Gdt {
         GdtEntry::KERNEL_DATA64,  // 0x10 - kernel data
         GdtEntry::NULL,           // 0x18 - TSS low  (patched at runtime)
         GdtEntry::NULL,           // 0x20 - TSS high (patched at runtime)
+        GdtEntry::USER_DATA64,    // 0x2B - user data
+        GdtEntry::USER_CODE64,    // 0x33 - user code
     ],
 };
 

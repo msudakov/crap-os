@@ -170,9 +170,6 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     unsafe { crate::gdt::init_gdt(); }  // Initialize Global Descriptor Table
     unsafe { crate::idt::init_idt(); }  // Initialize Interrupt Descriptor Table
 
-    // TEST new GDT
-    gdt::verify_gdt();
-
     // Initialize framebuffer writer for global macros
     {
         let mut writer = globals::FRAMEBUFFER.lock();
@@ -285,7 +282,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     fbprintln!("[*] Testing keyboard interrupts. Type some stuff...");
 
     // Create Test process
-    /*let test_process_1 = globals::PROCESS_MANAGER.create_process(
+    let test_process_1 = globals::PROCESS_MANAGER.create_process(
         "Test Proc 1",
         cr3,
         task_a,
@@ -301,7 +298,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     ).expect("Failed to create test process");
     test_process_2.spawn_thread("Fault task", task_fault, 0).expect("failed to spawn Fault Task");
     let thread_c = test_process_2.spawn_thread("Task C", task_c, 0).expect("failed to spawn task C");
-    crate::process_manager::thread::exit_thread(thread_c);*/
+    //crate::process_manager::thread::exit_thread(thread_c);
 
 
     // Signal the Task Scheduler that the kernel has completed its

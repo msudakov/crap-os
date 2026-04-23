@@ -333,6 +333,32 @@ pub struct Task {
     /// switch-away and will be overwritten by the next `switch_to`).
     pub saved_rsp: u64,
 
+    /// The fixed top of the kernel stack allocated for this task, used to
+    /// populate TSS.rsp[0], so the CPU has somewhere to land on ring 3 -> ring
+    /// 0 transitions. Every task, including user tasks, has one of these,
+    /// because even user tasks need a kernel stack to handle their interrupts
+    /// and syscalls.
+    pub kernel_stack_top: u64,
+
+    /// The top of the stack mapped in user virtual address space, used to set
+    /// RSP in the `iretq` frame when first entering ring 3. Only user tasks
+    /// have this.
+    pub _user_stack_top: u64,
+
+    /// Used to signal the scheduler and context switcher whether `TSS.rsp[0]`
+    /// needs to be updated on context switch. If this is true, `TSS.rsp[0]` is
+    /// updated on switch; otherwise (i.e., it's a kernel task), the update is
+    /// skipped on switch.
+    pub is_user_task: bool,
+    
+    /// The read-only PML4 address value cached from the parent process field
+    /// [`crate::process_manager::process::Process::cr3`]. It is used for fast
+    /// checking whether `TSS.rsp[0]` needs to be updated when the scheduler's
+    /// [`crate::task_scheduler::scheduler::schedule`] routine calls
+    /// [`crate::task_scheduler::switcher::switch_to`]. Having this value cached
+    /// here saves critical time during context switches.
+    pub cr3: u64,
+
     /// The number of system clock ticks remaining in the quantum of this task.
     /// 
     /// This starts out at max quantum ticks and gets decremented every clock
@@ -405,14 +431,22 @@ impl Task {
         // value at that moment, making the idle task resumable. The state is
         // initialized to `Running` because this task is the currently
         // executing context at the time `new_idle` is called.
+        //
+        // `kernel_stack_top` is set to 0, as the idle task never runs in ring
+        // 3; so, TSS.rsp[0] is always overwritten before any user task runs.
+        // Thus, initializing it to 0 here is safe.
         Task {
-            id:              TaskId::IDLE,
-            state:           TaskState::Running,
-            saved_rsp:       0,
-            ticks_remaining: crate::globals::TASK_QUANTUM_TICKS,
-            ticks_executed:  AtomicU64::new(0),
+            id:               TaskId::IDLE,
+            state:            TaskState::Running,
+            saved_rsp:        0,
+            kernel_stack_top: 0,
+            _user_stack_top:  0,
+            is_user_task:     false,
+            cr3:              0,
+            ticks_remaining:  crate::globals::TASK_QUANTUM_TICKS,
+            ticks_executed:   AtomicU64::new(0),
             thread,
-            _stack:          stack,
+            _stack:           stack,
         }
     }
 
@@ -462,7 +496,11 @@ impl Task {
         // pops the frame and executes `ret`, RSP lands on a 16-byte aligned
         // address as required by the ABI. The `& !0xF` mask clears the low 4
         // bits, rounding down to 16 bytes.
-        //let stack_top = stack.as_mut_ptr() as usize + TASK_STACK_SIZE;
+        //
+        // `stack_top` is the highest usable address in this task's kernel
+        // stack, aligned to 16 bytes. This is what `TSS.rsp[0]` must point to,
+        // so that the CPU lands on a valid stack when entering the kernel from
+        // ring 3.
         let stack_top = (stack.as_mut_ptr() as usize + TASK_STACK_SIZE) & !0xF;
         let frame_ptr = ((stack_top - core::mem::size_of::<InitialFrame>())
             & !0xF) as *mut InitialFrame;
@@ -503,6 +541,10 @@ impl Task {
             id: TaskId::PENDING, // Gets replaced with proper ID after insertion
             state: TaskState::Ready,
             saved_rsp,
+            kernel_stack_top: stack_top as u64,
+            _user_stack_top: 0,
+            is_user_task: false,
+            cr3: 0,  // Kernel task, so no CR3 switch needed
             ticks_remaining: crate::globals::TASK_QUANTUM_TICKS,
             ticks_executed: AtomicU64::new(0),
             thread,

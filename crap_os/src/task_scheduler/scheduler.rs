@@ -569,7 +569,7 @@ pub unsafe fn schedule() {
     // We have to use raw values instead of references because a reference into
     // `scheduler` would borrow the `MutexGuard`, keeping the lock alive. We
     // need the lock released before `switch_to`, so we must copy the data out.
-    let (old_rsp_ptr, new_rsp) = {
+    let (old_rsp_ptr, new_rsp, new_cr3) = {
         let mut scheduler = SCHEDULER.lock();
 
         // Dequeue the next ready task.
@@ -652,12 +652,23 @@ pub unsafe fn schedule() {
             .map(|task| &mut task.saved_rsp as *mut u64)
             .unwrap_or(core::ptr::null_mut());
 
-        let new_rsp = scheduler
-            .get_task(next_id)
-            .map(|task| task.saved_rsp)
-            .unwrap_or(0);
+        // Get a reference to the incoming task for CR3 and stack top settings
+        let next_task = scheduler.get_task(next_id).unwrap();
 
-        (old_rsp_ptr, new_rsp)
+        // Only update TSS.rsp[0] if the incoming task can actually run in ring
+        // 3. Kernel-only tasks (including idle) never transition to ring 3, so
+        // the TSS kernel stack is irrelevant for them. Skipping the update also
+        // avoids clobbering a valid TSS entry with a meaningless value when
+        // switching between two kernel tasks.
+        if next_task.is_user_task {
+            crate::gdt::set_kernel_stack(next_task.kernel_stack_top);
+        }
+
+        // Fetch the new CR3 and saved RSP variables to pass to the switcher
+        let new_rsp = next_task.saved_rsp;
+        let new_cr3 = next_task.cr3;
+
+        (old_rsp_ptr, new_rsp, new_cr3)
 
         // The lock is released here.
     };

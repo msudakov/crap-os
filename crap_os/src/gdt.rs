@@ -208,6 +208,7 @@ impl GdtEntry {
     /// 32 bits wide); the high half carries the upper 32 bits of the base.
     ///
     /// # Arguments
+    /// 
     /// * `base`  - Virtual address of the `TSS` struct.
     /// * `limit` - `size_of::<Tss>() - 1` (the CPU adds 1 internally).
     pub fn tss_low(base: u64, limit: u32) -> Self {
@@ -249,6 +250,7 @@ impl GdtEntry {
     ///  63:32        | Reserved; must be zero (CPU may raise #GP if non-zero)
     ///
     /// # Arguments
+    /// 
     /// * `base` - The same virtual address passed to `tss_low`.
     pub fn tss_high(base: u64) -> Self {
         // Shift away the lower 32 bits that were encoded in the low half.
@@ -482,4 +484,29 @@ pub unsafe fn init_gdt() {
         "ltr ax",
         in("ax") TSS_SELECTOR,
     );
+}
+
+/// Updates `TSS.rsp[0]` to point to the given kernel stack top.
+///
+/// This must be called on every context switch to the incoming task, before
+/// that task starts executing. The CPU reads `TSS.rsp[0]` on every ring-3  to
+/// ring-0 transition (interrupts, syscalls, etc.) to find the kernel stack, so
+/// it must always reflect the currently running task's kernel stack.
+/// 
+/// # Arguments
+/// 
+/// * `stack_top` - The given kernel stack top to update `TSS.rsp[0]` with.
+#[inline]
+pub fn set_kernel_stack(stack_top: u64) {
+    unsafe { TSS.rsp[0] = stack_top };
+
+    // Verification: read back and confirm the write took effect.
+    // Remove once step 6 (user threads) is working.
+    unsafe {
+        let rsp0 = core::ptr::addr_of!(TSS.rsp[0]).read_unaligned();
+        debug_assert_eq!(
+            rsp0, stack_top,
+            "TSS.rsp[0] write did not take effect"
+        );
+    }
 }

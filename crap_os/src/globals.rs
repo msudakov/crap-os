@@ -142,13 +142,6 @@ pub static HPET: StaticIrqSpinLock<Option<HpetInfo>> =
 /// ready to be executed in the Task Scheduler's queue.
 pub static SYS_FLAG_KERNEL_INIT_COMPLETE: AtomicBool = AtomicBool::new(false);
 
-/// Atomic boolean flag to track if the dead task reaper `SystemTask` (and its
-/// tombstone cleanup routine) has been added to the system task queue. Since
-/// that SystemTask can be enqueued from several locations, this flag helps
-/// avoid double-queueing that would otherwise waste the CPU time in the middle
-/// of the timer tick processing and task scheduling.
-pub static SYS_FLAG_TASK_REAPER_QUEUED: AtomicBool = AtomicBool::new(false);
-
 /// Atomic boolean flag used to signal the timer ISR to disregard the result of
 /// task quantum check and force the scheduler to run regardless. This is set
 /// by `SystemTask` routines tied to task and process management; e.g., when a

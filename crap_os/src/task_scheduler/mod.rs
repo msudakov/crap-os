@@ -9,10 +9,12 @@
 mod switcher;
 pub mod task;
 pub mod scheduler;
+pub mod reaper;
 pub(super) mod sleep_queue;
 
 // Re-export public APIs
 pub use scheduler::{SchedulerError, init_idle, on_timer_tick, schedule, wake,
-    insert_and_queue_task, yield_blocked, get_current_task_id,
-    tombstone_cleanup, kill_current_task, sleep};
+    insert_and_queue_task, yield_blocked, get_current_task_id, sleep,
+    kill_current_task};
 pub use task::TaskId;
+pub use reaper::{queue_task_reaper, reap_dying_tasks, tombstone_cleanup};

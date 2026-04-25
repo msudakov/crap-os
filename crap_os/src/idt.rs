@@ -839,6 +839,15 @@ extern "C" fn handler_apic_timer(_frame: &InterruptFrame) {
     // before any normal task gets the CPU.
     crate::system_core::drain_system_tasks();
 
+    // Drain tombstone cleanup queue first, so that the tasks the reaper
+    // transitions from dying to dead on this tick are guaranteed another tick
+    // before they get cleaned up and dropped completely.
+    crate::task_scheduler::tombstone_cleanup();
+
+    // Drain task reaper queue, marking dying tasks as dead and enqueueing them
+    // for tombstone cleanup in the following timer tick.
+    crate::task_scheduler::reap_dying_tasks();
+
     // Check if a SystemTask has set the force reschedule flag, and reset it
     if crate::globals::SYS_FLAG_FORCE_RESCHEDULE.load(Ordering::Relaxed) {
         should_schedule = true;

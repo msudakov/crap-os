@@ -21,6 +21,7 @@ use core::sync::atomic::AtomicU64;
 use alloc::sync::Weak;
 use alloc::boxed::Box;
 use crate::spinlock::IrqSpinLock;
+use crate::task_scheduler::queue_task_reaper;
 use crate::process_manager::thread::{Thread, ThreadState};
 
 /// Uniquely identifies a task within the scheduler's task table.
@@ -96,12 +97,19 @@ impl TaskId {
 //        |                                  v
 //        |    event arrives (wake)     +---------+
 //        ----------------------------- | Blocked |
-//                                      +----|----+
+//                                      +---------+
+//                                           |
 //                                           | (and eventually...)
-//                                           v
-//                                     +----------+
-//                                     |   Dead   |
-//                                     +----------+
+//                                           V
+//                                     +-----------+
+//                                     |   Dying   |
+//                                     +-----------+
+//                                           |
+//                                           |
+//                                           V
+//                                     +-----------+
+//                                     |    Dead   |
+//                                     +-----------+
 
 /// The lifecycle state of a task as tracked by the scheduler.
 #[allow(dead_code)]
@@ -123,9 +131,15 @@ pub enum TaskState {
 
     /// The task has finished executing (its entry function returned, or it
     /// explicitly terminated itself) or faulted. The `Task` struct (and its
-    /// stack allocation) remains alive until the scheduler performs a
-    /// "tombstone cleanup" on the next scheduling pass, at which point the
-    /// `Task` is dropped and the stack is freed.
+    /// stack allocation) remains alive until the task reaper runs and marks
+    /// it as [`TaskState::Dead`] on the next timer tick.
+    Dying,
+
+    /// The reaper has marked the task as dead, and the scheduler will perform
+    /// tombstone cleanup on the next scheduling pass, at which point the
+    /// `Task` is dropped and the stack is freed. During the tombstone cleanup,
+    /// the task's parent thread will also be marked as [`ThreadState::Dead`],
+    /// just before the task is dropped.
     Dead,
 }
 
@@ -556,39 +570,51 @@ impl Task {
 /// Handles a task's normal return and exit.
 /// 
 /// This gets called automatically by `task_entry_stub` when a task's entry
-/// function returns normally. It marks the current task as `Dead`, marks its
+/// function returns normally. It marks the current task as `Dying`, marks its
 /// parent `Thread` as `Dying`, and immediately yields to the scheduler. The
-/// actual stack and task table cleanup (tombstone cleanup) is deferred to the
-/// `dead_task_reaper` `SystemTask`, which runs at the next timer tick. This
-/// function never returns.
+/// actual stack and task table cleanup (tombstone cleanup) are deferred by two
+/// timer ticks. This function never returns.
 pub fn task_exit() -> ! {
-    // Mark this task as `Dead`. We do this in a block, so the scheduler lock
+    // Disable interrupts for the entire exit sequence to close the race
+    // window between marking this task Dying and calling schedule(). If a
+    // timer fires between those two points, schedule() will see a Dying task
+    // as current and produce a null old_rsp_ptr, corrupting the switch.
+    // schedule() will re-enable interrupts after the switch via
+    // restore_interrupts(), so we don't need to restore them here.
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+
+    // Mark this task as `Dying`. We do this in a block, so the scheduler lock
     // is dropped before we call `schedule()` (which will acquire it again
     // internally), and we must not hold it across that call.
     {
         let mut scheduler = super::scheduler::SCHEDULER.lock();
         let this_id = scheduler.current;
         if let Some(task) = scheduler.get_task_mut(this_id) {
-            task.state = TaskState::Dead;
+            task.state = TaskState::Dying;
 
             // We also mark the task's parent thread as dying
             task.thread.upgrade().unwrap().lock().state = ThreadState::Dying;
+
+            // Queue task reaper to mark the task as dead on the next tick
+            if queue_task_reaper(this_id).is_err() {
+                crate::hardware_manager::sprint(
+                    "\n[REAPER] Failed to queue task reaper...\n");
+            }
+            else {
+                crate::hardware_manager::sprint(
+                    "\n[REAPER] Task exited\n");
+            }
         }
         // The lock is dropped here
     }
 
-    // Enqueue the `dead_task_reaper` `SystemTask`, so tombstone cleanup runs
-    // on the next timer tick. The reaper will find this task's slot marked
-    // `Dead` and free it.
-    crate::helper_functions::queue_dead_task_reaper_no_dupe();
-
-    // With the status set to `Dead`, we now hand off to the next ready task.
-    // This task will never be rescheduled, because `Dead` tasks are not
+    // With the status set to `Dying`, we now hand off to the next ready task.
+    // This task will never be rescheduled, because `Dying` tasks are not
     // re-queued. The reaper will free this task's stack at the next timer tick,
     // by which point we are no longer running on it.
     unsafe { super::scheduler::schedule() };
 
     // Truly unreachable, as `schedule()` switches the stack away and never
-    // returns to a `Dead` task. If we somehow land here, fault loudly.
-    unreachable!("task_exit: schedule() returned to a dead task");
+    // returns to a `Dying` task. If we somehow land here, fault loudly.
+    unreachable!("task_exit: schedule() returned to a dying/dead task");
 }

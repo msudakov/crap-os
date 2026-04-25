@@ -290,15 +290,15 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     ).expect("Failed to create test process");
     test_process_1.spawn_thread("P1 T2", task_b, 0).expect("failed to spawn task B");
     
-    let test_process_2 = globals::PROCESS_MANAGER.create_process(
-        "Test Proc 2",
-        cr3,
-        task_c,
-        0
-    ).expect("Failed to create test process");
-    test_process_2.spawn_thread("Fault task", task_fault, 0).expect("failed to spawn Fault Task");
-    let thread_c = test_process_2.spawn_thread("Task C", task_c, 0).expect("failed to spawn task C");
-    //crate::process_manager::thread::exit_thread(thread_c);
+    //let test_process_2 = globals::PROCESS_MANAGER.create_process(
+    //    "Test Proc 2",
+    //    cr3,
+    //    task_c,
+    //    0
+    //).expect("Failed to create test process");
+    test_process_1.spawn_thread("Fault task", task_fault, 0).expect("failed to spawn Fault Task");
+    let thread_c = test_process_1.spawn_thread("Task C", task_c, 0).expect("failed to spawn task C");
+    crate::process_manager::thread::exit_thread(thread_c);
 
 
     // Signal the Task Scheduler that the kernel has completed its
@@ -312,7 +312,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // re-enable maskable hardware interrupts.
     unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
 
-    globals::PROCESS_MANAGER.print_processes();
+    //globals::PROCESS_MANAGER.print_processes();
 
     // Enter halt loop on the idle task
     let mut count = 0;
@@ -409,19 +409,21 @@ fn task_keyboard(_arg: u64) {
 #[allow(dead_code)]
 fn task_a(_arg: u64) {
     loop {
-        crate::hardware_manager::sprint("\n* HELLO from Process 1 Thread 1");
-        fbprint!("\n* HELLO from Process 1 Thread 1");
-        sleep(2);
+        //crate::hardware_manager::sprint("\n* HELLO from Process 1 Thread 1");
+        //fbprint!("\n* HELLO from Process 1 Thread 1");
+        crate::hardware_manager::sprint("A");
+        sleep(1);
     }
 }
 
 #[allow(dead_code)]
 fn task_b(_arg: u64) {
-    loop {
-    //for _ in 0..10 {
-        crate::hardware_manager::sprint("\n# HOWDY from Process 1 Thread 2");
-        fbprint!("\n# HOWDY from Process 1 Thread 2");
-        sleep(2);
+    //loop {
+    for _ in 0..3 {
+        crate::hardware_manager::sprint("Hello, world");
+        //crate::hardware_manager::sprint("\n# HOWDY from Process 1 Thread 2");
+        //fbprint!("\n# HOWDY from Process 1 Thread 2");
+        sleep(1);
     }
 }
 
@@ -445,8 +447,9 @@ fn task_fault(_arg: u64) {
 #[allow(dead_code)]
 fn task_c(_arg: u64) {
     loop {
-        crate::hardware_manager::sprint("\n% HOLA from Process 2 Thread 1");
-        fbprint!("\n% HOLA from Process 2 Thread 1");
-        sleep(2);
+        //crate::hardware_manager::sprint("\n% HOLA from Process 2 Thread 1");
+        //fbprint!("\n% HOLA from Process 2 Thread 1");
+        crate::hardware_manager::sprint(".");
+        sleep(1);
     }
 }

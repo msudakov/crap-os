@@ -197,32 +197,6 @@ pub fn get_timer_ticks() -> u64 {
     crate::globals::TIMER_TICKS.load(Ordering::Relaxed)
 }
 
-/// Queues the dead task reaper SystemTask if its global system flag shows that
-/// it is not currently in the system task queue. Since that SystemTask can be
-/// enqueued from several locations, this function helps avoid double-queueing
-/// that would otherwise waste the CPU time in the middle of the timer tick
-/// processing and task scheduling.
-/// 
-/// # Returns
-/// 
-/// Returns true if the SystemTask was not in queue and has been successfully
-/// enqueued, and false if it was already enqueued judging by its system flag.
-pub fn queue_dead_task_reaper_no_dupe() -> bool {
-    let mut reaper_queued = false;
-    let flags = disable_interrupts_save();
-
-    if !crate::globals::SYS_FLAG_TASK_REAPER_QUEUED.load(Ordering::Relaxed) {
-        crate::globals::SYS_FLAG_TASK_REAPER_QUEUED.store(
-            true, core::sync::atomic::Ordering::SeqCst);
-        crate::system_core::queue_system_task(
-            crate::system_core::system_tasks::dead_task_reaper, 0);
-        reaper_queued = true;
-    }
-
-    restore_interrupts(flags);
-    reaper_queued
-}
-
 /// Encodes the `slot_index` and `slot_generation` fields of `TaskId` into a
 /// single u64 value.
 /// 

@@ -155,10 +155,13 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     // Initialize serial port writer for global macros
     {
+        hardware_manager::sprint("TEST 1\n");
         let mut writer = globals::SERIAL.lock();
+        hardware_manager::sprint("TEST 2\n");
         *writer = Some(hardware_manager::SerialWriter::new(
             globals::COM1_PORT,
         ));
+        hardware_manager::sprint("TEST 3\n");
     }
 
     // We can now use serial port IRQ-safe global spinlock macros

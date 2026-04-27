@@ -50,6 +50,7 @@ use crate::spinlock::IrqSpinLock;
 use super::thread::{Thread, ThreadId};
 use crate::task_scheduler::{insert_and_queue_task, SchedulerError};
 use crate::task_scheduler::task::Task;
+use crate::memory_manager::AddressSpace;
 
 /// Uniquely identifies a process within the process manager.
 ///
@@ -119,12 +120,18 @@ pub struct Process {
     /// Human-readable name for this process, used in debug output and logging.
     pub name: &'static str,
 
-    /// Physical address of this process's page table root (CR3 register value).
+    /*/// Physical address of this process's page table root (CR3 register value).
     ///
     /// Reserved for future user mode support. All current kernel processes
     /// share the same address space, so this field is stored at construction
     /// but not yet acted upon.
-    pub cr3: u64,
+    pub cr3: u64,*/
+
+
+
+    pub address_space: AddressSpace,
+
+
 
     /// The list of threads owned by this process.
     ///
@@ -156,7 +163,8 @@ impl Process {
         Arc::new(Process {
             id: ProcessId::next(),
             name,
-            cr3,
+            // Kernel processes wrap their existing PML4 - no new allocation
+            address_space: AddressSpace::from_existing(cr3),
             threads: IrqSpinLock::new(Vec::new()),
         })
     }
@@ -180,9 +188,17 @@ impl Process {
         Arc::new(Process {
             id: ProcessId::IDLE,
             name: "Idle",
-            cr3,
+            // Kernel processes wrap their existing PML4 - no new allocation
+            address_space: AddressSpace::from_existing(cr3),
             threads: IrqSpinLock::new(Vec::new()),
         })
+    }
+
+    /// Return the physical address of this process's PML4, suitable for
+    /// loading into CR3 or caching in a Task.
+    #[inline]
+    pub fn pml4_phys(&self) -> u64 {
+        self.address_space.pml4_phys
     }
 
     /// Spawns a new thread in this process.

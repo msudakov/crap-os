@@ -20,16 +20,18 @@ pub mod pmm;
 pub mod vmm;
 pub mod kernel_heap;
 pub mod manager;
+pub mod address_space;
 
 // Re-export public APIs
 pub use manager::MemoryManager;
 pub use pmm::{PhysicalMemoryManager, page_overlaps};
 pub use vmm::{init_page_tables};
 pub use kernel_heap::{LockedHeap, GlobalHeapAllocator};
+pub use address_space::AddressSpace;
 
 pub const PRESENT: u64 = 1 << 0;   // Must be 1 for the entry to be valid
 pub const WRITABLE: u64 = 1 << 1;  // If 1, writes are allowed; if 0, read-only
-// pub const USER: u64 = 1 << 2;     // If 1, user-mode access is allowed
+pub const USER: u64 = 1 << 2;      // If 1, user-mode access is allowed
 pub const PWT: u64 = 1 << 3;       // Page Write-Through
 pub const PCD: u64 = 1 << 4;       // Page Cache Disable
 pub const NX: u64 = 1 << 63;       // No-Execute bit

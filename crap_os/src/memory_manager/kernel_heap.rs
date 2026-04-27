@@ -261,7 +261,8 @@ impl KernelHeap {
 
                 // Map virtual to physical in the kernel's page tables.
                 unsafe {
-                    mm.map_page(virt_addr, phys_addr, PRESENT | WRITABLE | NX)
+                    mm.map_page(virt_addr, phys_addr, PRESENT | WRITABLE | NX,
+                        false)
                 };
             }
         } // MEMORY_MANAGER lock dropped here, and interrupts are re-enabled

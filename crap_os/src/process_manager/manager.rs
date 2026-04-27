@@ -159,8 +159,8 @@ impl ProcessManager {
         for proc in processes.iter() {
             sprintln!("\n========== PROCESS INFORMATION ==========");
             fbprintln!("\n========== PROCESS INFORMATION ==========");
-            sprintln!("Process: {} (ID: {}, PML4: {:#X})", proc.name, proc.id.as_u64(), proc.cr3);
-            fbprintln!("Process: {} (ID: {}, PML4: {:#X})", proc.name, proc.id.as_u64(), proc.cr3);
+            sprintln!("Process: {} (ID: {}, PML4: {:#X})", proc.name, proc.id.as_u64(), proc.pml4_phys());
+            fbprintln!("Process: {} (ID: {}, PML4: {:#X})", proc.name, proc.id.as_u64(), proc.pml4_phys());
 
             {
                 let threads = proc.threads.lock();

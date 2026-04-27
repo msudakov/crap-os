@@ -600,10 +600,6 @@ pub fn task_exit() -> ! {
                 crate::hardware_manager::sprint(
                     "\n[REAPER] Failed to queue task reaper...\n");
             }
-            else {
-                crate::hardware_manager::sprint(
-                    "\n[REAPER] Task exited\n");
-            }
         }
         // The lock is dropped here
     }

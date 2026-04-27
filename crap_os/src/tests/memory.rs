@@ -22,7 +22,7 @@ pub fn test_memory_manager() {
         // get_physical_addr resolves it correctly.
         // =====================================================================
         let phys1 = mm!().alloc_page().expect("Test 1: alloc failed");
-        mm!().map_page(virt1, phys1, PRESENT | WRITABLE);
+        mm!().map_page(virt1, phys1, PRESENT | WRITABLE, false);
 
         match mm!().get_physical_addr(virt1) {
             Some(resolved) => assert!(resolved == phys1,
@@ -59,7 +59,7 @@ pub fn test_memory_manager() {
         // should not be back in the free list yet.
         // =====================================================================
         let phys3 = mm!().alloc_page().expect("Test 3: alloc failed");
-        mm!().map_page(virt2, phys3, PRESENT | WRITABLE);
+        mm!().map_page(virt2, phys3, PRESENT | WRITABLE, false);
         mm!().unmap_page(virt2);
 
         assert!(mm!().get_physical_addr(virt2).is_none(),
@@ -89,7 +89,7 @@ pub fn test_memory_manager() {
         // =====================================================================
         let free_before = mm!().free_page_count();
         let phys5 = mm!().alloc_page().expect("Test 5: alloc failed");
-        mm!().map_page(virt4, phys5, PRESENT | WRITABLE);
+        mm!().map_page(virt4, phys5, PRESENT | WRITABLE, false);
 
         // Mapping consumed: 1 data page + 1 PT + 1 PD + 1 PDPT = 4 pages
         assert!(mm!().free_page_count() == free_before - 4,

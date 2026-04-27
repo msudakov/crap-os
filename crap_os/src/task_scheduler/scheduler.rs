@@ -691,18 +691,19 @@ pub unsafe fn schedule() {
     // Perform the context switch. No lock is held at this point, but the
     // interrupts must still be disabled across the call to `switch_to`.
     //  The assembly code in `switch_to` will:
-    //   1. Push callee-saved registers onto the outgoing task's stack;
-    //   2. Write RSP into the outgoing task's `saved_rsp`;
-    //   3. Load RSP from the incoming task's stack;
-    //   4. Pop callee-saved registers from the incoming task's stack;
-    //   5. Execute `ret`, jumping into the incoming task's execution context.
+    //    - Push callee-saved registers onto the outgoing task's stack;
+    //    - Write RSP into the outgoing task's `saved_rsp`;
+    //    - Load RSP from the incoming task's stack;
+    //    - Conditionally reload CR3
+    //    - Pop callee-saved registers from the incoming task's stack;
+    //    - Execute `ret`, jumping into the incoming task's execution context.
     //
     // From the outgoing task's perspective, this function call "returns" the
     // next time it is selected as the incoming task in a future `schedule()`
     // invocation. From the incoming task's perspective it either:
     //   - Returns from a prior `switch_to` call (previously-run task), or
     //   - Enters `task_entry_stub` for the first time (brand-new task).
-    unsafe { switch_to(old_rsp_ptr, new_rsp) };
+    unsafe { switch_to(old_rsp_ptr, new_rsp, new_cr3) };
 
     // Finally, when the outgoing task gets back here, the interrupts are
     // restored to what they were. And if the task doesn't return here (i.e., it
@@ -969,10 +970,6 @@ pub fn kill_current_task() {
             if queue_task_reaper(this_id).is_err() {
                 crate::hardware_manager::sprint(
                     "\n[REAPER] Failed to queue task reaper...\n");
-            }
-            else {
-                crate::hardware_manager::sprint(
-                    "\n[REAPER] Reaper queued .\n");
             }
         }
     }  // The lock is released here

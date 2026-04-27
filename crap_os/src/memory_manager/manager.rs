@@ -218,12 +218,16 @@ impl MemoryManager {
     /// use by the kernel. `physical_addr` must be a PMM-owned physical page.
     /// Mapping a page that is already mapped to a different frame silently
     /// overwrites the PTE.
-    pub unsafe fn map_page(&mut self, virtual_addr: u64, physical_addr: u64,
-        flags: u64
+    pub unsafe fn map_page(
+        &mut self,
+        virtual_addr: u64,
+        physical_addr: u64,
+        flags: u64,
+        is_user_page: bool,
     ) {
         unsafe {
             vmm::map_page(&mut self.pmm, self.pml4, virtual_addr, physical_addr,
-                flags);
+                flags, is_user_page);
         }
     }
 

@@ -22,7 +22,7 @@
 //! in the CPU chip package, uses the CR3 register to locate the PML4. It then
 //! traverses the levels to resolve the final physical address.
 
-use crate::memory_manager::{PRESENT, WRITABLE, PWT, PCD, NX};
+use crate::memory_manager::{PRESENT, WRITABLE, USER, PWT, PCD, NX};
 use crate::memory_manager::{MemoryMapInfo, EfiMemoryDescriptor, EfiMemoryType};
 use crate::memory_manager::{PhysicalMemoryManager, page_overlaps};
 use crate::globals::{KERNEL_PHYSICAL_MAP_BASE, KERNEL_VIRTUAL_BASE, PAGE_SIZE,
@@ -33,9 +33,12 @@ use crate::globals::{KERNEL_PHYSICAL_MAP_BASE, KERNEL_VIRTUAL_BASE, PAGE_SIZE,
 /// 
 /// # Arguments
 ///
-/// * `pmm`   - Physical memory manager.
-/// * `table` - Address of the page table to look up or create if not exists.
-/// * `index` - Page table index from previous lookup level.
+/// * `pmm`                - Physical memory manager.
+/// * `table`              - Address of the page table to look up or create
+///                          if not exists.
+/// * `index`              - Page table index from previous lookup level.
+/// * `intermediate_flags` - Flags used by user-space page table walks to 
+///                          propagate USER bit through all intermediate levels.
 /// 
 /// # Returns
 /// 
@@ -46,8 +49,11 @@ use crate::globals::{KERNEL_PHYSICAL_MAP_BASE, KERNEL_VIRTUAL_BASE, PAGE_SIZE,
 /// Dereferences raw pointers.
 /// `table` must be a valid, aligned pointer to a mapped 512-entry page table.
 /// `index` must be in range [0, 511]. The PMM must be in a consistent state.
-unsafe fn get_or_create_table(pmm: &mut PhysicalMemoryManager, table: *mut u64,
-    index: u64
+unsafe fn get_or_create_table(
+    pmm: &mut PhysicalMemoryManager,
+    table: *mut u64,
+    index: u64,
+    intermediate_flags: u64,
 ) -> *mut u64 {
     unsafe {
         let entry = table.add(index as usize);
@@ -61,7 +67,10 @@ unsafe fn get_or_create_table(pmm: &mut PhysicalMemoryManager, table: *mut u64,
                 new_table_phys
             };
             zero_out_page(new_table_virt);
-            *entry = new_table_phys | PRESENT | WRITABLE;
+
+            // Use caller-supplied flags so user-space page table walks
+            // propagate USER through all intermediate levels.
+            *entry = new_table_phys | intermediate_flags;
         }
 
         let phys = *entry & !0xFFF;
@@ -85,6 +94,14 @@ unsafe fn get_or_create_table(pmm: &mut PhysicalMemoryManager, table: *mut u64,
 /// * `virtual_addr`  - Virtual page address to map.
 /// * `physical_addr` - Physical page address to map to.
 /// * `flags`         - Virtual page flags to include in the mapping.
+/// * `is_user_page`  - If true, any newly-created intermediate tables (PDPT,
+///     PD, PT) will be marked with PRESENT | WRITABLE | USER. This is required
+///     for user-mode pages, as the CPU checks the USER flag at every level of
+///     the walk, not just the final PTE. Existing intermediate tables are not
+///     modified, so the caller must ensure they were originally created with
+///     the correct flags. If set to false, intermediate tables are marked
+///     PRESENT | WRITABLE (supervisor only), which is correct for all kernel
+///     mappings.
 /// 
 /// # Safety
 /// 
@@ -93,17 +110,34 @@ unsafe fn get_or_create_table(pmm: &mut PhysicalMemoryManager, table: *mut u64,
 /// be a real, PMM-owned physical page address. Caller must ensure the virtual
 /// address is not already mapped to a different frame unless intentionally
 /// remapping.
-pub unsafe fn map_page(pmm: &mut PhysicalMemoryManager, pml4_addr: *mut u64,
-    virtual_addr: u64, physical_addr: u64, flags: u64
+pub unsafe fn map_page(
+    pmm: &mut PhysicalMemoryManager,
+    pml4_addr: *mut u64,
+    virtual_addr: u64,
+    physical_addr: u64,
+    flags: u64,
+    is_user_page: bool,
 ) {
+    let intermediate_flags = if is_user_page {
+        PRESENT | WRITABLE | USER
+    } else {
+        PRESENT | WRITABLE
+    };
+
     let pml4_index = (virtual_addr >> 39) & 0x1FF;
     let pdpt_index = (virtual_addr >> 30) & 0x1FF;
     let pd_index   = (virtual_addr >> 21) & 0x1FF;
     let pt_index   = (virtual_addr >> 12) & 0x1FF;
 
-    let pdpt = unsafe { get_or_create_table(pmm, pml4_addr, pml4_index) };
-    let pd   = unsafe { get_or_create_table(pmm, pdpt, pdpt_index) };
-    let pt   = unsafe { get_or_create_table(pmm, pd, pd_index) };
+    let pdpt = unsafe {
+        get_or_create_table(pmm, pml4_addr, pml4_index, intermediate_flags)
+    };
+    let pd   = unsafe {
+        get_or_create_table(pmm, pdpt, pdpt_index, intermediate_flags)
+    };
+    let pt   = unsafe {
+        get_or_create_table(pmm, pd, pd_index, intermediate_flags)
+    };
 
     unsafe {
         let pte = pt.add(pt_index as usize);
@@ -350,7 +384,7 @@ fn invalidate_page(address: u64) {
 /// Performs a `write_volatile` on raw memory locations.
 /// `address` must be a valid virtual address pointing to at least 4096 bytes
 /// of exclusively-owned, writable, mapped memory.
-fn zero_out_page(address: u64) {
+pub(super) fn zero_out_page(address: u64) {
     let page_cursor = address as *mut u64;
     for i in 0..512 {
         unsafe { page_cursor.add(i).write_volatile(0u64) };
@@ -410,17 +444,19 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
 
         for i in 0..descriptor.num_pages {
             let phys = descriptor.physical_start + i * PAGE_SIZE;
-            unsafe { map_page(pmm, pml4, phys, phys, PRESENT | WRITABLE) };
+            unsafe {
+                map_page(pmm, pml4, phys, phys, PRESENT | WRITABLE, false)
+            };
         }
     }
 
     // Identity map + higher-half map: kernel image
     let mut addr = pmm.kernel_start;
     while addr < pmm.kernel_end {
-        unsafe { map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE) };
         unsafe {
+            map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE, false);
             map_page(pmm, pml4, addr + KERNEL_VIRTUAL_BASE, addr,
-            PRESENT | WRITABLE)
+                PRESENT | WRITABLE, false)
         };
         addr += PAGE_SIZE;
     }
@@ -430,11 +466,11 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
     let stack_end = memory_map.stack_base_addr + memory_map.stack_size;
     let mut addr = stack_start;
     while addr < stack_end {
-        unsafe { map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE | NX) };
         unsafe {
+            map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE | NX, false);
             map_page(pmm, pml4, addr + KERNEL_VIRTUAL_BASE, addr,
-            PRESENT | WRITABLE | NX)
-        };
+            PRESENT | WRITABLE | NX, false);
+        }
         addr += PAGE_SIZE;
     }
 
@@ -449,7 +485,7 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
     let fb_end = framebuffer_info.framebuffer_addr + fb_size;
     let mut addr = fb_start;
     while addr < fb_end {
-        unsafe { map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE) };
+        unsafe { map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE, false) };
         addr += PAGE_SIZE;
     }
 
@@ -458,7 +494,7 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
     let map_end = memory_map.memory_map_addr + memory_map.memory_map_size;
     let mut addr = map_start;
     while addr < map_end {
-        unsafe { map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE) };
+        unsafe { map_page(pmm, pml4, addr, addr, PRESENT | WRITABLE, false) };
         addr += PAGE_SIZE;
     }
 
@@ -531,7 +567,9 @@ pub fn build_direct_map(pmm: &mut PhysicalMemoryManager, pml4: *mut u64,
         // Map every 4 KB page in this descriptor's physical range
         for i in 0..descriptor.num_pages {
             let phys = descriptor.physical_start + i * PAGE_SIZE;
-            unsafe { map_page(pmm, pml4, phys_map_base + phys, phys, flags) };
+            unsafe {
+                map_page(pmm, pml4, phys_map_base + phys, phys, flags, false)
+            };
         }
     }
 
@@ -550,7 +588,7 @@ pub fn build_direct_map(pmm: &mut PhysicalMemoryManager, pml4: *mut u64,
         while phys < phys_base + size {
             unsafe {
                 map_page(pmm, pml4, KERNEL_PHYSICAL_MAP_BASE + phys, phys,
-                    PRESENT | WRITABLE | PWT | PCD);
+                    PRESENT | WRITABLE | PWT | PCD, false);
             }
             phys += PAGE_SIZE;
         }
@@ -562,7 +600,7 @@ pub fn build_direct_map(pmm: &mut PhysicalMemoryManager, pml4: *mut u64,
     let hpet_mmio_addr = 0xFED00000;
     unsafe {
         map_page(pmm, pml4, KERNEL_PHYSICAL_MAP_BASE + hpet_mmio_addr,
-            hpet_mmio_addr, PRESENT | WRITABLE | PWT | PCD)
+            hpet_mmio_addr, PRESENT | WRITABLE | PWT | PCD, false)
     };
 }
 
@@ -579,8 +617,10 @@ pub fn build_direct_map(pmm: &mut PhysicalMemoryManager, pml4: *mut u64,
 /// * `pmm` - Physical memory manager (for allocating page-table pages).
 /// * `pml4` - Root of the active page table.
 /// * `framebuffer_info` - UEFI-provided information about the framebuffer.
-pub fn map_framebuffer_higher_half(pmm: &mut PhysicalMemoryManager, pml4: *mut u64,
-    framebuffer_info: &crate::FramebufferInfo
+pub fn map_framebuffer_higher_half(
+    pmm: &mut PhysicalMemoryManager,
+    pml4: *mut u64,
+    framebuffer_info: &crate::FramebufferInfo,
 ) {
     // Calculate the total byte size of the framebuffer. Height * width gives
     // the total number of pixels; then, multiplying by (bpp / 8) converts
@@ -606,7 +646,7 @@ pub fn map_framebuffer_higher_half(pmm: &mut PhysicalMemoryManager, pml4: *mut u
     let mut phys = fb_phys_start;
     let mut virt = KERNEL_FRAMEBUFFER_VIRTUAL_BASE;
     while phys < fb_phys_end {
-        unsafe { map_page(pmm, pml4, virt, phys, PRESENT | WRITABLE) };
+        unsafe { map_page(pmm, pml4, virt, phys, PRESENT | WRITABLE, false) };
         phys += PAGE_SIZE;
         virt += PAGE_SIZE;
     }

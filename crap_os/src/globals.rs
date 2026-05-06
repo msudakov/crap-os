@@ -105,6 +105,8 @@ pub static mut GDT: Gdt = Gdt {
         GdtEntry::KERNEL_DATA64,  // 0x10 - kernel data
         GdtEntry::NULL,           // 0x18 - TSS low  (patched at runtime)
         GdtEntry::NULL,           // 0x20 - TSS high (patched at runtime)
+        GdtEntry::USER_DATA64,    // 0x2B - user data
+        GdtEntry::USER_CODE64,    // 0x33 - user code
     ],
 };
 
@@ -139,13 +141,6 @@ pub static HPET: StaticIrqSpinLock<Option<HpetInfo>> =
 /// kernel is initialized, the idle task only ever runs if no other task is
 /// ready to be executed in the Task Scheduler's queue.
 pub static SYS_FLAG_KERNEL_INIT_COMPLETE: AtomicBool = AtomicBool::new(false);
-
-/// Atomic boolean flag to track if the dead task reaper `SystemTask` (and its
-/// tombstone cleanup routine) has been added to the system task queue. Since
-/// that SystemTask can be enqueued from several locations, this flag helps
-/// avoid double-queueing that would otherwise waste the CPU time in the middle
-/// of the timer tick processing and task scheduling.
-pub static SYS_FLAG_TASK_REAPER_QUEUED: AtomicBool = AtomicBool::new(false);
 
 /// Atomic boolean flag used to signal the timer ISR to disregard the result of
 /// task quantum check and force the scheduler to run regardless. This is set

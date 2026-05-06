@@ -9,7 +9,7 @@
 //!      stack does not cause an additional fault (which would lead to triple
 //!      fault and imminent CPU reset).
 //!   2. A kernel-mode stack pointer (RSP0) for transitions from ring 3 to
-//!      ring 0, once user-mode space support is added.
+//!      ring 0.
 //!
 //! The GDT has the following layout:
 //!
@@ -20,9 +20,14 @@
 //!  2     | 0x10   | 0x10     | 64-bit ring 0 kernel data (read/write)
 //!  3     | 0x18   | 0x18     | TSS ring 0 descriptor (low 8 bytes)
 //!  4     | 0x20   | -        | TSS ring 0 descriptor (high 8 bytes)
+//!  5     | 0x28   | 0x2B     | 64-bit ring 3 user data | (OR'd) 0x3 RPL
+//!  6     | 0x30   | 0x33     | 64-bit ring 3 user code | (OR'd) 0x3 RPL
 //!
-//! The last two 8-byte slots form the single 16-byte TSS descriptor. The
-//! selector 0x18 refers to both, and index 4 (0x20) is not itself a selector.
+//! Two 8-byte slots at index 3 and 4 form the single 16-byte TSS descriptor.
+//! The selector 0x18 refers to both, and index 4 (0x20) is not itself a
+//! selector. The selectors at indices 5 and 6 for user mode differ from their
+//! respective offsets (unlike kernel segments) because they have to be OR'd
+//! with the RPL value of 0x3. Kernel-mode selectors are basically OR'd with 0.
 //!
 //! The IST1 (Interrupt Stack Table 1) points to the top of DOUBLE_FAULT_STACK.
 //! When a double-fault fires, the CPU atomically switches RSP to IST1 before
@@ -184,6 +189,16 @@ impl GdtEntry {
     /// 64-bit ring-0 data segment descriptor. Raw value: `0x00CF92000000FFFF`.
     pub const KERNEL_DATA64: Self = Self(0x00CF92000000FFFF);
 
+    /// 64-bit ring-3 code segment descriptor. Raw value: `0x00AFFA000000FFFF`.
+    /// Same as KERNEL_CODE64 but with DPL=3 (bits 45-46 set):
+    /// FA = `1111_1010` -> Present | DPL=3 | Code | Execute/Read
+    pub const USER_CODE64: Self = Self(0x00AFFA000000FFFF);
+
+    /// 64-bit ring-3 data segment descriptor. Raw value: `0x00CFF2000000FFFF`.
+    /// Same as `KERNEL_DATA64`, but with DPL=3 (bits 45-46 set):
+    /// F2 = `1111_0010` -> Present | DPL=3 | Data | Read/Write
+    pub const USER_DATA64: Self = Self(0x00CFF2000000FFFF);
+
     /// Encodes the low 8-byte half of a 64-bit TSS descriptor.
     ///
     /// Unlike code/data descriptors, TSS descriptors are system segment
@@ -193,6 +208,7 @@ impl GdtEntry {
     /// 32 bits wide); the high half carries the upper 32 bits of the base.
     ///
     /// # Arguments
+    /// 
     /// * `base`  - Virtual address of the `TSS` struct.
     /// * `limit` - `size_of::<Tss>() - 1` (the CPU adds 1 internally).
     pub fn tss_low(base: u64, limit: u32) -> Self {
@@ -234,6 +250,7 @@ impl GdtEntry {
     ///  63:32        | Reserved; must be zero (CPU may raise #GP if non-zero)
     ///
     /// # Arguments
+    /// 
     /// * `base` - The same virtual address passed to `tss_low`.
     pub fn tss_high(base: u64) -> Self {
         // Shift away the lower 32 bits that were encoded in the low half.
@@ -254,11 +271,13 @@ impl GdtEntry {
 ///   [2] - 64-bit kernel data     (selector 0x10)
 ///   [3] - TSS descriptor low     (selector 0x18,  the lower 8 bytes of TSS)
 ///   [4] - TSS descriptor high    (not a selector; the upper 8 bytes of TSS)
+///   [5] - 64-bit user data       (selector 0x2B = 0x28 | 0x03)
+///   [6] - 64-bit user code       (selector 0x33 = 0x30 | 0x03)
 ///
 /// The x86-64 requirement is that the GDT be 8-byte aligned.
 #[repr(C, align(8))]
 pub struct Gdt {
-    pub entries: [GdtEntry; 5],
+    pub entries: [GdtEntry; 7],
 }
 
 // =============================================================================
@@ -283,6 +302,22 @@ pub const KERNEL_DS: u16 = 0x10;
 /// TSS selector.
 /// GDT index 3 -> byte offset 24 -> 0x18. Loaded into TR via `ltr`.
 pub const TSS_SELECTOR: u16 = 0x18;
+
+/// User data segment selector.
+/// GDT index 5 -> byte offset 40 -> 0x28 | RPL 3 (OR'd with 0x03).
+pub const USER_DS: u16 = 0x2B;
+
+/// User code segment selector.
+/// GDT index 6 -> byte offset 48 -> 0x30 | RPL 3 (OR'd with 0x03).
+pub const USER_CS: u16 = 0x33;
+
+/// RPL 3 version of the user data segment selector, suitable for loading
+/// directly into the iretq frame's SS field.
+pub const USER_DS_RPL3: u64 = USER_DS as u64;  // 0x2B
+
+/// RPL 3 version of the user code segment selector, suitable for loading
+/// directly into the iretq frame's CS field.
+pub const USER_CS_RPL3: u64 = USER_CS as u64;  // 0x33
 
 /// The 10-byte GDTR descriptor structure consumed by the `lgdt` instruction.
 ///
@@ -311,11 +346,12 @@ struct GdtDescriptor {
 /// The following steps are performed:
 ///   1. Set `TSS.ist[0]` (IST1) to the top of `DOUBLE_FAULT_STACK`
 ///   2. Patch the two TSS descriptor slots in `GDT` with the TSS address/limit
-///   3. Build a `GdtDescriptor` pointing at `GDT`
-///   4. Execute `lgdt` to load the GDTR, activating the new GDT
-///   5. Perform a far return (`retfq`) to atomically load CS = `KERNEL_CS`
-///   6. Reload DS, ES, SS, FS, GS with `KERNEL_DS`
-///   7. Execute `ltr` to load the Task Register with `TSS_SELECTOR`
+///   3. Populate user-mode descriptors
+///   4. Build a `GdtDescriptor` pointing at `GDT`
+///   5. Execute `lgdt` to load the GDTR, activating the new GDT
+///   6. Perform a far return (`retfq`) to atomically load CS = `KERNEL_CS`
+///   7. Reload DS, ES, SS, FS, GS with `KERNEL_DS`
+///   8. Execute `ltr` to load the Task Register with `TSS_SELECTOR`
 ///
 /// # Safety
 /// 
@@ -360,11 +396,24 @@ pub unsafe fn init_gdt() {
     let tss_base  = core::ptr::addr_of!(TSS) as u64;
     let tss_limit = (core::mem::size_of::<Tss>() - 1) as u32;
 
-    unsafe { GDT.entries[3] = GdtEntry::tss_low(tss_base, tss_limit) };
-    unsafe { GDT.entries[4] = GdtEntry::tss_high(tss_base) };
+    unsafe {
+        GDT.entries[3] = GdtEntry::tss_low(tss_base, tss_limit);
+        GDT.entries[4] = GdtEntry::tss_high(tss_base);
+    }
 
     // -------------------------------------------------------------------------
-    // Steps 3–5: Build the GDTR, load it, and reload CS via far return.
+    // Step 3: Populate user-mode descriptors.
+    //
+    // `USER_DATA64` must be at index 5 and `USER_CODE64` at index 6. SYSRET
+    // requires that the user `CS = (STAR MSR upper 16 bits) + 16`, and user
+    // `SS = (STAR MSR upper 16 bits) + 8`.
+    unsafe {
+        GDT.entries[5] = GdtEntry::USER_DATA64;
+        GDT.entries[6] = GdtEntry::USER_CODE64;
+    }
+
+    // -------------------------------------------------------------------------
+    // Steps 4–6: Build the GDTR, load it, and reload CS via far return.
     //
     // The `limit` field is `size_of::<Gdt>() - 1` = 5 * 8 − 1 = 39.
     //
@@ -385,12 +434,12 @@ pub unsafe fn init_gdt() {
     };
 
     core::arch::asm!(
-        // Step 3 & 4: Load the GDTR from the gdtr struct on the stack.
+        // Step 4 & 5: Load the GDTR from the gdtr struct on the stack.
         // After this instruction, the CPU uses our new GDT for all subsequent
         // segment descriptor lookups, but CS still holds the old selector.
         "lgdt [{gdtr}]",
 
-        // Step 5: Far return to atomically reload CS:
+        // Step 6: Far return to atomically reload CS:
         "push {cs}",              // the new code segment selector
         "lea {tmp}, [rip + 3f]",  // RIP-relative: compute address of "3:"
         "push {tmp}",             // the return RIP
@@ -399,7 +448,7 @@ pub unsafe fn init_gdt() {
         // Execution resumes here with CS = KERNEL_CS (0x08).
         "3:",
 
-        // Step 6: Reload all data-segment registers.
+        // Step 7: Reload all data-segment registers.
         // These are not updated by the far return above; RETFQ only affects CS.
         // The `mov reg, ax` form is used because segment registers can only be
         // loaded from a general-purpose register, not from an immediate value.
@@ -426,7 +475,7 @@ pub unsafe fn init_gdt() {
     );
 
     // -------------------------------------------------------------------------
-    // Step 7: Load the Task Register (TR) with the TSS selector.
+    // Step 8: Load the Task Register (TR) with the TSS selector.
     //
     // `ltr` does two things:
     //   1. Loads the Task Register with the given selector, making the CPU
@@ -443,4 +492,29 @@ pub unsafe fn init_gdt() {
         "ltr ax",
         in("ax") TSS_SELECTOR,
     );
+}
+
+/// Updates `TSS.rsp[0]` to point to the given kernel stack top.
+///
+/// This must be called on every context switch to the incoming task, before
+/// that task starts executing. The CPU reads `TSS.rsp[0]` on every ring-3  to
+/// ring-0 transition (interrupts, syscalls, etc.) to find the kernel stack, so
+/// it must always reflect the currently running task's kernel stack.
+/// 
+/// # Arguments
+/// 
+/// * `stack_top` - The given kernel stack top to update `TSS.rsp[0]` with.
+#[inline]
+pub fn set_kernel_stack(stack_top: u64) {
+    unsafe { TSS.rsp[0] = stack_top };
+
+    // Verification: read back and confirm the write took effect.
+    // Remove once step 6 (user threads) is working.
+    unsafe {
+        let rsp0 = core::ptr::addr_of!(TSS.rsp[0]).read_unaligned();
+        debug_assert_eq!(
+            rsp0, stack_top,
+            "TSS.rsp[0] write did not take effect"
+        );
+    }
 }

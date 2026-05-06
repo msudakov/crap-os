@@ -54,9 +54,9 @@
 
 use core::sync::atomic::Ordering;
 use alloc::sync::Weak;
-use alloc::vec::Vec;
 use super::switcher::switch_to;
 use super::task::{Task, TaskId, TaskState};
+use super::queue_task_reaper;
 use crate::spinlock::{IrqSpinLock, StaticIrqSpinLock};
 use crate::globals::SYS_FLAG_KERNEL_INIT_COMPLETE;
 use crate::process_manager::thread::{Thread, ThreadState};
@@ -139,9 +139,9 @@ impl TaskSlot {
 /// The following must hold true:
 ///   - Every task in `queue` has state `Ready` and exists in `tasks`.
 ///   - Exactly one task has state `Running` at any time; its ID is `current`.
-///   - A task that is `Blocked` or `Dead` is not in `queue`.
-///   - A `Dead` task remains in `tasks` until the scheduler performs tombstone
-///     cleanup (drops it and frees its stack).
+///   - A task that is `Blocked`, `Dying,` or `Dead` is not in `queue`.
+///   - A `Dying` or `Dead` task remains in `tasks` until the scheduler performs
+///     tombstone cleanup via the reaper (drops it and frees its stack).
 ///   - `queue_len` always equals the number of IDs between `head` and `tail`
 ///     in the ring. Specifically: `queue_len == 0` when the queue is empty;
 ///     and, `queue_len == QUEUE_SIZE` when the queue is full.
@@ -218,9 +218,7 @@ impl Scheduler {
     /// # Returns
     ///
     /// Returns `Err(QueueFull)` if the ring buffer is at capacity, which the
-    /// caller must handle. But, the task ID is not lost silently, as the task
-    /// remains in `tasks` and can be re-enqueued when space becomes
-    /// available (e.g., after a dead task is cleaned up).
+    /// caller must handle.
     fn queue_push(&mut self, task_id: TaskId) -> Result<(), SchedulerError> {
         if self.queue_len == QUEUE_SIZE {
             return Err(SchedulerError::QueueFull);
@@ -388,7 +386,7 @@ impl Scheduler {
     /// Because of how [`TaskSlot`]s are implemented with slot index and slot
     /// generation, this fetch operation is very efficient and executes in
     /// constant time (O(1)). It is a no-op if no task with the ID exists.
-    /// Called by [`tombstone_cleanup`] during reaper execution to free slots
+    /// Called by [`tombstone_cleanup`] after reaper execution to free slots
     /// occupied by [`TaskState::Dead`] tasks.
     /// 
     /// # Arguments
@@ -406,7 +404,7 @@ impl Scheduler {
     /// Panics if the task's [`Weak`] thread reference cannot be upgraded.
     /// A task being reaped must still have a live thread, as a dangling `Weak`
     /// at this point indicates a lifecycle ordering violation.
-    fn remove_task(&mut self, task_id: TaskId) {
+    pub(super) fn remove_task(&mut self, task_id: TaskId) {
         // Double check that the task is still current and is not stale
         if let Some(task) = self.get_task_mut(task_id) {
             // Upgrade the thread reference or panic if the `Weak` is dangling
@@ -569,13 +567,13 @@ pub unsafe fn schedule() {
     // We have to use raw values instead of references because a reference into
     // `scheduler` would borrow the `MutexGuard`, keeping the lock alive. We
     // need the lock released before `switch_to`, so we must copy the data out.
-    let (old_rsp_ptr, new_rsp) = {
+    let (old_rsp_ptr, new_rsp, new_cr3) = {
         let mut scheduler = SCHEDULER.lock();
 
         // Dequeue the next ready task.
         // `queue_pop` returns `None` if no tasks are in the ready queue,
-        // meaning every other task is either `Blocked`, `Dead`, or there is
-        // only the idle task. In that case, we switch to the idle task.
+        // meaning every other task is either `Blocked`, `Dying`, `Dead`, or
+        // there is only the idle task. In that case, we switch to idle task.
         let next_id = loop {
             // Pop the next task ID from the ready queue
             let task_id = match scheduler.queue_pop() {
@@ -609,7 +607,8 @@ pub unsafe fn schedule() {
         // and push it to the tail of the queue, so it will run again after all
         // currently-queued tasks have had their turn. If the task is `Blocked`,
         // it will be re-enqueued by `wake()` when the awaited event fires. If
-        // the task is `Dead`, tombstone cleanup will drop it on a future pass.
+        // the task is `Dying` or `Dead`, the reaper and tombstone cleanup will
+        // drop it on a future pass.
         let outgoing_id = scheduler.current;
         if let Some(outgoing) = scheduler.get_task_mut(outgoing_id) {
             if outgoing.state == TaskState::Running {
@@ -631,8 +630,9 @@ pub unsafe fn schedule() {
                     let _ = scheduler.queue_push(outgoing_id);
                 }
             }
-            // Blocked or Dead: do not re-enqueue. The task will be woken or
-            // cleaned up through separate mechanisms (`wake`, `remove_task`).
+            // Blocked, Dying, or Dead: do not re-enqueue. The task will be
+            // woken or cleaned up through separate mechanisms (`wake`,
+            // `remove_task`, etc).
         }
 
         scheduler.current = next_id;  // Update the current task with incoming
@@ -652,12 +652,23 @@ pub unsafe fn schedule() {
             .map(|task| &mut task.saved_rsp as *mut u64)
             .unwrap_or(core::ptr::null_mut());
 
-        let new_rsp = scheduler
-            .get_task(next_id)
-            .map(|task| task.saved_rsp)
-            .unwrap_or(0);
+        // Get a reference to the incoming task for CR3 and stack top settings
+        let next_task = scheduler.get_task(next_id).unwrap();
 
-        (old_rsp_ptr, new_rsp)
+        // Only update TSS.rsp[0] if the incoming task can actually run in ring
+        // 3. Kernel-only tasks (including idle) never transition to ring 3, so
+        // the TSS kernel stack is irrelevant for them. Skipping the update also
+        // avoids clobbering a valid TSS entry with a meaningless value when
+        // switching between two kernel tasks.
+        if next_task.is_user_task {
+            crate::gdt::set_kernel_stack(next_task.kernel_stack_top);
+        }
+
+        // Fetch the new CR3 and saved RSP variables to pass to the switcher
+        let new_rsp = next_task.saved_rsp;
+        let new_cr3 = next_task.cr3;
+
+        (old_rsp_ptr, new_rsp, new_cr3)
 
         // The lock is released here.
     };
@@ -680,18 +691,19 @@ pub unsafe fn schedule() {
     // Perform the context switch. No lock is held at this point, but the
     // interrupts must still be disabled across the call to `switch_to`.
     //  The assembly code in `switch_to` will:
-    //   1. Push callee-saved registers onto the outgoing task's stack;
-    //   2. Write RSP into the outgoing task's `saved_rsp`;
-    //   3. Load RSP from the incoming task's stack;
-    //   4. Pop callee-saved registers from the incoming task's stack;
-    //   5. Execute `ret`, jumping into the incoming task's execution context.
+    //    - Push callee-saved registers onto the outgoing task's stack;
+    //    - Write RSP into the outgoing task's `saved_rsp`;
+    //    - Load RSP from the incoming task's stack;
+    //    - Conditionally reload CR3
+    //    - Pop callee-saved registers from the incoming task's stack;
+    //    - Execute `ret`, jumping into the incoming task's execution context.
     //
     // From the outgoing task's perspective, this function call "returns" the
     // next time it is selected as the incoming task in a future `schedule()`
     // invocation. From the incoming task's perspective it either:
     //   - Returns from a prior `switch_to` call (previously-run task), or
     //   - Enters `task_entry_stub` for the first time (brand-new task).
-    unsafe { switch_to(old_rsp_ptr, new_rsp) };
+    unsafe { switch_to(old_rsp_ptr, new_rsp, new_cr3) };
 
     // Finally, when the outgoing task gets back here, the interrupts are
     // restored to what they were. And if the task doesn't return here (i.e., it
@@ -873,59 +885,14 @@ pub fn get_current_task_id() -> TaskId {
     SCHEDULER.lock().current
 }
 
-/// Tombstone cleanup removes all `Dead` tasks from the task table and frees
-/// their resources.
-/// 
-/// This is called exclusively by the `dead_task_reaper` `SystemTask`,
-/// which fires on the timer interrupt after a task has exited. By the time this
-/// runs, the dead task has already been switched away from by `schedule()`,
-/// so its stack is no longer in use and is safe to drop.
-pub fn tombstone_cleanup() {
-    // Unset the dead task reaper system task's global flag, so other call
-    // sites can queue it again when needed.
-    crate::globals::SYS_FLAG_TASK_REAPER_QUEUED.store(
-            false, core::sync::atomic::Ordering::SeqCst);
-
-    // Hold the lock only long enough to sweep the task table
-    let tasks_reaped = {
-        let mut scheduler = SCHEDULER.lock();
-        let mut dead_task_count = 0u64;
-
-        // Find all dead task IDs first
-        let dead_task_ids: Vec<_> = scheduler.tasks.iter()
-            .filter_map(|slot| slot.task.as_ref())
-            .filter(|task| task.state == TaskState::Dead)
-            .map(|task| task.id)
-            .collect();
-
-        // Remove the located dead tasks
-        for id in dead_task_ids {
-            scheduler.remove_task(id);
-            dead_task_count += 1;
-        }
-
-        dead_task_count
-    };  // The lock is released here
-
-    if tasks_reaped > 0 {
-        // TODO: for debugging purposes; can clean up later on.
-        // Log how many tasks were cleaned up, so we can verify during testing.
-        if crate::globals::DEBUG_LEVEL == crate::DebugLevel::INFO {
-            crate::helper_functions::print_u64_field(
-                "\n[REAPER] Tombstone cleanup reaped dead task(s): ",
-                tasks_reaped);
-        }
-    }
-}
-
-/// Marks a task as [`TaskState::Dead`], marks the backing thread as
+/// Marks a task as [`TaskState::Dying`], marks the backing thread as
 /// [`ThreadState::Dying`] to signal to the process manager that this thread is
 /// on its way out, and queues a forced reschedule if the task is currently
 /// running.
 ///
-/// Dead tasks are not re-enqueued by [`schedule`], so the task will not run
-/// again after being switched out. Slot cleanup is deferred to the reaper
-/// via [`tombstone_cleanup`].
+/// Dying and Dead tasks are not re-enqueued by [`schedule`], so the task will
+/// not run again after being switched out. Slot cleanup is deferred to the
+/// reaper and the tombstone cleanup on a later clock tick.
 /// 
 /// # Arguments
 /// 
@@ -948,8 +915,8 @@ pub fn kill_task(task_id_u64: u64) {
 
         // Make sure the task is not stale
         if let Some(task) = scheduler.get_task_mut(task_id) {
-            // Set the task state to dead
-            task.state = TaskState::Dead;
+            // Set the task state to dying
+            task.state = TaskState::Dying;
 
             // We also mark the task's parent thread as dying
             task.thread.upgrade().unwrap().lock().state = ThreadState::Dying;
@@ -962,6 +929,12 @@ pub fn kill_task(task_id_u64: u64) {
         }
     };  // The lock is released here
 
+    // Queue task reaper to mark the task as dead on the next tick
+    if queue_task_reaper(task_id).is_err() {
+        crate::hardware_manager::sprint(
+            "\n[REAPER] Failed to queue task reaper...\n");
+    }
+
     if is_current {
         // Signal the timer ISR to reschedule regardless of task quantum once
         // the system task queue is fully drained.
@@ -970,13 +943,12 @@ pub fn kill_task(task_id_u64: u64) {
     }
 }
 
-/// Marks the currently-running task as `Dead` and enqueues the
-/// `dead_task_reaper` SystemTask for the tombstone cleanup on the next timer
-/// tick.
+/// Marks the currently-running task as `Dying` and queues the task reaper to
+/// run on the next timer tick.
 /// 
 /// Called from exception handlers when a recoverable fault is attributed to the
 /// current task. This is the abnormal termination counterpart to `task_exit()`
-/// in `task.rs`, and both paths converge on the same `Dead` task state and the
+/// in `task.rs`, and both paths converge on the same `Dying` task state and the
 /// same reaper, so the cleanup machinery does not need to distinguish between
 /// normal and abnormal task termination.
 ///
@@ -989,17 +961,18 @@ pub fn kill_current_task() {
         let mut scheduler = SCHEDULER.lock();
         let this_id = scheduler.current;
         if let Some(task) = scheduler.get_task_mut(this_id) {
-            task.state = TaskState::Dead;
+            task.state = TaskState::Dying;
 
             // We also mark the task's parent thread as dying
             task.thread.upgrade().unwrap().lock().state = ThreadState::Dying;
+
+            // Queue task reaper to mark the task as Dead on the next tick
+            if queue_task_reaper(this_id).is_err() {
+                crate::hardware_manager::sprint(
+                    "\n[REAPER] Failed to queue task reaper...\n");
+            }
         }
     }  // The lock is released here
-
-    // Enqueue the reaper, so the dead task's slot and stack are freed on the
-    // next timer tick, by which point `schedule()` will have switched us away,
-    // and the stack will no longer be in use.
-    crate::helper_functions::queue_dead_task_reaper_no_dupe();
 }
 
 /// Blocks the current task for at least `seconds` seconds.
@@ -1029,6 +1002,7 @@ pub fn kill_current_task() {
 ///               valid no-op sleep: the task simply yields the remainder of its
 ///               current quantum and is immediately re-enqueued without ever
 ///               entering the sleep queue.
+#[allow(dead_code)]
 pub fn sleep(seconds: u32) {
     let task_id = get_current_task_id();
 

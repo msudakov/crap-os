@@ -6,19 +6,12 @@
 //! designed to run at elevated priority between hardware IRQ handling and
 //! normal task scheduling.
 
-/// This `SystemTask` is enqueued by `task_exit()` whenever a task terminates,
-/// and fires on the next timer tick.
-/// 
-/// It calls into the scheduler to perform tombstone cleanup: sweeping the task
-/// table for Dead tasks and freeing their resources.
+/// This `SystemTask` is enqueued by an exiting thread whenever its task is
+/// targeted for forceful termination, and fires on the next timer tick.
 /// 
 /// # Arguments
 /// 
-/// * `arg` - This parameter is unused and exists for signature consistency.
-pub fn dead_task_reaper(_arg: u64) {
-    crate::task_scheduler::tombstone_cleanup();
-}
-
-pub fn task_killer(task_id: u64) {
-    crate::task_scheduler::scheduler::kill_task(task_id);
+/// * `task_id_u64` - Compressed `TaskId` value of the target task as a single u64.
+pub fn task_killer(task_id_u64: u64) {
+    crate::task_scheduler::scheduler::kill_task(task_id_u64);
 }

@@ -18,6 +18,11 @@ use crate::spinlock::StaticIrqSpinLock;
 /// If this limit is hit, this constant should be reconsidered.
 const MAX_SYSTEM_TASKS: usize = 32;
 
+/// Bitmask for wrapping the system task queue's head/tail indices. Only valid
+/// because MAX_SYSTEM_TASKS is a power of two, and `index & MASK` is
+/// equivalent to `index % SIZE` but without the division.
+const SYSTEM_TASKS_MASK: usize = MAX_SYSTEM_TASKS - 1;
+
 /// A single unit of deferred kernel work.
 /// 
 /// A `SystemTask` is a function pointer and its argument, enqueued for
@@ -110,7 +115,7 @@ impl SystemTaskQueue {
         }
 
         self.system_tasks[self.tail] = Some(task);
-        self.tail = (self.tail + 1) % MAX_SYSTEM_TASKS;  // Wrap tail around
+        self.tail = (self.tail + 1) & SYSTEM_TASKS_MASK;  // Wrap tail around
         self.queue_len += 1;
         Ok(())
     }
@@ -131,7 +136,7 @@ impl SystemTaskQueue {
         // important for keeping the backing array clean, as we don't want a
         // consumed task's function pointer sitting in memory indefinitely.
         let task = self.system_tasks[self.head].take();
-        self.head = (self.head + 1) % MAX_SYSTEM_TASKS;
+        self.head = (self.head + 1) & SYSTEM_TASKS_MASK;
         self.queue_len -= 1;
         task
     }

@@ -68,6 +68,7 @@ pub struct SleepQueue {
     queue_len: usize,
 }
 
+#[allow(dead_code)]
 impl SleepQueue {
     /// Creates an empty [`SleepQueue`] at compile time, suitable for use as a
     /// static initializer. All entry slots are initialized to `None` and

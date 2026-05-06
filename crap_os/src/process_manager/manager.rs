@@ -102,9 +102,9 @@ impl ProcessManager {
         idle_process
     }
 
-    /// Creates a new process with a single main thread and registers it in the
-    /// process list, and the main thread is immediately queued in the scheduler
-    /// and eligible for scheduling as soon as this function returns.
+    /// Creates a new kernel process with a single main thread and registers it
+    /// in the process list, and the main thread is immediately queued in the
+    /// scheduler and eligible for scheduling as soon as this function returns.
     ///
     /// # Arguments
     /// 
@@ -119,7 +119,7 @@ impl ProcessManager {
     /// Returns a strong `Arc` reference to the new process on success, or
     /// [`SchedulerError`] if the scheduler task table or run queue
     /// is full.
-    pub fn create_process(
+    pub fn create_kernel_process(
         &self,
         name: &'static str,
         cr3: u64,
@@ -127,10 +127,56 @@ impl ProcessManager {
         main_arg: u64,
     ) -> Result<Arc<Process>, SchedulerError> {
         // Create the new process instance and try to spawn the main thread
-        let process = Process::new(name, cr3);
-        process.spawn_thread("main", main_entry, main_arg)?;
+        let process = Process::new_kernel(name, cr3);
+        process.spawn_kernel_thread("main", main_entry, main_arg)?;
         
         // Only register the new process if the thread was spawned successfully
+        self.processes.lock().push(Arc::clone(&process));
+
+        Ok(process)
+    }
+
+    /// Creates a new user process with a fresh isolated address space and a
+    /// single main thread, registers it in the process list, and queues the
+    /// main thread in the scheduler immediately.
+    ///
+    /// Unlike `create_kernel_process`, this allocates a brand-new PML4 for
+    /// the process and copies the kernel's upper-half entries into it. The
+    /// caller does not need to set up any mappings, as the main thread's code
+    /// page and user stack are mapped internally by `spawn_user_thread`.
+    ///
+    /// # Arguments
+    ///
+    /// * `name`             - Human-readable name for this process.
+    /// * `kernel_pml4_phys` - Physical address of the kernel's own PML4, used
+    ///                        as the source for the upper-half copy. Pass the
+    ///                        same CR3 value used by all kernel processes.
+    /// * `user_entry`       - Virtual address of the user-mode entry point in
+    ///                        the new process's address space.
+    ///
+    /// # Returns
+    ///
+    /// Returns a strong `Arc` reference to the new process on success, or
+    /// [`SchedulerError`] if the scheduler task table or run queue is full.
+    pub fn create_user_process(
+        &self,
+        name: &'static str,
+        kernel_pml4_phys: u64,
+        user_entry: u64,
+    ) -> Result<Arc<Process>, SchedulerError> {
+        // Allocate a fresh address space and create the process. No user
+        // mappings exist yet - `spawn_user_thread` maps the user stack below.
+        let process = Process::new_user(name, kernel_pml4_phys);
+
+        // Spawn the main thread. This maps the user stack into the process's
+        // address space and sets up the iretq frame. The thread is queued in
+        // the scheduler and eligible to run as soon as this returns.
+        process.spawn_user_thread("main", user_entry)?;
+
+        // Only register the process if the thread spawned successfully.
+        // If spawn_user_thread returned an error, the process Arc is dropped
+        // here and its address space is cleaned up without polluting the
+        // process list with a threadless process.
         self.processes.lock().push(Arc::clone(&process));
 
         Ok(process)
@@ -149,7 +195,7 @@ impl ProcessManager {
         self.processes
             .lock()
             .iter()
-            .find(|p| p.name == name)
+            .find(|process| process.name == name)
             .cloned()
     }
 
@@ -159,8 +205,8 @@ impl ProcessManager {
         for proc in processes.iter() {
             sprintln!("\n========== PROCESS INFORMATION ==========");
             fbprintln!("\n========== PROCESS INFORMATION ==========");
-            sprintln!("Process: {} (ID: {}, PML4: {:#X})", proc.name, proc.id.as_u64(), proc.cr3);
-            fbprintln!("Process: {} (ID: {}, PML4: {:#X})", proc.name, proc.id.as_u64(), proc.cr3);
+            sprintln!("Process: {} (ID: {}, PML4: {:#X})", proc.name, proc.id.as_u64(), proc.pml4_phys());
+            fbprintln!("Process: {} (ID: {}, PML4: {:#X})", proc.name, proc.id.as_u64(), proc.pml4_phys());
 
             {
                 let threads = proc.threads.lock();

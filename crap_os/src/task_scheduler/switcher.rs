@@ -73,8 +73,12 @@
 //!     registers (RDI) and calls the real entry function.
 
 
-/// Switches the execution context from an "outgoing" task to an "incoming"
-/// task.
+/// Switches the execution context from an outgoing task to an incoming task.
+/// 
+/// This is the lowest-level context switch primitive. It saves the outgoing
+/// task's callee-saved registers onto its kernel stack, swaps RSP, optionally
+/// loads a new CR3 (page table root), then restores the incoming task's
+/// callee-saved registers and returns into it.
 /// 
 /// # Arguments
 /// 
@@ -83,11 +87,31 @@
 ///   after pushing the frame, so the scheduler can later pass it back as
 ///   `new_rsp` to resume this task.
 ///
-/// * `new_rsp`     -  (RSI) The value, previously written to `saved_rsp` for
+/// * `new_rsp`     - (RSI) The value, previously written to `saved_rsp` for
 ///   the incoming task, to restore, so that popping the frame retrieves that
 ///   task's registers correctly.
 /// 
+/// * `new_cr3`     - (RDX) Physical address of the incoming task's PML4. If
+///   zero, the CR3 reload is skipped entirely, as this covers all kernel-to-
+///   kernel switches, where both tasks share the same address space, and a CR3
+///   write would wastefully flush the TLB for no benefit.
+/// 
+/// We skip the CR3 write when `new_cr3` is zero because writing CR3 (even with
+/// the same value already in it) unconditionally flushes all non-global TLB
+/// entries on x86-64. Skipping the write on kernel-to-kernel switches preserves
+/// the TLB warm state and avoids the flush overhead on every tick when only
+/// kernel tasks are running.
+/// 
 /// # Safety
+/// 
+///   - `old_rsp_ptr` must point to a valid `u64` that outlives the switch;
+///   - `new_rsp` must be a valid kernel stack pointer set up by a prior
+///     `switch_to` save or by `Task::new`'s `InitialFrame`;
+///   - `new_cr3` must be the physical address of a valid PML4 or zero;
+///   - Interrupts should be disabled by the caller before this is invoked.
+///     The incoming task re-enables them via its own `task_entry_stub` (for
+///     new tasks) or at the `restore_interrupts` call in `schedule()` (for
+///     previously-running tasks resuming after a prior switch).
 /// 
 /// This function has no compiler-generated prologue or epilogue whatsoever.
 /// The entire function body must be a single `naked_asm!` block. This is
@@ -101,7 +125,11 @@
 /// the compiler cannot reason about its safety, and we must ensure all of it
 /// works correctly.
 #[unsafe(naked)]
-pub unsafe extern "C" fn switch_to(old_rsp_ptr: *mut u64, new_rsp: u64) {
+pub unsafe extern "C" fn switch_to(
+    old_rsp_ptr: *mut u64,  // RDI
+    new_rsp: u64,           // RSI
+    new_cr3: u64,           // RDX
+) {
     core::arch::naked_asm!(
         // =====================================================================
         // Phase 1: Save the outgoing task's context
@@ -141,6 +169,17 @@ pub unsafe extern "C" fn switch_to(old_rsp_ptr: *mut u64, new_rsp: u64) {
         // InitialFrame for a new task) is waiting.
         "mov rsp, rsi",
 
+        // =====================================================================
+        // Phase 3: Conditionally reload CR3
+        // =====================================================================
+        // If new_cr3 is zero, this is a kernel-to-kernel switch, and both tasks
+        // share the same address space; so, we skip the write to avoid an
+        // unnecessary TLB flush.
+        "test rdx, rdx",
+        "jz 2f",
+        "mov cr3, rdx",
+        "2:",
+
         // Next, we pop the callee-saved registers in the reverse push order.
         // For a previously-run task, these restore the exact register values
         // the task had when it was last switched out. For a brand-new task,
@@ -159,7 +198,7 @@ pub unsafe extern "C" fn switch_to(old_rsp_ptr: *mut u64, new_rsp: u64) {
         "pop rbp",
 
         // =====================================================================
-        // Phase 3: Transfer control to the incoming task
+        // Phase 4: Transfer control to the incoming task
         // =====================================================================
         //
         // This `ret` pops the 8-byte word now at the top of the stack (the word

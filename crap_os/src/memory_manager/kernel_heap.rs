@@ -77,12 +77,12 @@
 //!    .        |_ KernelHeap::grow()
 //!    .        .  |_ MEMORY_MANAGER.lock()  -> this acquires MM lock
 //!    .        .  .  |_ mm.alloc_page()
-//!    .        .  .  |_ mm.map_page()
+//!    .        .  .  |_ mm.map_kernel_page()
 //!    .        .  |_ MEMORY_MANAGER unlocked
 //!    .        |_ retries free list
 //!    |_ KERNEL_HEAP unlocked
 
-use crate::memory_manager::{PRESENT, WRITABLE, NX};
+use crate::memory_manager::{KERNEL_PML4, PRESENT, WRITABLE, NX};
 use crate::globals::{PAGE_SIZE, MEMORY_MANAGER, KERNEL_HEAP};
 use core::ptr;
 use core::alloc::{GlobalAlloc, Layout};
@@ -260,10 +260,8 @@ impl KernelHeap {
                     .expect("[KERNEL_HEAP] PMM out of memory during heap grow");
 
                 // Map virtual to physical in the kernel's page tables.
-                unsafe {
-                    mm.map_page(virt_addr, phys_addr, PRESENT | WRITABLE | NX,
-                        false)
-                };
+                let flags = PRESENT | WRITABLE | NX;
+                unsafe { mm.map_page(KERNEL_PML4, virt_addr, phys_addr, flags)};
             }
         } // MEMORY_MANAGER lock dropped here, and interrupts are re-enabled
 

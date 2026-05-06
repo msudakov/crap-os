@@ -311,6 +311,14 @@ pub const USER_DS: u16 = 0x2B;
 /// GDT index 6 -> byte offset 48 -> 0x30 | RPL 3 (OR'd with 0x03).
 pub const USER_CS: u16 = 0x33;
 
+/// RPL 3 version of the user data segment selector, suitable for loading
+/// directly into the iretq frame's SS field.
+pub const USER_DS_RPL3: u64 = USER_DS as u64;  // 0x2B
+
+/// RPL 3 version of the user code segment selector, suitable for loading
+/// directly into the iretq frame's CS field.
+pub const USER_CS_RPL3: u64 = USER_CS as u64;  // 0x33
+
 /// The 10-byte GDTR descriptor structure consumed by the `lgdt` instruction.
 ///
 /// `lgdt` expects a pointer to exactly this layout in memory:

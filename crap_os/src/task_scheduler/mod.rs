@@ -16,5 +16,5 @@ pub(super) mod sleep_queue;
 pub use scheduler::{SchedulerError, init_idle, on_timer_tick, schedule, wake,
     insert_and_queue_task, yield_blocked, get_current_task_id, sleep,
     kill_current_task};
-pub use task::TaskId;
+pub use task::{Task, TaskId};
 pub use reaper::{queue_task_reaper, reap_dying_tasks, tombstone_cleanup};

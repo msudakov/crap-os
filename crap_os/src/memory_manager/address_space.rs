@@ -28,8 +28,7 @@
 //! even though the mappings are present in the PML4. The hardware enforces
 //! this, and any ring-3 access to a supervisor-only page triggers a #PF.
 
-use crate::memory_manager::PhysicalMemoryManager;
-use crate::memory_manager::vmm::map_page;
+use super::{PRESENT, WRITABLE, USER, NX};
 use crate::globals::{KERNEL_PHYSICAL_MAP_BASE, PAGE_SIZE};
 
 /// Owns the PML4 (top-level page table) for a single user process.
@@ -39,14 +38,35 @@ use crate::globals::{KERNEL_PHYSICAL_MAP_BASE, PAGE_SIZE};
 /// (walking the page table and freeing every intermediate table and mapped
 /// user page) will be added when process exit is implemented. For now,
 /// `AddressSpace` is only created and never destroyed.
+#[allow(dead_code)]
 pub struct AddressSpace {
     /// Physical address of this process's PML4 page. This is the value loaded
     /// into CR3 when the process is scheduled.
     pub pml4_phys: u64,
+
+    /// Address of the top of the user stack. This is the initial RSP handed to
+    /// the user thread (the top of the mapped region).
+    pub user_stack_top: u64,
+
+    /// Size of the user stack in the number of pages.
+    pub user_stack_pages: u64,
 }
 
 impl AddressSpace {
-    /// Creates a new user address space.
+    // Allocate the user stack. We allocate physical pages and map them
+    // into the user address space at a fixed virtual address for now.
+    // A proper VA allocator will replace this hardcoded address later.
+    //
+    // The user stack grows downward from USER_STACK_TOP, so the initial
+    // RSP handed to the user thread is USER_STACK_TOP (the top of the
+    // mapped region). We map USER_STACK_PAGES pages below that address.
+    //
+    // TODO: implement proper VA allocator
+    const USER_STACK_PAGES: u64 = 4;  // 16 KB user stack is enough for now
+    const USER_STACK_TOP: u64 = 0x7FFFFFFF0000;
+
+    /// Creates and initializes a new user address space, using the default
+    /// user stack top and number of stack pages.
     ///
     /// Allocates a fresh PML4 page, zeroes the lower half (user space, indices
     /// 0–255), and copies the kernel's upper-half PML4 entries (indices
@@ -55,8 +75,6 @@ impl AddressSpace {
     ///
     /// # Arguments
     ///
-    /// * `pmm`              - Physical memory manager used to allocate the PML4
-    ///                        page.
     /// * `kernel_pml4_phys` - Physical address of the kernel's own PML4, used
     ///                        as the source for the upper-half copy.
     ///
@@ -68,13 +86,18 @@ impl AddressSpace {
     ///
     /// Panics with `[CRITICAL] OOM` if the physical memory manager cannot
     /// allocate a page for the new PML4.
-    pub fn new(pmm: &mut PhysicalMemoryManager, kernel_pml4_phys: u64) -> Self {
+    pub fn init(kernel_pml4_phys: u64) -> Self {
         // Allocate one physical page for the new PML4
-        let pml4_phys = pmm.alloc_page()
-            .expect("[CRITICAL] OOM allocating user PML4");
+        let pml4_phys = {
+            let mut mm_guard = crate::globals::MEMORY_MANAGER.lock();
+            let mm = mm_guard.as_mut().unwrap();
+            mm.alloc_page().expect("[CRITICAL] OOM allocating user PML4")
+        };
 
         // Compute the virtual address of the new PML4 via the direct physical
-        // map, so we can write to it.
+        // map, so we can write to it. We could use the `zero_out_page` helper
+        // function of VMM, but we'll need to write more than just zeroes, so
+        // might as well do it manually here.
         let pml4_virt = pml4_phys + KERNEL_PHYSICAL_MAP_BASE;
         let pml4 = pml4_virt as *mut u64;
 
@@ -94,45 +117,43 @@ impl AddressSpace {
         // kernel's own virtual address space is reachable without a CR3 switch.
         let kernel_pml4_virt = kernel_pml4_phys + KERNEL_PHYSICAL_MAP_BASE;
         let kernel_pml4 = kernel_pml4_virt as *const u64;
-
         for i in 256..512 {
-            let kernel_entry = unsafe { kernel_pml4.add(i).read_volatile() };
-            unsafe { pml4.add(i).write_volatile(kernel_entry) };
+            let entry = unsafe { kernel_pml4.add(i).read_volatile() };
+            unsafe { pml4.add(i).write_volatile(entry) };
         }
 
-        AddressSpace { pml4_phys }
-    }
+        // Next, we map the user stack into the new PML4. We re-acquire the
+        // memory manager lock here because `vmm::map_page` needs the PMM for
+        // intermediate table allocation. The new PML4 is fully initialized at
+        // this point, so `map_page` will correctly build page tables rooted at
+        // `pml4_phys`.
+        {
+            let mut mm_guard = crate::globals::MEMORY_MANAGER.lock();
+            let mm = mm_guard.as_mut().unwrap();
+            for i in 0..Self::USER_STACK_PAGES {
+                // Allocate a physical page for this stack page
+                let phys = mm.alloc_page()
+                    .expect("[CRITICAL] OOM allocating user stack page");
 
-    /// Maps a single page in this address space.
-    ///
-    /// Thin wrapper around the VMM's `map_page` that uses this address space's
-    /// PML4 as the root. Intermediate page tables are allocated from `pmm` as
-    /// needed.
-    ///
-    /// # Arguments
-    ///
-    /// * `pmm`           - Physical memory manager for intermediate table
-    ///                     allocation.
-    /// * `virtual_addr`  - The virtual address to map; must be page-aligned.
-    /// * `physical_addr` - The physical address to map to, which also must be
-    ///                     page-aligned.
-    /// * `flags`         - Page table entry flags (PRESENT, WRITABLE, USER,
-    ///                     NX, etc.). The caller is responsible for including
-    ///                     the USER flag for any page that user-mode code must
-    ///                     be able to access.
-    /// * `is_user_page`  - True for user mappings, false for kernel mappings
-    ///                     within a user address space.
-    pub fn map_page(
-        &self,
-        pmm: &mut PhysicalMemoryManager,
-        virtual_addr: u64,
-        physical_addr: u64,
-        flags: u64,
-        is_user_page: bool,
-    ) {
-        let pml4 = (self.pml4_phys + KERNEL_PHYSICAL_MAP_BASE) as *mut u64;
-        unsafe { map_page(pmm, pml4, virtual_addr, physical_addr, flags,
-            is_user_page) };
+                // Map it into the user address space, growing downward from
+                // USER_STACK_TOP. Page 0 is directly below USER_STACK_TOP,
+                // page 1 is one page below that, and so on.
+                //
+                // Flags: PRESENT | WRITABLE | USER | NX
+                //   USER: ring-3 accessible
+                //   NX:   stack pages should never be executable
+                let virt = Self::USER_STACK_TOP - (i + 1) * PAGE_SIZE;
+                let flags = PRESENT | WRITABLE | USER | NX;
+
+                unsafe { mm.map_page(pml4_phys, virt, phys, flags) };
+            }
+        }
+
+        AddressSpace {
+            pml4_phys,
+            user_stack_top: Self::USER_STACK_TOP,
+            user_stack_pages: Self::USER_STACK_PAGES,
+        }
     }
 
     /// Wraps an already-loaded PML4 physical address in an `AddressSpace`.
@@ -144,8 +165,12 @@ impl AddressSpace {
     /// 
     /// # Arguments
     ///
-    /// * `pml4_phys` - Physical address of the kernel's own PML4.
-    pub fn from_existing(pml4_phys: u64) -> Self {
-        AddressSpace { pml4_phys }
+    /// * `kernel_pml4_phys` - Physical address of the kernel's own PML4.
+    pub fn from_existing(kernel_pml4_phys: u64) -> Self {
+        AddressSpace {
+            pml4_phys: kernel_pml4_phys,
+            user_stack_top: Self::USER_STACK_TOP,
+            user_stack_pages: Self::USER_STACK_PAGES,
+        }
     }
 }

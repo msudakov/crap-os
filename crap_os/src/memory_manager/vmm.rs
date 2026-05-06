@@ -384,7 +384,7 @@ fn invalidate_page(address: u64) {
 /// Performs a `write_volatile` on raw memory locations.
 /// `address` must be a valid virtual address pointing to at least 4096 bytes
 /// of exclusively-owned, writable, mapped memory.
-fn zero_out_page(address: u64) {
+pub(super) fn zero_out_page(address: u64) {
     let page_cursor = address as *mut u64;
     for i in 0..512 {
         unsafe { page_cursor.add(i).write_volatile(0u64) };

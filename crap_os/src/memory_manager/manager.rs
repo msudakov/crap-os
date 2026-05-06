@@ -1,16 +1,16 @@
 //! MemoryManager - Public Interface
 //!
-//! This interface encapsulates the needed physical and virtual memory management
-//! structures and functionality, and exports them to the rest of the system.
-//! This interface is implemented with IRQ-safe spinlock in the system globals.
+//! This interface encapsulates the needed physical and virtual memory
+//! management structures and functionality, and exports them to the rest of
+//! the system. This interface is implemented with IRQ-safe spinlock in the
+//! system globals.
 
-use crate::memory_manager::MemoryMapInfo;
-use crate::memory_manager::PhysicalMemoryManager;
-use crate::memory_manager::vmm;
 use crate::globals::KERNEL_PHYSICAL_MAP_BASE;
+use crate::memory_manager::{KERNEL_PML4, MemoryMapInfo, PhysicalMemoryManager,
+    vmm};
 
 /// The top-level Memory Manager. It owns the physical memory allocator (PMM)
-/// and the root of the page-table hierarchy (PML4).
+/// and the root of the kernel page-table hierarchy (PML4).
 ///
 /// After construction via `MemoryManager::init`, the caller must invoke
 /// `MemoryManager::init_higher_half` to complete the transition to the
@@ -18,22 +18,21 @@ use crate::globals::KERNEL_PHYSICAL_MAP_BASE;
 pub struct MemoryManager {
     /// The physical memory manager tracks which physical pages are free/used
     /// and services `alloc_page` / `free_page` requests.
-    pmm: PhysicalMemoryManager,
+    pub(super) pmm: PhysicalMemoryManager,
 
-    /// Virtual address of the PML4 page-table root. It changes after the
+    /// Virtual address of the kernel PML4 page-table root. It changes after the
     /// higher-half switch from a physical address to a virtual address through
     /// the direct map.
     pml4: *mut u64,
 
-    /// Physical address of the PML4 root, used during early init. It stays
-    /// constant throughout, even after the higher-half switch. It is needed
-    /// by `remove_identity_maps`.
+    /// Physical address of the kernel PML4 root, used during early init. It
+    /// stays constant throughout, even after the higher-half switch.
     pml4_phys: u64,
 }
 
 #[allow(dead_code)]
 impl MemoryManager {
-    /// Creates a new `MemoryManager` and enables the No-Execute (NX) bit
+    /// Creates a new [`MemoryManager`] and enables the No-Execute (NX) bit
     /// in the CPU's EFER (Extended Feature Enable Register) MSR (Model-Specific
     /// Register).
     ///
@@ -44,9 +43,10 @@ impl MemoryManager {
     ///
     /// # Arguments
     /// 
-    /// * `pmm` - An already-initialized physical memory manager.
-    /// * `pml4_phys` - The physical address of the root PML4 table. It is
-    ///   updated to virtual address stored in `pml4` during `init_higher_half`.
+    /// * `pmm`       - An already-initialized physical memory manager.
+    /// * `pml4_phys` - The physical address of the kernel root PML4 table. It
+    ///                 is updated to virtual address stored in `pml4` during
+    ///                 `init_higher_half`.
     /// 
     /// # Safety
     /// 
@@ -87,7 +87,7 @@ impl MemoryManager {
 
         Self {
             pmm,
-            // At this point identity mapping is in effect, so the physical
+            // At this point, identity mapping is in effect, so the physical
             // address can be used directly as a pointer. The `pml4` starts as
             // physical and is updated to virtual in `init_higher_half`.
             pml4: pml4_phys as *mut u64,
@@ -115,8 +115,10 @@ impl MemoryManager {
     /// After this returns, no low virtual address is valid. Physical addresses
     /// are reachable via `phys_to_virt()`. UEFI is completely gone from the
     /// address space.
-    pub fn init_higher_half(&mut self,
-        framebuffer_info: &crate::FramebufferInfo, memory_map: &MemoryMapInfo
+    pub fn init_higher_half(
+        &mut self,
+        framebuffer_info: &crate::FramebufferInfo,
+        memory_map: &MemoryMapInfo,
     ) {
         // Step 1: Map all usable physical memory into the high virtual window.
         // After this, every physical address P can be read/written at
@@ -131,7 +133,8 @@ impl MemoryManager {
         // Step 3: Map the GPU framebuffer into the kernel's virtual address
         // space so the graphics subsystem can still write to it after identity
         // maps are removed.
-        vmm::map_framebuffer_higher_half(&mut self.pmm, self.pml4, framebuffer_info);
+        vmm::map_framebuffer_higher_half(&mut self.pmm, self.pml4,
+            framebuffer_info);
 
         // Step 4: Update `self.pml4` from a physical address pointer to a
         // virtual address pointer through the direct map. All subsequent
@@ -198,48 +201,93 @@ impl MemoryManager {
         virt - KERNEL_PHYSICAL_MAP_BASE
     }
 
-    /// Delegates to the inner `PhysicalMemoryManager::alloc_page()` and
+    /// Delegates to the inner [`PhysicalMemoryManager::alloc_page()`] and
     /// allocates a physical page.
     pub fn alloc_page(&mut self) -> Option<u64> {
         self.pmm.alloc_page()
     }
 
-    /// Delegates to the inner `PhysicalMemoryManager::free_page()` and frees
+    /// Delegates to the inner [`PhysicalMemoryManager::free_page()`] and frees
     /// a physical page.
     pub fn free_page(&mut self, addr: u64) {
         self.pmm.free_page(addr)
     }
 
-    /// Delegates to the `map_page` and maps a physical page to a virtual page.
+    /// Maps a physical page to a virtual page in a virtual address space.
+    /// 
+    /// This function applies to both kernel-mode and user-mode processes. If
+    /// mapping a page in the kernel's address space, pass [`KERNEL_PML4`] in
+    /// the `pml4_phys` parameter; otherwise, pass a user process's PML4
+    /// address.
+    /// 
+    /// # Arguments
+    ///
+    /// * `pml4_phys`    - Physical address of the target process's PML4 if
+    ///                    targeting a user-mode process, or [`KERNEL_PML4`] if
+    ///                    targeting a kernel-mode process.
+    /// * `virtual_addr` - Virtual address to map in the address space.
+    /// * `physical_addr`- Physical page to map.
+    /// * `flags`        - PTE flags.
     /// 
     /// # Safety
     ///
-    /// `virtual_addr` must be a canonical higher-half address not already in
-    /// use by the kernel. `physical_addr` must be a PMM-owned physical page.
-    /// Mapping a page that is already mapped to a different frame silently
-    /// overwrites the PTE.
+    /// `pml4_phys` must be the physical address of a valid, fully-initialized
+    /// PML4, or zero ([`KERNEL_PML4`]) if mapping a kernel page. `virtual_addr`
+    /// must be a canonical higher-half address not already in use by the kernel
+    /// if mapping a kernel page, or a canonical user-space address (below
+    /// 0x0000800000000000) if mapping a user page. Mapping a kernel address
+    /// into a user PML4 with the USER flag would expose kernel memory to ring
+    /// 3. `physical_addr` must be a PMM-owned physical page. Mapping a page
+    /// that is already mapped to a different frame silently overwrites the PTE.
     pub unsafe fn map_page(
         &mut self,
+        pml4_phys: u64,
         virtual_addr: u64,
         physical_addr: u64,
         flags: u64,
-        is_user_page: bool,
     ) {
+        let pml4 = match pml4_phys {
+            KERNEL_PML4 => self.pml4,                             // kernel page
+            _ => (pml4_phys + KERNEL_PHYSICAL_MAP_BASE) as *mut u64 // user page
+        };
+
         unsafe {
-            vmm::map_page(&mut self.pmm, self.pml4, virtual_addr, physical_addr,
-                flags, is_user_page);
+            vmm::map_page(&mut self.pmm, pml4, virtual_addr, physical_addr,
+                flags, true);
         }
     }
 
-    /// Delegates to the `get_physical_addr` and resolves a virtual address to
-    /// its mapped physical address.
+    /// Delegates to the [`vmm::get_physical_addr`] and resolves a virtual
+    /// address to its mapped physical address in the kernel address space or a
+    /// user process address space.
+    /// 
+    /// # Arguments
+    ///
+    /// * `pml4_phys`    - Physical address of the target process's PML4 if
+    ///                    targeting a user-mode process, or [`KERNEL_PML4`] if
+    ///                    targeting a kernel-mode process.
+    /// * `virtual_addr` - Virtual address to resolve in the address space.
+    /// 
+    /// # Returns
+    /// 
+    /// Returns the physical address the virtual address maps to, or `None` if
+    /// it is unmapped.
     /// 
     /// # Safety
     ///
     /// The page table hierarchy must not be concurrently modified while this
     /// function is executing.
-    pub unsafe fn get_physical_addr(&self, virtual_addr: u64) -> Option<u64> {
-        unsafe { vmm::get_physical_addr(self.pml4, virtual_addr) }
+    pub unsafe fn get_physical_addr(
+        &self,
+        pml4_phys: u64,
+        virtual_addr: u64
+    ) -> Option<u64> {
+        let pml4 = match pml4_phys {
+            KERNEL_PML4 => self.pml4,                             // kernel page
+            _ => (pml4_phys + KERNEL_PHYSICAL_MAP_BASE) as *mut u64 // user page
+        };
+
+        unsafe { vmm::get_physical_addr(pml4, virtual_addr) }
     }
 
     /// Unmaps the virtual page, reclaiming any intermediate page tables that
@@ -253,6 +301,13 @@ impl MemoryManager {
     ///   - Shared memory
     ///   - Reference-counted frames
     ///   - Remapping
+    /// 
+    /// # Arguments
+    ///
+    /// * `pml4_phys`    - Physical address of the target process's PML4 if
+    ///                    targeting a user-mode process, or [`KERNEL_PML4`] if
+    ///                    targeting a kernel-mode process.
+    /// * `virtual_addr` - Virtual address to unmap in the address space.
     ///
     /// # Returns
     /// 
@@ -261,30 +316,53 @@ impl MemoryManager {
     /// 
     /// # Safety
     ///
-    /// `virtual_addr` must be a canonical address. Unmapping a page that is
-    /// still in use (e.g., part of a live stack or the heap) causes immediate
-    /// undefined behaviour on next access.
-    pub unsafe fn unmap_page(&mut self, virtual_addr: u64) -> bool {
-        vmm::unmap_page(&mut self.pmm, self.pml4, virtual_addr)
+    /// `pml4_phys` must be the physical address of the process's PML4, or zero
+    /// ([`KERNEL_PML4`]) if unmapping a kernel page. `virtual_addr` must be a
+    /// canonical address. Unmapping a page that is still in use (e.g., part of
+    /// a live stack or the heap) causes immediate undefined behaviour on next
+    /// access.
+    pub unsafe fn unmap_page(
+        &mut self,
+        pml4_phys: u64,
+        virtual_addr: u64
+    ) -> bool {
+        let pml4 = match pml4_phys {
+            KERNEL_PML4 => self.pml4,                             // kernel page
+            _ => (pml4_phys + KERNEL_PHYSICAL_MAP_BASE) as *mut u64 // user page
+        };
+
+        vmm::unmap_page(&mut self.pmm, pml4, virtual_addr)
     }
 
-    /// Same as `unmap_page`, except this function also returns its physical
-    /// frame to the PMM.
+    /// Same as [`MemoryManager::unmap_page`], except this function also frees
+    /// the physical frame and returns it to the PMM.
     ///
-    /// This is the common case. But, `unmap_page` can be used directly if we
-    /// need to handle the physical frame ourselves (e.g., shared mappings, COW,
-    /// etc).
+    /// This is the common case. But, [`MemoryManager::unmap_page`] can be used
+    /// directly if we need to handle the physical frame ourselves (e.g., shared
+    /// mappings, COW, etc).
+    /// 
+    /// # Arguments
+    ///
+    /// * `pml4_phys`    - Physical address of the target process's PML4 if
+    ///                    targeting a user-mode process, or [`KERNEL_PML4`] if
+    ///                    targeting a kernel-mode process.
+    /// * `virtual_addr` - Virtual address to unmap in the address space.
     /// 
     /// # Safety
     ///
-    /// Same as `unmap_page`. Additionally, the freed physical frame must not be
-    /// referenced by any other mapping (e.g., shared memory, COW) or it will be
-    /// returned to the PMM while still live.
-    pub unsafe fn unmap_and_free_page(&mut self, virtual_addr: u64) {
+    /// Same requirements as `unmap_page`. Additionally, the freed physical
+    /// frame must not be referenced by any other mapping (e.g., shared memory,
+    /// COW) or it will be returned to the PMM while still live.
+    pub unsafe fn unmap_and_free_page(
+        &mut self,
+        pml4_phys: u64,
+        virtual_addr: u64
+    ) {
         unsafe {
-            if let Some(phys) = self.get_physical_addr(virtual_addr) {
-                self.unmap_page(virtual_addr);
-                self.pmm.free_page(phys);
+            if let Some(phys) = self.get_physical_addr(pml4_phys, virtual_addr
+            ) {
+                self.unmap_page(pml4_phys, virtual_addr);
+                self.free_page(phys);
             }
         }
     }

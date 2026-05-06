@@ -155,13 +155,10 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
     // Initialize serial port writer for global macros
     {
-        hardware_manager::sprint("TEST 1\n");
         let mut writer = globals::SERIAL.lock();
-        hardware_manager::sprint("TEST 2\n");
         *writer = Some(hardware_manager::SerialWriter::new(
             globals::COM1_PORT,
         ));
-        hardware_manager::sprint("TEST 3\n");
     }
 
     // We can now use serial port IRQ-safe global spinlock macros
@@ -269,7 +266,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     fbprintln!("[+] All MM heap allocator tests passed!\n");*/
 
     // Create and initialize the System process
-    let system_process = globals::PROCESS_MANAGER.create_process(
+    let system_process = globals::PROCESS_MANAGER.create_kernel_process(
         "System",
         cr3,
         nop_thread_stub,
@@ -277,7 +274,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     ).expect("[FATAL ERROR] Failed to create System process");
 
     // Spawn keyboard buffer reader thread in the System process
-    system_process.spawn_thread("Keyboard reader", task_keyboard, 0).expect(
+    system_process.spawn_kernel_thread("Keyboard reader", task_keyboard, 0).expect(
         "Failed to spawn keyboard thread");
     
     // Testing keyboard interrupts
@@ -285,23 +282,68 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     fbprintln!("[*] Testing keyboard interrupts. Type some stuff...");
 
     // Create Test process
-    let test_process_1 = globals::PROCESS_MANAGER.create_process(
+    let test_process_1 = globals::PROCESS_MANAGER.create_kernel_process(
         "Test Proc 1",
         cr3,
         task_a,
         0
     ).expect("Failed to create test process");
-    test_process_1.spawn_thread("P1 T2", task_b, 0).expect("failed to spawn task B");
+    test_process_1.spawn_kernel_thread("P1 T2", task_b, 0).expect("failed to spawn task B");
     
-    //let test_process_2 = globals::PROCESS_MANAGER.create_process(
+    //let test_process_2 = globals::PROCESS_MANAGER.create_kernel_process(
     //    "Test Proc 2",
     //    cr3,
     //    task_c,
     //    0
     //).expect("Failed to create test process");
-    test_process_1.spawn_thread("Fault task", task_fault, 0).expect("failed to spawn Fault Task");
-    let thread_c = test_process_1.spawn_thread("Task C", task_c, 0).expect("failed to spawn task C");
+    test_process_1.spawn_kernel_thread("Fault task", task_fault, 0).expect("failed to spawn Fault Task");
+    let thread_c = test_process_1.spawn_kernel_thread("Task C", task_c, 0).expect("failed to spawn task C");
     crate::process_manager::thread::exit_thread(thread_c);
+
+    // Testing user-mode processes. This is very clunky and is only here for
+    // testing purposes...
+    // This opcode sequence is: push rax; pop rax; jmp -4
+    // It exercises the user stack without doing anything privileged
+    const USER_PAYLOAD: &[u8] = &[0x50, 0x58, 0xEB, 0xFC];
+    const USER_CODE_VIRT: u64 = 0x0000_0000_0040_0000;
+    // Allocate and populate the code page
+    let code_phys = {
+        let mut mm_guard = globals::MEMORY_MANAGER.lock();
+        let mm = mm_guard.as_mut().unwrap();
+        let phys = mm.alloc_page()
+            .expect("[FATAL] OOM allocating user code page");
+        let virt = phys + globals::KERNEL_PHYSICAL_MAP_BASE;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                USER_PAYLOAD.as_ptr(),
+                virt as *mut u8,
+                USER_PAYLOAD.len(),
+            );
+        }
+        phys
+    };
+    // Create the process - AddressSpace::init runs here, PML4 is fresh
+    let user_process = globals::PROCESS_MANAGER.create_user_process(
+        "User Test",
+        cr3,
+        USER_CODE_VIRT,
+    ).expect("Could not create user process");
+    // Map the code page into the process's address space now that
+    // we have the PML4. This must happen before interrupts are enabled so the
+    // thread cannot be scheduled before the mapping is in place.
+    {
+        let mut mm_guard = globals::MEMORY_MANAGER.lock();
+        let mm = mm_guard.as_mut().unwrap();
+        unsafe {
+            mm.map_page(
+                user_process.pml4_phys(),
+                USER_CODE_VIRT,
+                code_phys,
+                crate::memory_manager::PRESENT | crate::memory_manager::USER,
+            );
+        }
+    }
+
 
 
     // Signal the Task Scheduler that the kernel has completed its
@@ -314,6 +356,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // handlers. The System process is also initialized, and it is now safe to
     // re-enable maskable hardware interrupts.
     unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
+
 
     //globals::PROCESS_MANAGER.print_processes();
 

@@ -53,7 +53,6 @@
 #include <efi.h>
 #include <efilib.h>
 
-
 #define COM1_PORT 0x3F8  // COM1 port base address
 #define KERNEL_STACK_PAGES 32  // 32 * 4096 = 128 KB; lower it to 64 later on
 #define KERNEL_STACK_SIZE  (KERNEL_STACK_PAGES * 0x1000)
@@ -96,6 +95,7 @@ typedef struct {
     UINT64 memory_map_size;
     UINT64 descriptor_size;
     UINT32 descriptor_ver;
+    UINT32 bsp_apic_id;  // Fits in u8, but stored as u32 for natural alignment
     UINT64 kernel_load_addr;
     UINT64 kernel_image_size;
     UINT64 stack_base_addr;
@@ -595,8 +595,13 @@ static UINT64 build_page_tables(
         UINT64 rsdp_page = RsdpAddr & ~0xFFFULL;
         map_page_pool(&pool, pml4, rsdp_page, rsdp_page, PT_PRESENT);
         // Also map the next page since XSDT pointer inside may reference it
+        /*
         map_page_pool(&pool, pml4, rsdp_page + 0x1000, rsdp_page + 0x1000,
             PT_PRESENT);
+        */
+        // Removed because it is likely unused; XSDT itself can be much larger
+        // than one page, and it likely won't be at rsdp_page + 0x1000 anyway,
+        // since it's at an arbitrary physical address.
     }
 
     // -------------------------------------------------------------------------
@@ -899,6 +904,20 @@ efi_main(EFI_HANDLE ImageHandle, EFI_SYSTEM_TABLE *SystemTable) {
 
     // Add the RSDP address to the memory map
     MemoryMapInfoStruct->rsdp_addr = RsdpAddr;
+
+    // Read BSP APIC ID via CPUID leaf 1, EBX bits [31:24].
+    // This is always valid, requires no MMIO, and doesn't depend on LAPIC
+    // initialization state. The initial APIC ID is the hardware-assigned
+    // ID of the executing processor (the BSP at boot time).
+    UINT32 ebx = 0;
+    __asm__ __volatile__(
+        "cpuid"
+        : "=b"(ebx)
+        : "a"(1)
+        : "ecx", "edx"
+    );
+    MemoryMapInfoStruct->bsp_apic_id = (ebx >> 24) & 0xFF;
+    Print(L"[+] BSP APIC ID: 0x%x\n\r", MemoryMapInfoStruct->bsp_apic_id);
 
     // We have to call GetMemoryMap twice. This first call gets the
     // initial size of the memory map structure. It may or may not change

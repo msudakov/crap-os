@@ -167,7 +167,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     sprint_debug!(DebugLevel::INFO, "[INFO] Serial initialized successfully");
 
 
-    
+
     // CPU parsing test
     {
         sprintln!("[INFO] CPU topology from ACPI MADT:");
@@ -188,6 +188,9 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             panic!("BSP APIC ID {:#x} not found in MADT — firmware bug or struct layout mismatch", cpu_topology.bsp_apic_id);
         }
     }
+
+    // Initialize CPU topology
+    processor_control::init_cpu_topology(cpu_topology);
 
 
 

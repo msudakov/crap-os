@@ -5,5 +5,8 @@
 //! and IPI dispatch.
 
 pub mod topology;
+pub mod per_cpu;
 
-pub use topology::{CpuInfo, CpuTopology, MAX_CPUS};
+pub use topology::{CpuInfo, CpuTopology, MAX_CPUS, CPU_TOPOLOGY,
+    init_cpu_topology};
+pub use per_cpu::{CpuId, PerCpu};

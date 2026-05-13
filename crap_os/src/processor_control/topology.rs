@@ -9,6 +9,8 @@
 //! This structure informs the rest of the system how many CPUs exist, what a
 //! CPU's APIC ID is, which CPU is the BSP, etc.
 
+use crate::spinlock::StaticSpinLock;
+
 /// Maximum number of logical CPUs this kernel will support.
 ///
 /// 64 covers any realistic desktop or workstation target. We can later raise it
@@ -40,6 +42,9 @@ pub struct CpuInfo {
     /// online at runtime even if `enabled` is currently false (firmware-
     /// managed hot-plug).
     pub online_capable: bool,
+
+    // TODO: Add `CpuState` enum for when implementing SIPI sequence and the
+    // AP bring-up.
 }
 
 impl CpuInfo {
@@ -133,4 +138,26 @@ impl CpuTopology {
     pub fn get_usable_cpu_count(&self) -> usize {
         self.get_enabled_cpus().count()
     }
+}
+
+/// Global CPU topology, populated once during early kernel initialization by
+/// `hardware_manager::parse_acpi` and then read-only for the kernel's lifetime.
+///
+/// A `StaticSpinLock` is used to satisfy the `static` requirement, but after
+/// `init` is called this lock is never contended — callers should only ever
+/// read through it. Write access is intentionally limited to the single `init`
+/// call in `_start`.
+pub static CPU_TOPOLOGY: StaticSpinLock<Option<CpuTopology>> =
+    StaticSpinLock::new(None);
+
+/// Initializes the global CPU topology. Must be called exactly once during
+/// kernel init, before any code that calls `cpu_topology()`.
+///
+/// # Panics
+///
+/// Panics if called more than once (topology is already `Some`).
+pub fn init_cpu_topology(topology: CpuTopology) {
+    let mut guard = CPU_TOPOLOGY.lock();
+    assert!(guard.is_none(), "CPU topology already initialized");
+    *guard = Some(topology);
 }

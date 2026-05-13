@@ -599,9 +599,10 @@ static UINT64 build_page_tables(
         map_page_pool(&pool, pml4, rsdp_page + 0x1000, rsdp_page + 0x1000,
             PT_PRESENT);
         */
+        // TODO:
         // Removed because it is likely unused; XSDT itself can be much larger
         // than one page, and it likely won't be at rsdp_page + 0x1000 anyway,
-        // since it's at an arbitrary physical address.
+        // since it's at an arbitrary physical address. Double check this later.
     }
 
     // -------------------------------------------------------------------------

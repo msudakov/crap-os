@@ -62,27 +62,29 @@ impl CpuId {
     /// cache the result locally rather than calling this repeatedly.
     #[inline]
     pub fn current() -> Self {
-        let ebx: u32;
+        let apic_id: u32;
+        
         // SAFETY: CPUID is always available on x86-64. Leaf 1 is guaranteed
         // to exist on any processor that supports the x86-64 ISA. RBX is used
         // internally by LLVM and cannot be used as an operand for inline asm;
         // so, we let the compiler pick a scratch register and move it manually.
         unsafe {
             core::arch::asm!(
-                "mov {tmp}, rbx",   // Save rbx to a compiler-chosen register
-                "cpuid",
-                "mov {out}, ebx",   // Capture EBX result
-                "mov rbx, {tmp}",   // Restore rbx
-                tmp = out(reg) _,
-                out = out(reg) ebx,
+                "mov {save}, rbx",   // Save rbx to a 64-bit compiler reg
+                "cpuid",             // Clobbers eax/ebx/ecx/edx
+                "shr ebx, 24",       // Shift APIC ID bits [31:24] down to [7:0]
+                "movzx {out:e}, bl", // Zero-extend the low byte into output reg
+                "mov rbx, {save}",   // Restore rbx
+                save = out(reg) _,   // Compiler picks a 64-bit scratch reg
+                out  = out(reg) apic_id,
                 in("eax") 1u32,
                 out("ecx") _,
                 out("edx") _,
                 options(nostack, nomem),
             );
         }
-        // Initial APIC ID is in bits [31:24] of EBX
-        CpuId((ebx >> 24) & 0xFF)
+
+        CpuId(apic_id)
     }
  
     /// Constructs a `CpuId` from a raw APIC ID value.

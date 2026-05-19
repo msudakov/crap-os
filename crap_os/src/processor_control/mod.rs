@@ -6,7 +6,31 @@
 
 pub mod topology;
 pub mod per_cpu;
+pub mod gdt;
 
 pub use topology::{CpuInfo, CpuTopology, MAX_CPUS, CPU_TOPOLOGY,
     init_cpu_topology};
 pub use per_cpu::{CpuId, PerCpu};
+pub use gdt::{
+    // Runtime API
+    set_kernel_stack,
+    init_gdt,
+    ap_init_gdt,
+    // Types needed by other modules
+    Tss,
+    Gdt,
+    IstStack,
+    // Per-CPU statics
+    CPU_TSS,
+    CPU_GDT,
+    CPU_DOUBLE_FAULT_STACK,
+    // Selector constants referenced from idt.rs and task.rs
+    KERNEL_CS,
+    KERNEL_DS,
+    TSS_SELECTOR,
+    USER_CS,
+    USER_DS,
+    USER_CS_RPL3,
+    USER_DS_RPL3,
+    DOUBLE_FAULT_IST_SIZE,
+};

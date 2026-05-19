@@ -55,8 +55,8 @@
 use core::sync::atomic::Ordering;
 use core::arch::asm;        // used in non-naked handlers (cr2 read, cpu_halt)
 use core::arch::naked_asm;  // used inside #[naked] trampolines
-use crate::gdt::KERNEL_CS;
-use crate::globals::IDT;
+use crate::processor_control::gdt::KERNEL_CS;
+use crate::globals::{IDT, CPU_FORCE_RESCHEDULE};
 use crate::hardware_manager;
 use crate::helper_functions::print_u64_field;
 
@@ -848,11 +848,12 @@ extern "C" fn handler_apic_timer(_frame: &InterruptFrame) {
     // for tombstone cleanup in the following timer tick.
     crate::task_scheduler::reap_dying_tasks();
 
-    // Check if a SystemTask has set the force reschedule flag, and reset it
-    if crate::globals::SYS_FLAG_FORCE_RESCHEDULE.load(Ordering::Relaxed) {
+    // Check if a SystemTask has set the force reschedule flag on this CPU,
+    // honor it, then reset it.
+    let force_flag = CPU_FORCE_RESCHEDULE.current();
+    if force_flag.load(Ordering::Relaxed) {
         should_schedule = true;
-        crate::globals::SYS_FLAG_FORCE_RESCHEDULE.store(
-            false, Ordering::SeqCst);
+        force_flag.store(false, Ordering::SeqCst);
     }
 
     // Send EOI before schedule(). This re-arms the APIC for the next tick.

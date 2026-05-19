@@ -13,7 +13,6 @@ mod memory_manager;
 mod system_core;
 mod task_scheduler;
 mod process_manager;
-pub mod gdt;
 pub mod idt;
 mod tests;
 
@@ -197,8 +196,11 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // Initialie kernel heap and pre-map 16 pages (64 KB)
     globals::KERNEL_HEAP.heap.lock().init(16);
 
-    unsafe { crate::gdt::init_gdt(); }  // Initialize Global Descriptor Table
-    unsafe { crate::idt::init_idt(); }  // Initialize Interrupt Descriptor Table
+    // Initialize Global Descriptor Table
+    unsafe { processor_control::gdt::init_gdt(); }
+
+    // Initialize Interrupt Descriptor Table
+    unsafe { crate::idt::init_idt(); }
 
     // Initialize framebuffer writer for global macros
     {

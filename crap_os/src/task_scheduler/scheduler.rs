@@ -52,14 +52,16 @@
 //!     outgoing task's saved flags, thus corrupting the incoming task's
 //!     interrupt state.
 
-use core::sync::atomic::Ordering;
+use core::sync::atomic::{Ordering, AtomicBool};
 use alloc::sync::Weak;
 use super::switcher::switch_to;
 use super::task::{Task, TaskId, TaskState};
 use super::queue_task_reaper;
 use crate::spinlock::{IrqSpinLock, StaticIrqSpinLock};
-use crate::globals::SYS_FLAG_KERNEL_INIT_COMPLETE;
+use crate::globals::{SYS_FLAG_KERNEL_INIT_COMPLETE, CPU_TICKS_REMAINING,
+    TASK_QUANTUM_TICKS, CPU_FORCE_RESCHEDULE};
 use crate::process_manager::thread::{Thread, ThreadState};
+use crate::processor_control::{CpuId};
 
 /// Maximum number of simultaneously live tasks (in any [`TaskState`]) in
 /// [`TaskSlot`]s.
@@ -476,8 +478,8 @@ pub(super) static SCHEDULER: StaticIrqSpinLock<Scheduler> =
 // Public API - exported at the module level
 // =============================================================================
 
-/// Initializes the scheduler and registers the current execution context as
-/// the idle task (`TaskId::IDLE`).
+/// Initializes the scheduler, registers the current execution context as the
+/// idle task (`TaskId::IDLE`), and initializes the BSP's per-CPU quantum slot.
 ///
 /// The idle task is the kernel's own `_start` routine that is already running
 /// on the higher-half stack. We register it as `TaskId::IDLE`, so that the
@@ -513,6 +515,15 @@ pub fn init_idle(thread: Weak<IrqSpinLock<Thread>>) {
 
     // `current` is set to IDLE here because the idle task is currently running
     scheduler.current = TaskId::IDLE;
+
+    // Initialize the BSP's quantum slot and flag slot. The idle task runs until
+    // the first real task is ready; giving it a full quantum is the safest
+    // default.
+    let cpu = CpuId::current();
+    unsafe {
+        CPU_TICKS_REMAINING.init(CpuId::current(), TASK_QUANTUM_TICKS);
+        CPU_FORCE_RESCHEDULE.init(cpu, AtomicBool::new(false));
+    }
 }
 
 /// Inserts a new kernel task into the Scheduler's tasks table, and enqueues it
@@ -661,12 +672,19 @@ pub unsafe fn schedule() {
         // avoids clobbering a valid TSS entry with a meaningless value when
         // switching between two kernel tasks.
         if next_task.is_user_task {
-            crate::gdt::set_kernel_stack(next_task.kernel_stack_top);
+            crate::processor_control::gdt::set_kernel_stack(next_task.kernel_stack_top);
         }
 
-        // Fetch the new CR3 and saved RSP variables to pass to the switcher
+        // Fetch the new CR3 and saved RSP variables to pass to the switcher,
+        // and the remaining quantum ticks for the new task.
         let new_rsp = next_task.saved_rsp;
         let new_cr3 = next_task.cr3;
+        let new_quantum = next_task.ticks_remaining;
+
+        // Load the incoming task's quantum into this CPU's per-CPU slot, so the
+        // timer ISR sees the correct remaining ticks without acquiring the
+        // scheduler lock.
+        unsafe { *CPU_TICKS_REMAINING.get_mut(CpuId::current()) = new_quantum };
 
         (old_rsp_ptr, new_rsp, new_cr3)
 
@@ -740,20 +758,40 @@ pub unsafe fn schedule() {
 /// 
 /// Returns `true` if the scheduler should preempt the current task, `false` if
 /// the current task should continue running.
-///
-/// # SMP note
-/// Currently acquires the global SCHEDULER lock to access the current task.
-/// In a future SMP implementation, `ticks_remaining` should migrate to
-/// per-CPU state, so the hot timer path never needs the global lock, and only
-/// `schedule()` itself would acquire it when actually switching tasks.
-/// `ticks_executed` correctly stays in `Task` permanently, as it is
-/// per-task, not per-CPU.
 pub fn on_timer_tick() -> bool {
     // Advance the sleep delta queue. Any tasks woken here will be Ready and
     // eligible for scheduling within this same tick.
     super::sleep_queue::tick_sleep_queue();
 
-    let mut scheduler = SCHEDULER.lock();
+    // Read and decrement the per-CPU quantum counter; no scheduler lock needed.
+    // This is the only value the timer ISR hot path touches on every tick.
+    let cpu = CpuId::current();
+    let remaining = CPU_TICKS_REMAINING.get(cpu);
+
+    // `ticks_executed` still lives on the Task and requires the scheduler lock.
+    // We only pay this cost once per tick, not per-CPU per-tick in the future.
+    {
+        let mut scheduler = SCHEDULER.lock();
+        let current_id = scheduler.current;
+        if let Some(task) = scheduler.get_task_mut(current_id) {
+            task.ticks_executed.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    if *remaining <= 1 {
+        // Quantum expired. Reset the per-CPU counter to a full quantum so
+        // the incoming task starts fresh. The task's own ticks_remaining
+        // field will be overwritten by schedule() when it loads the next
+        // task's quantum into this slot.
+        unsafe { *CPU_TICKS_REMAINING.get_mut(cpu) = TASK_QUANTUM_TICKS };
+        true
+    }
+    else {
+        unsafe { *CPU_TICKS_REMAINING.get_mut(cpu) = remaining - 1 };
+        false
+    }
+
+    /*let mut scheduler = SCHEDULER.lock();
     let current_id = scheduler.current;
 
     if let Some(task) = scheduler.get_task_mut(current_id) {
@@ -778,7 +816,7 @@ pub fn on_timer_tick() -> bool {
         // No task is currently registered as running.
         // Signal the ISR to call schedule(), so it can find one.
         true
-    }
+    }*/
 }
 
 /// Blocks the calling task and immediately yields the CPU to the next ready
@@ -938,8 +976,7 @@ pub fn kill_task(task_id_u64: u64) {
     if is_current {
         // Signal the timer ISR to reschedule regardless of task quantum once
         // the system task queue is fully drained.
-        crate::globals::SYS_FLAG_FORCE_RESCHEDULE.store(
-            true, core::sync::atomic::Ordering::SeqCst);
+        CPU_FORCE_RESCHEDULE.current().store(true, Ordering::SeqCst);
     }
 }
 

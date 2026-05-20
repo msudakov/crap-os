@@ -9,7 +9,6 @@ use crate::spinlock::StaticIrqSpinLock;
 use crate::hardware_manager::{SerialWriter, FramebufferWriter};
 use crate::memory_manager::{MemoryManager, LockedHeap};
 use crate::process_manager::{ProcessManager};
-use crate::idt::{Idt, IdtEntry};
 use crate::hardware_manager::hpet::HpetInfo;
 use crate::processor_control::per_cpu::PerCpu;
 
@@ -70,18 +69,9 @@ pub static KERNEL_HEAP: LockedHeap = LockedHeap::new(
 /// Global Process Manager singleton.
 pub static PROCESS_MANAGER: ProcessManager = ProcessManager::new();
 
-/// The global IDT instance.
-/// 
-/// `static mut` is safe here for the same reason as the GDT: the IDT is written
-/// once during single-threaded init (before interrupts are enabled) and is
-/// read-only after that from Rust's perspective. The CPU reads it on every
-/// exception/interrupt, but never writes to it. So, this does not need to be
-/// in a spinlock.
-pub static mut IDT: Idt = Idt {
-    entries: [IdtEntry::missing(); 256],
-};
-
-/// Global monotonic tick counter, incremented by the APIC timer IRQ handler.
+/// Global monotonic tick counter, incremented by the BSP's timer ISR on every
+/// tick. Used as a wall-clock reference for sleep and timeout calculations. On
+/// SMP, this remains BSP-only.
 ///
 /// `AtomicU64` makes the counter safe to read from any context (interrupt
 /// handlers, kernel threads) without a lock. `Relaxed` ordering is acceptable

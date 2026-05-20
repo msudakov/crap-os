@@ -106,7 +106,7 @@ pub struct Tss {
     ///
     /// The CPU loads RSP from `rsp[0]` (RSP0) when transitioning from ring 3
     /// to ring 0 (e.g., on every syscall or user-mode interrupt). RSP1 and
-    /// RSP2 are for transitions to rings 1 and 2 respectively.
+    /// RSP2 are for transitions to rings 1 and 2, respectively.
     pub rsp: [u64; 3],
 
     /// Reserved; the CPU never reads this field.

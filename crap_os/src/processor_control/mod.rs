@@ -7,6 +7,7 @@
 pub mod topology;
 pub mod per_cpu;
 pub mod gdt;
+pub mod idt;
 
 pub use topology::{CpuInfo, CpuTopology, MAX_CPUS, CPU_TOPOLOGY,
     init_cpu_topology};
@@ -33,4 +34,12 @@ pub use gdt::{
     USER_CS_RPL3,
     USER_DS_RPL3,
     DOUBLE_FAULT_IST_SIZE,
+};
+pub use idt::{
+    init_idt,
+    load_idt,
+    Idt,
+    IdtEntry,
+    InterruptFrame,
+    IDT,
 };

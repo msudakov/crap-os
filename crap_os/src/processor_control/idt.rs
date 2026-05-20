@@ -48,15 +48,21 @@
 //! access to every field.
 //!
 //! The double-fault handler (#DF, vector 8) is installed with IST=1, which
-//! points to the dedicated `DOUBLE_FAULT_STACK` defined in gdt.rs. All other
-//! handlers use IST=0 (no stack switch; they run on whatever stack was active
-//! when the exception fired).
+//! points to the dedicated per-CPU double-fault stack defined in gdt.rs.
+//! All other handlers use IST=0 (no stack switch; they run on whatever stack
+//! was active when the exception fired).
+//!
+//! Unlike the GDT, the IDT entries are identical across all CPUs, as every core
+//! uses the same 256 handler addresses. The IDT is therefore a single shared
+//! static. `init_idt()` populates it once on the BSP; `load_idt()` executes
+//! `lidt` on each CPU (BSP and each AP) to point that CPU's IDTR at the same
+//! table.
 
 use core::sync::atomic::Ordering;
-use core::arch::asm;        // used in non-naked handlers (cr2 read, cpu_halt)
-use core::arch::naked_asm;  // used inside #[naked] trampolines
+use core::arch::asm;
+use core::arch::naked_asm;
 use crate::processor_control::gdt::KERNEL_CS;
-use crate::globals::{IDT, CPU_FORCE_RESCHEDULE};
+use crate::globals::CPU_FORCE_RESCHEDULE;
 use crate::hardware_manager;
 use crate::helper_functions::print_u64_field;
 
@@ -66,13 +72,12 @@ use crate::helper_functions::print_u64_field;
 
 /// The full CPU + GPR context captured by every interrupt trampoline.
 ///
-/// Fields are ordered to match the stack layout described above, from lowest
-/// address (RAX, pushed last) to highest address (SS, pushed first by CPU).
-/// The struct is `#[repr(C)]` so the compiler cannot reorder fields and the
-/// pointer cast from RSP is well-defined.
+/// Fields are ordered to match the stack layout described in the module docs,
+/// from lowest address (RAX, pushed last) to highest address (SS, pushed first
+/// by the CPU). `repr(C)` prevents field reordering so the pointer cast from
+/// RSP is well-defined.
 #[repr(C)]
 pub struct InterruptFrame {
-    // General-purpose registers saved by the trampoline (low -> high address)
     pub rax: u64,
     pub rbx: u64,
     pub rcx: u64,
@@ -89,10 +94,10 @@ pub struct InterruptFrame {
     pub r14: u64,
     pub r15: u64,
 
-    // Error code: pushed by the CPU for some exceptions; 0 for the rest.
+    // Error code: pushed by the CPU for some exceptions; 0 for the rest
     pub error_code: u64,
 
-    // Fields pushed automatically by the CPU on exception entry.
+    // Fields pushed automatically by the CPU on exception entry
     pub rip:    u64,
     pub cs:     u64,
     pub rflags: u64,
@@ -189,16 +194,34 @@ impl IdtEntry {
     }
 }
 
+// =============================================================================
+// IDT storage
+// =============================================================================
+
 /// The kernel's 256-entry Interrupt Descriptor Table.
 ///
-/// 256 * 16 bytes = 4096 bytes (exactly one page). `align(16)` satisfies
-/// the architectural requirement that the IDT base be 8-byte aligned; 16-byte
-/// alignment additionally ensures every entry starts on a naturally aligned
-/// boundary for clean cache-line behaviour.
+/// 256 * 16 bytes = 4096 bytes (exactly one page). Shared across all CPUs, as
+/// every core loads the same handler addresses via `load_idt()`. Written once
+/// by `init_idt()` during single-threaded BSP init, then read-only for the
+/// kernel's lifetime.
+///
+/// `align(16)` satisfies the architectural requirement that the IDT base be
+/// 8-byte aligned and additionally ensures every entry starts on a naturally
+/// aligned boundary.
 #[repr(C, align(16))]
 pub struct Idt {
     pub entries: [IdtEntry; 256],
 }
+
+/// The single shared IDT instance.
+///
+/// Written exactly once by `init_idt()`. After, it is treated as read-only, and
+/// no lock is needed for reads. The `static mut` is required because the CPU
+/// accesses it by raw virtual address (via IDTR), not through a Rust reference,
+/// and we need a stable address for the kernel's lifetime.
+pub static mut IDT: Idt = Idt {
+    entries: [IdtEntry::missing(); 256],
+};
 
 /// The 10-byte IDTR pseudo-descriptor loaded via `lidt`.
 #[repr(C, packed)]
@@ -508,11 +531,7 @@ fn print_frame(frame: &InterruptFrame) {
 fn cpu_halt() -> ! {
     loop {
         unsafe {
-            asm!(
-                "cli",
-                "hlt",
-                options(nomem, nostack),
-            );
+            asm!("cli", "hlt", options(nomem, nostack));
         }
     }
 }
@@ -898,20 +917,18 @@ extern "C" fn handler_apic_spurious(_frame: &InterruptFrame) {
 }
 
 // =============================================================================
-// IDT Initialization
+// Initialization
 // =============================================================================
 
-/// Populates all 256 IDT entries and loads the table into the CPU via `lidt`.
+/// Populates all 256 IDT entries.
 ///
-/// The call order is important here:
-///   1. `gdt::init_gdt()` must be called first (the IDT entries reference the
-///      KERNEL_CS selector, which must be valid in the GDT);
-///   2. `idt::init_idt()` installs the handlers;
-///   3. The caller may then execute `sti` to enable interrupts.
+/// Called once during single-threaded BSP initialization, before `load_idt()`
+/// and before `sti`. After this returns, the IDT is effectively read-only.
 ///
 /// # Safety
-/// 
-/// Must be called once, during single-threaded kernel init, before `sti`.
+///
+/// Must be called exactly once, during single-threaded BSP init, with
+/// interrupts disabled.
 pub unsafe fn init_idt() {
     unsafe {
         // `&raw mut` produces a raw pointer directly without forming a
@@ -976,13 +993,26 @@ pub unsafe fn init_idt() {
             stub_apic_keyboard as unsafe extern "C" fn() as u64, 0);
         (*idt)[0xFF] = IdtEntry::interrupt_gate(
             stub_apic_spurious as unsafe extern "C" fn() as u64, 0);
+    }
+}
 
-        // Build and load the IDTR pseudo-descriptor
-        let idtr = IdtDescriptor {
-            limit: (core::mem::size_of::<Idt>() - 1) as u16,
-            base:  core::ptr::addr_of!(IDT) as u64,
-        };
+/// Loads the IDT into the calling CPU's IDTR register via `lidt`.
+///
+/// Must be called on every CPU: on BSP, after `init_idt()`; on each AP,
+/// during its own bring-up sequence. All CPUs point at the same shared `IDT`
+/// static.
+///
+/// # Safety
+///
+/// `init_idt()` must have been called before this is called on any CPU.
+/// Interrupts should be disabled on the calling CPU.
+pub unsafe fn load_idt() {
+    let idtr = IdtDescriptor {
+        limit: (core::mem::size_of::<Idt>() - 1) as u16,
+        base:  core::ptr::addr_of!(IDT) as u64,
+    };
 
+    unsafe {
         asm!(
             "lidt [{idtr}]",
             idtr = in(reg) &idtr as *const IdtDescriptor as u64,

@@ -13,7 +13,6 @@ mod memory_manager;
 mod system_core;
 mod task_scheduler;
 mod process_manager;
-pub mod idt;
 mod tests;
 
 use hardware_manager::FramebufferInfo;
@@ -200,7 +199,8 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     unsafe { processor_control::gdt::init_gdt(); }
 
     // Initialize Interrupt Descriptor Table
-    unsafe { crate::idt::init_idt(); }
+    unsafe { crate::processor_control::init_idt(); }
+    unsafe { crate::processor_control::load_idt(); }
 
     // Initialize framebuffer writer for global macros
     {

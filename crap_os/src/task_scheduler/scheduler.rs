@@ -507,9 +507,6 @@ impl PerCpuQueue {
     }
 }
 
-
-
-
 /// Per-CPU scheduler state that includes the ready queue spinlock and the
 /// currently executing task.
 ///
@@ -636,7 +633,11 @@ pub fn insert_and_queue_task(task: Task) -> Result<TaskId, SchedulerError> {
     // If the queue is full, the task remains in the table as `Ready`, but is
     // unreachable by the scheduler until a slot frees up. In practice, this
     // should not happen if QUEUE_SIZE == MAX_TASKS.
-    bsp.queue.lock().push(task_id).expect("[SCHEDULER] Task inserted into table but CPU Ready queue is full");
+    bsp.queue
+        .lock()
+        .push(task_id)
+        .expect(
+            "[SCHEDULER] Task inserted into table but CPU Ready queue is full");
 
     Ok(task_id)
 }
@@ -743,7 +744,8 @@ pub unsafe fn schedule() {
                     if outgoing_id != TaskId::IDLE || queue_idle {
                         if cpu_sched.queue.lock().push(outgoing_id).is_err() {
                             crate::hardware_manager::serial::print(
-                                "\n[SCHEDULER] Failed to re-enqueue outgoing task: ready queue full\n");
+                                "\n[SCHEDULER] Failed to re-enqueue outgoing 
+                                task: ready queue full\n");
                         }
                     }
                 }

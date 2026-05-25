@@ -24,7 +24,7 @@ use crate::spinlock::IrqSpinLock;
 use crate::task_scheduler::queue_task_reaper;
 use crate::process_manager::thread::{Thread, ThreadState};
 use crate::memory_manager::AddressSpace;
-use crate::gdt::{USER_CS_RPL3, USER_DS_RPL3};
+use crate::processor_control::gdt::{USER_CS_RPL3, USER_DS_RPL3};
 
 /// Uniquely identifies a task within the scheduler's task table.
 ///
@@ -466,15 +466,10 @@ pub struct Task {
     /// here saves critical time during context switches.
     pub cr3: u64,
 
-    /// The number of system clock ticks remaining in the quantum of this task.
-    /// 
-    /// This starts out at max quantum ticks and gets decremented every clock
-    /// tick. When it reaches 1 (not 0, because that check happens at the end
-    /// of the task's tick period), the task is scheduled for preemption.
-    /// 
-    /// TODO: migrate this to Process Control structure when per-CPU storage is
-    /// implemented. On SMP, this should live on the running core, not the task,
-    /// to avoid needing the scheduler lock in the timer ISR hot path.
+    /// The number of ticks remaining in this task's quantum, stored here as the
+    /// value to load into the per-CPU `CPU_TICKS_REMAINING` slot when this task
+    /// is next scheduled in. The live countdown during execution lives in
+    /// `globals::CPU_TICKS_REMAINING`, not here.
     pub ticks_remaining: u32,
 
     /// The total number of system clock ticks this task has consumed; used for
@@ -758,8 +753,12 @@ pub fn task_exit() -> ! {
     // is dropped before we call `schedule()` (which will acquire it again
     // internally), and we must not hold it across that call.
     {
-        let mut scheduler = super::scheduler::SCHEDULER.lock();
-        let this_id = scheduler.current;
+        // TODO: Remove the commented lines after testing
+        //let mut scheduler = super::scheduler::SCHEDULER.lock();
+        //let this_id = scheduler.current;
+        let this_id = super::scheduler::get_current_task_id();
+        let mut scheduler = super::scheduler::GLOBAL_SCHEDULER.lock();
+        
         if let Some(task) = scheduler.get_task_mut(this_id) {
             task.state = TaskState::Dying;
 

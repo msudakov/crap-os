@@ -53,6 +53,7 @@
 
 use core::ptr;
 use crate::memory_manager::MemoryManager;
+use crate::processor_control::topology::{CpuInfo, CpuTopology};
 
 /// ACPI 2.0 Root System Description Pointer (RSDP) - the entry point into the
 /// ACPI table tree.
@@ -190,6 +191,35 @@ struct MadtEntryHeader {
     length: u8,
 }
 
+/// MADT entry type 0: Processor Local APIC.
+///
+/// One entry exists per logical CPU in the system. The `apic_id` field is the
+/// hardware APIC ID used for interrupt routing and IPI targeting. The `flags`
+/// field indicates whether the CPU is usable:
+///   bit 0 (ENABLED):        firmware has enabled this CPU.
+///   bit 1 (ONLINE_CAPABLE): CPU can be brought online at runtime (hot-plug).
+///
+/// A CPU with neither bit set should be ignored entirely.
+#[repr(C, packed)]
+struct MadtLocalApic {
+    /// Standard 2-byte MADT entry header (entry_type = 0, length = 8).
+    header: MadtEntryHeader,
+
+    /// ACPI Processor UID. Correlates this entry with ACPI processor objects
+    /// in the DSDT/SSDT. Not used for interrupt routing.
+    acpi_uid: u8,
+
+    /// Hardware APIC ID. This is what the LAPIC ID register reports for this
+    /// CPU, and what the I/O APIC redirection table destination field expects
+    /// when targeting this CPU in physical destination mode.
+    apic_id: u8,
+
+    /// Processor flags:
+    ///   bit 0 = ENABLED:        CPU is enabled and may be started.
+    ///   bit 1 = ONLINE_CAPABLE: CPU supports firmware-managed hot-plug.
+    flags: u32,
+}
+
 /// MADT entry type 1: I/O APIC.
 ///
 /// Describes one I/O APIC in the system. A machine may have more than one
@@ -288,18 +318,28 @@ pub(super) unsafe fn find_acpi_table(
 
 /// Parses the ACPI tables starting from the RSDP.
 ///
+/// Performs a single pass through the MADT, simultaneously collecting:
+///   - APIC hardware addresses (Local APIC base, I/O APIC base, and GSI base)
+///   - CPU topology (one `CpuInfo` per Processor Local APIC entry, type 0)
+///
+/// The `bsp_apic_id` field of the returned `CpuTopology` is set from the
+/// `bsp_apic_id` argument (passed from `MemoryMapInfo`, which the bootloader
+/// populated via CPUID leaf 1).
+///
 /// # Arguments
 /// 
-/// * `rsdp_virt` - RSDP virtual address from the bootloader (already translated
-///     through the kernel's direct physical map). ACPI tables themselves store
-///     physical addresses internally; this function translates those physical
-///     addresses to virtual ones using the Memory Manager before dereferencing
-///     them.
+/// * `rsdp_virt`    - RSDP virtual address from the bootloader (already
+///     translated through the kernel's direct physical map). ACPI tables
+///     themselves store physical addresses internally; this function translates
+///     those physical addresses to virtual ones using the Memory Manager before
+///     dereferencing them.
+/// * `bsp_apic_id`  - APIC ID of the Bootstrap Processor, as read by the
+///     bootloader via CPUID leaf 1, EBX bits [31:24].
 /// 
 /// # Returns
 /// 
-/// Returns the APIC-related addresses, or `None` if the RSDP signature is
-/// invalid or the MADT cannot be found.
+/// Returns `Some((ApicInfo, CpuTopology))` on success, or `None` if the RSDP
+/// signature is invalid or the MADT cannot be found.
 /// 
 /// # Safety
 /// 
@@ -308,13 +348,16 @@ pub(super) unsafe fn find_acpi_table(
 /// - All physical addresses referenced by the ACPI tables are covered by the
 ///     kernel's direct physical map (i.e., `phys_to_virt` can safely translate
 ///     them). This is guaranteed as long as the physical map covers the first
-///     4 GiB, as CPI tables are always below 4 GiB on x86-64.
-pub unsafe fn parse_acpi(rsdp_virt: u64) -> Option<ApicInfo> {
-    // Locate the APIC table MADT pointer
+///     4 GiB, as ACPI tables are always below 4 GiB on x86-64.
+pub unsafe fn parse_acpi(
+    rsdp_virt: u64,
+    bsp_apic_id: u32,
+) -> Option<(ApicInfo, CpuTopology)> {
+    // Locate the APIC table (MADT) pointer
     let madt_ptr = unsafe { find_acpi_table(rsdp_virt, b"APIC")? };
-    
-    // Parse the MADT we found and extract the LAPIC and I/O APIC addresses
-    unsafe { parse_madt(madt_ptr) }
+
+    // Single pass: collect APIC addresses and CPU topology simultaneously
+    unsafe { parse_madt(madt_ptr, bsp_apic_id) }
 }
 
 /// Scans the XSDT entry array for a table whose 4-byte signature matches `sig`.
@@ -434,7 +477,8 @@ unsafe fn find_table_in_rsdt(rsdt_virt: u64, sig: &[u8; 4]
     None
 }
 
-/// Parses the MADT table and extracts the Local APIC and I/O APIC information.
+/// Performs a single pass through the MADT, collecting both APIC hardware
+/// addresses and the full CPU topology.
 ///
 /// The MADT table has the following layout (all sizes in bytes):
 ///
@@ -452,19 +496,28 @@ unsafe fn find_table_in_rsdt(rsdt_virt: u64, sig: &[u8; 4]
 ///   | ... (variable number of entries) ...|
 ///   +-------------------------------------+
 ///
-/// We walk the entry list from start to end, updating our I/O APIC variables
-/// whenever we encounter an entry with type == 1. If multiple I/O APICs are
-/// present, only the last one's values are kept with this implementation.
+/// Entry types handled:
+///  0 = Processor Local APIC -> appended to `CpuTopology`
+///  1 = I/O APIC             -> captured as `io_apic_phys` / `io_apic_gsi_base`
+///
+/// All other entry types are skipped by advancing the cursor by `entry.length`.
 ///
 /// # Arguments
 /// 
-/// * `madt_sdt` - Virtual pointer to the start of the MADT (its `SdtHeader`).
+/// * `madt_sdt`    - Virtual pointer to the start of the MADT (its SdtHeader).
+/// * `bsp_apic_id` - APIC ID of the BSP (from bootloader CPUID read), stored
+///     into `CpuTopology::bsp_apic_id`, so that callers can identify the BSP
+///     entry.
 ///
 /// # Returns
 /// 
-/// Returns `Some(ApicInfo)` on success, or `None` if no I/O APIC entry was
-/// found (which would make APIC-mode interrupt routing impossible).
-unsafe fn parse_madt(madt_sdt: *const SdtHeader) -> Option<ApicInfo> {
+/// Returns `Some((ApicInfo, CpuTopology))` on success, or `None` if no I/O
+/// APIC entry was found (which would make APIC-mode interrupt routing
+/// impossible).
+unsafe fn parse_madt(
+    madt_sdt: *const SdtHeader,
+    bsp_apic_id: u32,
+) -> Option<(ApicInfo, CpuTopology)> {
     // Read the total table length from the SDT header, used to compute the
     // address of the last byte of the entry array.
     let sdt_len = unsafe {
@@ -480,60 +533,98 @@ unsafe fn parse_madt(madt_sdt: *const SdtHeader) -> Option<ApicInfo> {
             (*madt_hdr_ptr).local_apic_addr)) as u64
     };
 
-    // Walk the variable-length entry list, where entries start after both the
-    // SdtHeader and the MadtHeader. The cursor advances by each entry's own
-    // `length` field, which covers the 2-byte MadtEntryHeader plus any
-    // entry-specific fields.
+    // Walk the variable-length entry list. Entries start after both the
+    // SdtHeader and the MadtHeader.
     let entries_start = madt_sdt as usize + size_of::<SdtHeader>()
         + size_of::<MadtHeader>();
     let entries_end = madt_sdt as usize + sdt_len;
 
     let mut cursor = entries_start;
-    let mut io_apic_phys: u64 = 0;  // Set when we find the first I/O APIC entry
-    let mut io_apic_gsi_base: u32 = 0;  // GSI base of the same I/O APIC
+    let mut io_apic_phys: u64 = 0;
+    let mut io_apic_gsi_base: u32 = 0;
+
+    // Initialize the topology with the BSP APIC ID from the bootloader.
+    // CPU entries will be appended as we encounter type-0 entries below.
+    let mut topology = CpuTopology::new();
+    topology.bsp_apic_id = bsp_apic_id;
 
     while cursor + size_of::<MadtEntryHeader>() <= entries_end {
-        // Read the 2-byte entry header to determine the type and length.
+        // Read the 2-byte entry header to determine type and length.
         // Both fields are u8, so alignment is not a concern here.
         let entry = unsafe { &*(cursor as *const MadtEntryHeader) };
         let entry_len = entry.length as usize;
 
         // A well-formed entry must be at least 2 bytes (just the header).
-        // A length of 0 or 1 would cause an infinite loop, so we treat it as a
-        // corrupt table and stop parsing.
+        // A length of 0 or 1 would cause an infinite loop, so we treat it
+        // as a corrupt table and stop parsing.
         if entry_len < 2 {
             break;
         }
 
-        if entry.entry_type == 1 {
-            // This is an I/O APIC entry (type 1) that we need to track; We use
-            // read_unaligned for the multi-byte fields because the struct may
-            // sit at an arbitrary byte offset within the MADT.
-            let io = unsafe { &*(cursor as *const MadtIoApic) };
+        match entry.entry_type {
+            // Type 0: Processor Local APIC - one entry per logical CPU.
+            // Minimum valid length is 8 bytes (header + acpi_uid + apic_id +
+            // flags). Entries shorter than this are malformed, so we skip them.
+            0 if entry_len >= 8 => {
+                let lapic = unsafe { &*(cursor as *const MadtLocalApic) };
 
-            io_apic_phys = unsafe {
-                ptr::read_unaligned(core::ptr::addr_of!(
-                    (*io).io_apic_addr)) as u64
-            };
-            io_apic_gsi_base = unsafe {
-                ptr::read_unaligned(core::ptr::addr_of!((*io).gsi_base))
-            };
+                let apic_id = lapic.apic_id;
+                let acpi_uid = lapic.acpi_uid;
+                let flags = unsafe {
+                    ptr::read_unaligned(core::ptr::addr_of!(lapic.flags))
+                };
+                let enabled = (flags & 0x1) != 0;
+                let online_capable = (flags & 0x2) != 0;
+
+                // Only record CPUs the firmware considers usable. A CPU with
+                // neither ENABLED nor ONLINE_CAPABLE set cannot be started.
+                if enabled || online_capable {
+                    topology.push(CpuInfo {
+                        apic_id: apic_id as u32,
+                        acpi_uid,
+                        enabled,
+                        online_capable,
+                    });
+                }
+            }
+
+            // Type 1: I/O APIC - capture the first one found.
+            // We do not currently support multi-I/O-APIC systems; the first
+            // entry is sufficient for all IRQ routing on any single-socket
+            // desktop or workstation target.
+            1 if entry_len >= 12 => {
+                // Only record the first I/O APIC; ignore subsequent ones.
+                if io_apic_phys == 0 {
+                    let io = unsafe { &*(cursor as *const MadtIoApic) };
+                    io_apic_phys = unsafe {
+                        ptr::read_unaligned(
+                            core::ptr::addr_of!(io.io_apic_addr)) as u64
+                    };
+                    io_apic_gsi_base = unsafe {
+                        ptr::read_unaligned(core::ptr::addr_of!(io.gsi_base))
+                    };
+                }
+            }
+
+            // All other entry types (ISOs, NMIs, overrides, x2APIC, etc.)
+            // are intentionally ignored for now. The cursor still advances
+            // by `entry_len` below, so they are correctly skipped.
+            _ => {}
         }
 
-        // Advance the cursor by the full entry length, regardless of entry
-        // type, so that unknown/ignored types are correctly skipped.
         cursor += entry_len;
     }
 
-    // If no I/O APIC entry was found, we cannot configure external interrupts,
-    // so we return None to signal failure to the caller.
+    // If no I/O APIC entry was found, we cannot configure external interrupts.
     if io_apic_phys == 0 {
         return None;
     }
 
-    Some(ApicInfo {
+    let apic_info = ApicInfo {
         local_apic_phys: local_apic_addr,
         io_apic_phys,
         io_apic_gsi_base,
-    })
+    };
+
+    Some((apic_info, topology))
 }

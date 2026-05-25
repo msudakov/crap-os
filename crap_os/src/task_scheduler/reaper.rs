@@ -31,12 +31,12 @@
 //! # Lock ordering
 //!
 //! Both `reap_dying_tasks` and `tombstone_cleanup` acquire REAPER_QUEUE (or
-//! TOMBSTONE_QUEUE) and then SCHEDULER while holding the first lock. This
-//! nested acquisition is safe only as long as a consistent global lock ordering
-//! is maintained everywhere, and no other code path acquires these locks in the
-//! reverse order, which would lead to a deadlock.
+//! TOMBSTONE_QUEUE) and then [`GLOBAL_SCHEDULER`] while holding the first lock.
+//! This nested acquisition is safe only as long as a consistent global lock
+//! ordering is maintained everywhere, and no other code path acquires these
+//! locks in the reverse order, which would lead to a deadlock.
 
-use super::scheduler::SCHEDULER;
+use super::scheduler::GLOBAL_SCHEDULER;
 use super::task::{TaskState, TaskId};
 use crate::spinlock::StaticIrqSpinLock;
 
@@ -249,6 +249,10 @@ pub(super) static REAPER_QUEUE: StaticIrqSpinLock<ReaperQueue> =
 pub(super) static TOMBSTONE_QUEUE: StaticIrqSpinLock<TombstoneQueue> =
     StaticIrqSpinLock::new(TombstoneQueue::new());
 
+// =============================================================================
+// Public API
+// =============================================================================
+
 /// Enqueues a `Dying` task for reaping on the next timer tick.
 ///
 /// The task must already be in the `Dying` state when this is called, as
@@ -284,7 +288,7 @@ pub fn reap_dying_tasks() {
 
     // At least one `Dying` task exists. Acquire the scheduler lock to update
     // task states.
-    let mut scheduler = SCHEDULER.lock();
+    let mut global = GLOBAL_SCHEDULER.lock();
 
     loop {
         let task_id = match queue.pop() {
@@ -292,7 +296,7 @@ pub fn reap_dying_tasks() {
             None => break,  // Queue is empty; drain is complete.
         };
 
-        if let Some(task) = scheduler.get_task_mut(task_id) {
+        if let Some(task) = global.get_task_mut(task_id) {
             // Only reap tasks that are actually Dying. If a task ID is in
             // the queue, but the task is in some other state, something has
             // gone wrong elsewhere, and we skip it rather than corrupting
@@ -320,7 +324,8 @@ pub fn reap_dying_tasks() {
 }
 
 /// Drains the tombstone queue, permanently removing all `Dead` tasks from the
-/// task table and freeing their resources (including their kernel stacks).
+/// global task table and freeing their resources (including their kernel
+/// stacks).
 ///
 /// Called from the timer ISR on every tick, before `reap_dying_tasks`. This
 /// ordering ensures that tasks promoted to `Dead` in the current tick's
@@ -343,7 +348,7 @@ pub fn tombstone_cleanup() {
 
     // At least one `Dead` task is ready for cleanup. Acquire the scheduler
     // lock to remove the task slots.
-    let mut scheduler = SCHEDULER.lock();
+    let mut global = GLOBAL_SCHEDULER.lock();
     
     loop {
         let task_id = match queue.pop() {
@@ -356,7 +361,7 @@ pub fn tombstone_cleanup() {
         // By the time we get here, at least one full timer tick has elapsed
         // since the task was switched away from, so the CPU is guaranteed
         // to no longer be executing on this stack.
-        scheduler.remove_task(task_id);
+        global.remove_task(task_id);
     }
 
     // TODO: for debugging purposes; can clean up later on.

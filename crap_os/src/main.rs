@@ -6,14 +6,13 @@
 mod globals;
 mod spinlock;
 mod macros;
+mod processor_control;
 mod helper_functions;
 mod hardware_manager;
 mod memory_manager;
 mod system_core;
 mod task_scheduler;
 mod process_manager;
-pub mod gdt;
-pub mod idt;
 mod tests;
 
 use hardware_manager::FramebufferInfo;
@@ -97,8 +96,9 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // Parse ACPI info to find APIC addresses. This must be done before Memory
     // Manager init sequence.
     let rsdp_virt = memory_map.rsdp_addr + globals::KERNEL_PHYSICAL_MAP_BASE;
-    let apic_info = unsafe {
-        hardware_manager::parse_acpi(rsdp_virt).expect("ACPI/MADT not found")
+    let (apic_info, cpu_topology) = unsafe {
+        hardware_manager::parse_acpi(rsdp_virt, memory_map.bsp_apic_id).expect(
+            "ACPI/MADT not found")
     };
     let hpet_info = unsafe {
         hardware_manager::parse_hpet(rsdp_virt).expect(
@@ -164,11 +164,43 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // We can now use serial port IRQ-safe global spinlock macros
     sprint_debug!(DebugLevel::INFO, "[INFO] Serial initialized successfully");
 
+
+
+    // CPU parsing test
+    {
+        sprintln!("[INFO] CPU topology from ACPI MADT:");
+        sprintln!("[INFO]   BSP APIC ID (bootloader CPUID): {}", cpu_topology.bsp_apic_id);
+        sprintln!("[INFO]   Total CPUs in MADT: {}", cpu_topology.cpu_count);
+        sprintln!("[INFO]   Usable CPUs (enabled or online-capable): {}", cpu_topology.get_usable_cpu_count());
+ 
+        for cpu in cpu_topology.iter() {
+            sprintln!("[INFO]   CPU | APIC ID: {:#04x} | ACPI UID: {:#04x} | Enabled: {} | Online-capable: {} | BSP: {}",
+                cpu.apic_id,
+                cpu.acpi_uid,
+                cpu.enabled,
+                cpu.online_capable,
+                cpu.apic_id == cpu_topology.bsp_apic_id,
+            );
+        }
+        if cpu_topology.bsp().is_none() {
+            panic!("BSP APIC ID {:#x} not found in MADT — firmware bug or struct layout mismatch", cpu_topology.bsp_apic_id);
+        }
+    }
+
+    // Initialize CPU topology
+    processor_control::init_cpu_topology(cpu_topology);
+
+
+
     // Initialie kernel heap and pre-map 16 pages (64 KB)
     globals::KERNEL_HEAP.heap.lock().init(16);
 
-    unsafe { crate::gdt::init_gdt(); }  // Initialize Global Descriptor Table
-    unsafe { crate::idt::init_idt(); }  // Initialize Interrupt Descriptor Table
+    // Initialize Global Descriptor Table
+    unsafe { processor_control::gdt::init_gdt(); }
+
+    // Initialize Interrupt Descriptor Table
+    unsafe { crate::processor_control::init_idt(); }
+    unsafe { crate::processor_control::load_idt(); }
 
     // Initialize framebuffer writer for global macros
     {

@@ -49,6 +49,7 @@ pub struct MemoryMapInfo {
     pub memory_map_size: u64,
     pub descriptor_size: u64,
     pub descriptor_ver: u32,
+    pub bsp_apic_id: u32, // Fits in u8, but stored as u32 for natural alignment
     pub kernel_load_addr : u64,
     pub kernel_image_size: u64,
     pub stack_base_addr: u64,

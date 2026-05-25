@@ -305,6 +305,9 @@ impl<T> PerCpu<T> {
     /// 
     /// Returns `true` if the slot for `cpu` has been initialized, `false`
     /// otherwise.
+    /// 
+    /// TODO: Remove dead_code marker when ths gets used later on.
+    #[allow(dead_code)]
     #[inline]
     pub fn is_initialized(&self, cpu: CpuId) -> bool {
         let index = cpu.apic_id() as usize;

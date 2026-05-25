@@ -753,8 +753,12 @@ pub fn task_exit() -> ! {
     // is dropped before we call `schedule()` (which will acquire it again
     // internally), and we must not hold it across that call.
     {
-        let mut scheduler = super::scheduler::SCHEDULER.lock();
-        let this_id = scheduler.current;
+        // TODO: Remove the commented lines after testing
+        //let mut scheduler = super::scheduler::SCHEDULER.lock();
+        //let this_id = scheduler.current;
+        let this_id = super::scheduler::get_current_task_id();
+        let mut scheduler = super::scheduler::GLOBAL_SCHEDULER.lock();
+        
         if let Some(task) = scheduler.get_task_mut(this_id) {
             task.state = TaskState::Dying;
 

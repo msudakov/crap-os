@@ -18,4 +18,4 @@
 
 pub mod rng;
 
-pub use rng::{init_cpu, get_random_bytes_vec};
+pub use rng::{init_cpu, get_random_bytes_vec, get_pseudo_random_bytes_vec};

@@ -304,9 +304,9 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     fbprintln!("[+] All MM heap allocator tests passed!\n");*/
 
     // Sample 32 cryptographically secure random bytes and print them.
-    let vec = crypto::get_random_bytes_vec(32);
-    let hex = crate::helper_functions::bytes_to_hex(&vec);
-    sprintln!("RNG test (32 bytes): {}", hex);
+    let vec1 = crypto::get_random_bytes_vec(32);
+    let hex1 = crate::helper_functions::bytes_to_hex(&vec1);
+    sprintln!("RNG test (32 bytes): {}", hex1);
     let test_cases: &[&str] = &[
         "0xDEADBEEF",
         "0xcafebabe",
@@ -328,6 +328,10 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             }
         }
     }
+    // Sample 32 pseudo-random bytes and print them.
+    let vec2 = crypto::get_pseudo_random_bytes_vec(32);
+    let hex2 = crate::helper_functions::bytes_to_hex(&vec2);
+    sprintln!("RNG test (32 bytes): {}", hex2);
 
     
 

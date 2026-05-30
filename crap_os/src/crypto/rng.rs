@@ -41,6 +41,26 @@
 //! fresh bytes from the hardware source. Between reseeds, each 8-byte output
 //! chunk is bound to the pool state (output = hw_word XOR pool_word), so
 //! learning the RDRAND output stream does not reveal the pool, and vice versa.
+//! 
+//! In addition to the cryptographically-strong RNG described above, this module
+//! also implements the xoshiro256++ pseudo-random number generator (PRNG).
+//! xoshiro256++ is a non-cryptographic PRNG that has the following properties:
+//!   - Period: 2^256 - 1. The state cycles through every possible non-zero
+//!     256-bit value before repeating, so wrap-around is not a practical
+//!     concern.
+//!   - Speed: ~4 arithmetic operations per 64-bit output word. On a modern
+//!     out-of-order x86-64 core, this typically executes in a single clock
+//!     cycle of throughput.
+//!   - Quality: passes PractRand and TestU01 BigCrush statistical test
+//!     suites. Suitable for simulation, randomised algorithms, and anything
+//!     that needs to look uniformly random without cryptographic guarantees.
+//!   - Not cryptographically secure: the full state can be recovered from
+//!     a short output sequence. It must never be used for key material, nonces
+//!     or initialization vectors (IVs), or anything where unpredictability
+//!     under adversarial observation matters.
+//! The ++ scrambler applied to the output (`s0.wrapping_add(t).rotate_left(23)
+//! .wrapping_add(s0)`) has better distribution in the high bits than the
+//! original "+" scrambler, at the cost of one extra addition.
 
 use core::arch::asm;
 use crate::processor_control::{CpuId, PerCpu};
@@ -76,6 +96,14 @@ pub struct CpuRngState {
     /// word. Advances by 8 on each draw and wraps at 32, ensuring successive
     /// draws bind against different pool regions.
     pool_cursor: usize,
+
+    /// xoshiro256++ state. Four 64-bit words giving a 256-bit internal state.
+    /// Seeded from the CSPRNG pool during [`init_cpu`], so the PRNG output is
+    /// unpredictable to an observer who does not know the initial seed, even
+    /// though it is not cryptographically strong. Must never be all-zero (the
+    /// xoshiro256++ absorbing state); [`init_cpu`] guarantees this by seeding
+    /// from the CSPRNG which cannot produce an all-zero 32-byte block.
+    xoshiro_state: [u64; 4],
 }
 
 #[allow(dead_code)]
@@ -89,6 +117,12 @@ impl CpuRngState {
             pool: [0u8; 32],
             call_count: 0,
             pool_cursor: 0,
+
+            // All-zero xoshiro256++ state is the absorbing state; the generator
+            // would produce nothing but zeroes forever. This value is only
+            // valid before `init_cpu` is called; `init_cpu` always overwrites
+            // it with a CSPRNG-seeded value before the slot becomes accessible.
+            xoshiro_state: [0u64; 4],
         }
     }
 }
@@ -430,7 +464,7 @@ unsafe fn fill_seed_buffer(
 ///
 /// * `cpu` - The `CpuId` of the calling CPU.
 #[inline]
-fn draw_8_bytes(cpu: CpuId) -> [u8; 8] {
+fn rng_draw_8_bytes(cpu: CpuId) -> [u8; 8] {
     // Disable interrupts for the duration of the draw. This prevents an ISR
     // on this core from re-entering get_random_bytes mid-draw. We do not need
     // a spinlock here because we are the only CPU that can touch this slot.
@@ -462,6 +496,62 @@ fn draw_8_bytes(cpu: CpuId) -> [u8; 8] {
     // Restore interrupts and return the drawn 8 bytes
     restore_interrupts(flags);
     output.to_le_bytes()
+}
+
+/// Advances the xoshiro256++ state by one step and returns the next 64-bit
+/// output word.
+///
+/// # Arguments
+///
+/// * `state` - Mutable reference to the four-word xoshiro256++ state. Must not
+///   be all-zero. Updated in place on every call.
+///
+/// # Returns
+///
+/// Returns the next 64-bit pseudo-random output word.
+#[inline]
+fn xoshiro256pp(state: &mut [u64; 4]) -> u64 {
+    // Output word: the "++" scrambler applied to s[0] and the sum of s[0]+s[3]
+    let t = state[0].wrapping_add(state[3]);
+    let result = t.rotate_left(23).wrapping_add(state[0]);
+
+    // State update: one step of the xoshiro256 linear engine
+    let update = state[1] << 17;
+    state[2]  ^= state[0];
+    state[3]  ^= state[1];
+    state[1]  ^= state[2];
+    state[0]  ^= state[3];
+    state[2]  ^= update;
+    state[3]   = state[3].rotate_left(45);
+
+    result
+}
+
+/// Advances the calling CPU's xoshiro256++ state by one step and returns the
+/// output as an 8-byte array.
+///
+/// Interrupts are disabled for the duration of the state update to prevent
+/// an ISR on the same core from re-entering `get_pseudo_random_bytes`
+/// mid-step and observing a partially advanced xoshiro state.
+///
+/// # Arguments
+///
+/// * `cpu` - The [`CpuId`] of the calling CPU.
+/// 
+/// # Returns
+/// 
+/// Returns the sampled pseudo-random bytes as an 8-byte array.
+#[inline]
+fn prng_draw_8_bytes(cpu: CpuId) -> [u8; 8] {
+    let flags = disable_interrupts_save();
+
+    // SAFETY: We are on `cpu`, interrupts are disabled, no ISR can preempt us,
+    // and no other CPU ever writes this slot.
+    let state = unsafe { RNG_STATE.get_mut(cpu) };
+    let word = xoshiro256pp(&mut state.xoshiro_state);
+
+    restore_interrupts(flags);
+    word.to_le_bytes()
 }
 
 // =============================================================================
@@ -499,6 +589,18 @@ pub unsafe fn init_cpu(hpet: &crate::hardware_manager::HpetInfo) {
     let mut initial_pool = [0u8; 32];
     unsafe { fill_seed_buffer(&mut initial_pool, Some(hpet)) };
 
+    // Derive the initial xoshiro256++ state directly from the CSPRNG pool.
+    // Reading the four u64 words from the pool guarantees the state is seeded
+    // with genuine hardware entropy and is never all-zero (since
+    // `fill_seed_buffer` draws from RDSEED/RDRAND/jitter, none of which can
+    // produce 32 zero bytes).
+    let xoshiro_state = [
+        u64::from_le_bytes(initial_pool[0..8].try_into().unwrap()),
+        u64::from_le_bytes(initial_pool[8..16].try_into().unwrap()),
+        u64::from_le_bytes(initial_pool[16..24].try_into().unwrap()),
+        u64::from_le_bytes(initial_pool[24..32].try_into().unwrap()),
+    ];
+
     // Initialize the per-CPU slot. `PerCpu::init` writes the value and sets
     // the initialized flag with Release ordering, ensuring the pool contents
     // are visible to any subsequent Acquire load in `get` or `get_mut`.
@@ -507,8 +609,38 @@ pub unsafe fn init_cpu(hpet: &crate::hardware_manager::HpetInfo) {
             pool:         initial_pool,
             call_count:   0,
             pool_cursor:  0,
+            xoshiro_state,
         })
     };
+}
+
+/// Forces an immediate reseed of the calling CPU's pool using the HPET jitter
+/// source.
+///
+/// Produces higher-quality entropy than the automatic RDRAND-only reseed path
+/// in [`get_random_bytes`]. Call this from a context where `HpetInfo` is
+/// available - e.g., immediately after [`init_cpu`] or after a suspend/
+/// resume cycle.
+///
+/// # Arguments
+///
+/// * `hpet` - Reference to the initialized `HpetInfo`.
+///
+/// # Safety
+///
+/// Same requirements as [`init_cpu`]: must be called from the CPU whose slot
+/// is being reseeded, and `hpet` must satisfy `HpetInfo::read_counter`'s
+/// safety contract.
+#[allow(dead_code)]
+pub unsafe fn reseed_cpu(hpet: &crate::hardware_manager::HpetInfo) {
+    let cpu = CpuId::current();
+    let mut fresh = [0u8; 32];
+    unsafe { fill_seed_buffer(&mut fresh, Some(hpet)) };
+
+    let flags = disable_interrupts_save();
+    let state  = unsafe { RNG_STATE.get_mut(cpu) };
+    xor_mix(&mut state.pool, &fresh);
+    restore_interrupts(flags);
 }
 
 /// Fills a buffer with cryptographically secure random bytes.
@@ -571,45 +703,16 @@ pub fn get_random_bytes(buffer: &mut [u8]) {
     // Fill the buffer in 8-byte chunks
     let mut remaining = buffer;
     while remaining.len() >= 8 {
-        let word = draw_8_bytes(cpu);
+        let word = rng_draw_8_bytes(cpu);
         remaining[..8].copy_from_slice(&word);
         remaining = &mut remaining[8..];
     }
 
     // Trailing partial chunk (0..7 bytes)
     if !remaining.is_empty() {
-        let word = draw_8_bytes(cpu);
+        let word = rng_draw_8_bytes(cpu);
         remaining.copy_from_slice(&word[..remaining.len()]);
     }
-}
-
-/// Forces an immediate reseed of the calling CPU's pool using the HPET jitter
-/// source.
-///
-/// Produces higher-quality entropy than the automatic RDRAND-only reseed path
-/// in [`get_random_bytes`]. Call this from a context where `HpetInfo` is
-/// available - e.g., immediately after [`init_cpu`] or after a suspend/
-/// resume cycle.
-///
-/// # Arguments
-///
-/// * `hpet` - Reference to the initialized `HpetInfo`.
-///
-/// # Safety
-///
-/// Same requirements as [`init_cpu`]: must be called from the CPU whose slot
-/// is being reseeded, and `hpet` must satisfy `HpetInfo::read_counter`'s
-/// safety contract.
-#[allow(dead_code)]
-pub unsafe fn reseed_cpu(hpet: &crate::hardware_manager::HpetInfo) {
-    let cpu = CpuId::current();
-    let mut fresh = [0u8; 32];
-    unsafe { fill_seed_buffer(&mut fresh, Some(hpet)) };
-
-    let flags = disable_interrupts_save();
-    let state  = unsafe { RNG_STATE.get_mut(cpu) };
-    xor_mix(&mut state.pool, &fresh);
-    restore_interrupts(flags);
 }
 
 /// Convenience wrapper around [`get_random_bytes`] that allocates and returns
@@ -636,6 +739,77 @@ pub unsafe fn reseed_cpu(hpet: &crate::hardware_manager::HpetInfo) {
 pub fn get_random_bytes_vec(length: usize) -> alloc::vec::Vec<u8> {
     let mut buffer = alloc::vec![0u8; length];
     get_random_bytes(&mut buffer);
+
+    buffer
+}
+
+/// Fills a buffer with high-speed pseudo-random bytes using xoshiro256++.
+///
+/// This is the fast, non-cryptographic counterpart to [`get_random_bytes`].
+/// It is appropriate for anything that needs to look random, but carries no
+/// security requirement: procedural generation, randomised algorithms,
+/// statistical sampling, jitter introduction, test data, and so on. It must
+/// never be used for key material, nonces/IVs, salts, tokens, or any value
+/// whose unpredictability must hold against an adversary.
+///
+/// The xoshiro256++ state is per-CPU and lives inside [`CpuRngState`]. Because
+/// only the owning CPU ever touches its state, no locks are needed. Interrupts
+/// are disabled for the duration of each 8-byte step to prevent an ISR on the
+/// same core from re-entering this function mid-step and observing or
+/// corrupting the xoshiro state.
+///
+/// # Arguments
+///
+/// * `buffer` - Destination buffer. Any length is accepted; an empty slice is a
+///   no-op.
+///
+/// # Panics
+///
+/// Panics if [`init_cpu`] has not been called for the current CPU.
+pub fn get_pseudo_random_bytes(buffer: &mut [u8]) {
+    if buffer.is_empty() {
+        return;
+    }
+
+    // Snapshot the CPU ID once to avoid repeated CPUID serialization
+    let cpu = CpuId::current();
+
+    let mut remaining = buffer;
+
+    // Fill in 8-byte chunks
+    while remaining.len() >= 8 {
+        let word = prng_draw_8_bytes(cpu);
+        remaining[..8].copy_from_slice(&word);
+        remaining = &mut remaining[8..];
+    }
+
+    // Trailing partial chunk (0..7 bytes)
+    if !remaining.is_empty() {
+        let word = prng_draw_8_bytes(cpu);
+        remaining.copy_from_slice(&word[..remaining.len()]);
+    }
+}
+
+/// Convenience wrapper around [`get_pseudo_random_bytes`] that allocates and
+/// returns an owned `Vec<u8>` of `length` pseudo-random bytes.
+///
+/// Prefer the slice form `get_pseudo_random_bytes(&mut buffer)` when the output
+/// length is known at compile time or heap allocation should be avoided.
+///
+/// # Arguments
+///
+/// * `length` - Number of pseudo-random bytes to generate.
+///
+/// # Returns
+///
+/// Returns an owned `Vec<u8>` filled with `length` pseudo-random bytes.
+///
+/// # Panics
+///
+/// Panics if [`init_cpu`] has not been called for the current CPU.
+pub fn get_pseudo_random_bytes_vec(length: usize) -> alloc::vec::Vec<u8> {
+    let mut buffer = alloc::vec![0u8; length];
+    get_pseudo_random_bytes(&mut buffer);
 
     buffer
 }

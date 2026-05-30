@@ -307,6 +307,29 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     let vec = crypto::get_random_bytes_vec(32);
     let hex = crate::helper_functions::bytes_to_hex(&vec);
     sprintln!("RNG test (32 bytes): {}", hex);
+    let test_cases: &[&str] = &[
+        "0xDEADBEEF",
+        "0xcafebabe",
+        "0xabc",
+        "0xincorrect",
+    ];
+    for input in test_cases {
+        crate::hardware_manager::sprint("hex_to_bytes(\"");
+        crate::hardware_manager::sprint(input);
+        crate::hardware_manager::sprint("\") -> ");
+        match crate::helper_functions::hex_to_bytes(input) {
+            Some(bytes) => {
+                let roundtrip = crate::helper_functions::bytes_to_hex(&bytes);
+                crate::hardware_manager::sprint(&roundtrip);
+                crate::hardware_manager::sprint(" (roundtrip OK)\n");
+            }
+            None => {
+                crate::hardware_manager::sprint("None (invalid input)\n");
+            }
+        }
+    }
+
+    
 
     // Create and initialize the System process
     let system_process = globals::PROCESS_MANAGER.create_kernel_process(

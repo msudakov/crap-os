@@ -273,3 +273,85 @@ pub fn bytes_to_hex(bytes: &[u8]) -> alloc::string::String {
 
     hex
 }
+
+/// Converts a hex string into an owned byte vector.
+///
+/// Accepts both uppercase and lowercase hex digits (`0`–`9`, `a`–`f`,
+/// `A`–`F`), with or without a `0x` / `0X` prefix. An odd number of hex
+/// digits is handled by implicitly zero-padding the leading nibble, so
+/// `"0xabc"` is treated as `"0x0abc"` and decodes to `[0x0a, 0xbc]`.
+///
+/// # Arguments
+///
+/// * `hex` - The hex string to decode.
+///
+/// # Returns
+///
+/// Returns `Some(Vec<u8>)` containing the decoded bytes on success,
+/// or `None` if:
+///   - The input is empty or contains only the `0x` / `0X` prefix with no
+///     hex digits following it;
+///   - Any character in the digit portion is not a valid hex digit.
+#[allow(dead_code)]
+pub fn hex_to_bytes(hex: &str) -> Option<alloc::vec::Vec<u8>> {
+    // Strip the optional "0x" / "0X" prefix before processing
+    let hex = if hex.starts_with("0x") || hex.starts_with("0X") {
+        &hex[2..]
+    } else {
+        hex
+    };
+
+    // A bare prefix with no digits, or a completely empty string, produces
+    // no bytes and is considered invalid.
+    if hex.is_empty() {
+        return None;
+    }
+
+    let hex_chars = hex.as_bytes();
+
+    // Pre-allocate the exact output capacity. An odd digit count gets one
+    // extra byte for the implicit leading zero nibble.
+    let byte_len = (hex_chars.len() + 1) / 2;
+    let mut bytes = alloc::vec::Vec::with_capacity(byte_len);
+
+    // For an odd-length input, synthesize the first byte from a leading zero
+    // nibble and the first actual digit, then advance past that digit.
+    // For even-length input, `start` remains 0 and this block is skipped.
+    let mut i = 0;
+    if hex_chars.len() % 2 != 0 {
+        bytes.push(hex_nibble(hex_chars[0])?);
+        i = 1;
+    }
+
+    // Decode the remaining characters in two-character (full byte) steps.
+    while i < hex_chars.len() {
+        let high = hex_nibble(hex_chars[i])?;
+        let low  = hex_nibble(hex_chars[i + 1])?;
+        bytes.push((high << 4) | low);
+        i += 2;
+    }
+
+    Some(bytes)
+}
+
+/// Decodes a single ASCII hex character into its 4-bit nibble value.
+///
+/// Accepts `0`–`9`, `a`–`f`, and `A`–`F`.
+/// 
+/// # Arguments
+///
+/// * `byte` - The single ASCII hex character to decode.
+/// 
+/// # Returns
+/// 
+/// Returns 4-bit nibble value for an ASCII hex character on success, or `None`
+/// in the case of an invalid value.
+#[inline]
+fn hex_nibble(byte: u8) -> Option<u8> {
+    match byte {
+        b'0'..=b'9' => Some(byte - b'0'),
+        b'a'..=b'f' => Some(byte - b'a' + 10),
+        b'A'..=b'F' => Some(byte - b'A' + 10),
+        _           => None,
+    }
+}

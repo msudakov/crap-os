@@ -13,6 +13,7 @@ mod memory_manager;
 mod system_core;
 mod task_scheduler;
 mod process_manager;
+mod crypto;
 mod tests;
 
 use hardware_manager::FramebufferInfo;
@@ -244,6 +245,11 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // Configure the APIC timer (currently 1ms tick rate)
         unsafe { hardware_manager::configure_timer(apic_ticks_per_ms) };
         sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Timer interrupt initialized");
+
+        // Initialize cryptographically-secure random number generator
+        unsafe { crypto::init_cpu(&hpet.as_ref().unwrap()); }
+        // To initialize RNG on an AP as part of bring up:
+        // unsafe { crypto::init_cpu(&HPET); } // Use global HpetInfo
     }
 
     // Unmask the keyboard IRQ in the I/O APIC
@@ -296,6 +302,11 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     tests::memory::test_heap_allocator();
     sprintln!("[+] All MM heap allocator tests passed!\n");
     fbprintln!("[+] All MM heap allocator tests passed!\n");*/
+
+    // Sample 32 cryptographically secure random bytes and print them.
+    let vec = crypto::get_random_bytes_vec(32);
+    let hex = crate::helper_functions::bytes_to_hex(&vec);
+    sprintln!("RNG test (32 bytes): {}", hex);
 
     // Create and initialize the System process
     let system_process = globals::PROCESS_MANAGER.create_kernel_process(

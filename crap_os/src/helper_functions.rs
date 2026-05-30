@@ -243,3 +243,33 @@ pub fn expand_task_id(encoded_task_id: u64) -> TaskId {
     // Restore the original task id
     TaskId {slot_index, slot_generation}
 }
+
+/// Converts a byte slice into an owned hex string prefixed with `0x`,
+/// with each byte rendered as exactly two uppercase hex digits.
+///
+/// An empty slice returns the string `"0x"` with no hex digits following
+/// the prefix.
+///
+/// # Arguments
+///
+/// * `bytes` - The byte slice to encode.
+///
+/// # Returns
+///
+/// Returns an owned `String` of length `2 + (bytes.len() * 2)`.
+#[allow(dead_code)]
+pub fn bytes_to_hex(bytes: &[u8]) -> alloc::string::String {
+    // Pre-allocate the exact capacity: "0x" prefix + 2 chars per byte
+    let mut hex = alloc::string::String::with_capacity(2 + bytes.len() * 2);
+
+    hex.push('0');
+    hex.push('x');
+
+    for &byte in bytes {
+        // Encode the high nibble first, then the low nibble
+        hex.push(HEX_CHARS_UPPER[(byte >> 4) as usize] as char);
+        hex.push(HEX_CHARS_UPPER[(byte & 0xF) as usize] as char);
+    }
+
+    hex
+}

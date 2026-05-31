@@ -340,6 +340,14 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     let sha1_digest = crypto::sha1("Hello".as_bytes());
     let sha1_hex = helper_functions::bytes_to_hex(&sha1_digest);
     sprintln!("SHA-1 test: {}", sha1_hex);
+    // Testing SHA2
+    let sha2_digest = crypto::sha256("Hello".as_bytes());
+    let sha2_hex = helper_functions::bytes_to_hex(&sha2_digest);
+    sprintln!("SHA-2 test: {}", sha2_hex);
+    // Testing SHA3
+    let sha3_digest = crypto::sha3_512("Hello".as_bytes());
+    let sha3_hex = helper_functions::bytes_to_hex(&sha3_digest);
+    sprintln!("SHA-3 test: {}", sha3_hex);
 
     
 

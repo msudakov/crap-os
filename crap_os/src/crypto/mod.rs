@@ -21,5 +21,4 @@ mod hash;
 
 // Re-export public APIs
 pub use rng::{init_cpu, get_random_bytes_vec, get_pseudo_random_bytes_vec};
-pub use hash::md5;
-pub use hash::sha1;
+pub use hash::{md5, sha1, sha256, sha3_512};

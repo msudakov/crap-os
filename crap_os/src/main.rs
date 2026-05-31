@@ -331,7 +331,15 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // Sample 32 pseudo-random bytes and print them.
     let vec2 = crypto::get_pseudo_random_bytes_vec(32);
     let hex2 = crate::helper_functions::bytes_to_hex(&vec2);
-    sprintln!("RNG test (32 bytes): {}", hex2);
+    sprintln!("PRNG test (32 bytes): {}", hex2);
+    // Testing MD5
+    let md5_digest = crypto::md5("Hello".as_bytes());
+    let md5_hex = helper_functions::bytes_to_hex(&md5_digest);
+    sprintln!("MD5 test: {}", md5_hex);
+    // Testing SHA1
+    let sha1_digest = crypto::sha1("Hello".as_bytes());
+    let sha1_hex = helper_functions::bytes_to_hex(&sha1_digest);
+    sprintln!("SHA-1 test: {}", sha1_hex);
 
     
 

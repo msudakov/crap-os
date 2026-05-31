@@ -303,51 +303,41 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     sprintln!("[+] All MM heap allocator tests passed!\n");
     fbprintln!("[+] All MM heap allocator tests passed!\n");*/
 
-    // Sample 32 cryptographically secure random bytes and print them.
-    let vec1 = crypto::get_random_bytes_vec(32);
-    let hex1 = crate::helper_functions::bytes_to_hex(&vec1);
-    sprintln!("RNG test (32 bytes): {}", hex1);
-    let test_cases: &[&str] = &[
-        "0xDEADBEEF",
-        "0xcafebabe",
-        "0xabc",
-        "0xincorrect",
+    // --- Base64 encode / decode round-trip tests ---
+    let test_cases: &[&[u8]] = &[
+        b"Hello",
+        b"Hello World",
+        b"Man",        // 3 bytes exactly — no padding
+        b"Ma",         // 2 bytes — one padding char
+        b"M",          // 1 byte  — two padding chars
+        b"",           // empty
+        b"any carnal pleasure",
+        &[0x00, 0xFF, 0x00, 0xFF],  // non-ASCII bytes
     ];
+
     for input in test_cases {
-        crate::hardware_manager::sprint("hex_to_bytes(\"");
-        crate::hardware_manager::sprint(input);
-        crate::hardware_manager::sprint("\") -> ");
-        match crate::helper_functions::hex_to_bytes(input) {
-            Some(bytes) => {
-                let roundtrip = crate::helper_functions::bytes_to_hex(&bytes);
-                crate::hardware_manager::sprint(&roundtrip);
-                crate::hardware_manager::sprint(" (roundtrip OK)\n");
+        let encoded = helper_functions::base64_encode(input);
+        let decoded = helper_functions::base64_decode(&encoded);
+
+        hardware_manager::sprint("input:   ");
+        // Print as hex so non-ASCII inputs display cleanly.
+        hardware_manager::sprint(&helper_functions::bytes_to_hex(input));
+        hardware_manager::sprint("\nencoded: ");
+        hardware_manager::sprint(&encoded);
+        hardware_manager::sprint("\ndecoded: ");
+        match decoded {
+            Some(ref bytes) => {
+                hardware_manager::sprint(&helper_functions::bytes_to_hex(bytes));
+                hardware_manager::sprint(if bytes.as_slice() == *input {
+                    " (round-trip OK)\n"
+                } else {
+                    " (MISMATCH!)\n"
+                });
             }
-            None => {
-                crate::hardware_manager::sprint("None (invalid input)\n");
-            }
+            None => hardware_manager::sprint("None (decode failed!)\n"),
         }
+        hardware_manager::sprint("\n");
     }
-    // Sample 32 pseudo-random bytes and print them.
-    let vec2 = crypto::get_pseudo_random_bytes_vec(32);
-    let hex2 = crate::helper_functions::bytes_to_hex(&vec2);
-    sprintln!("PRNG test (32 bytes): {}", hex2);
-    // Testing MD5
-    let md5_digest = crypto::md5("Hello".as_bytes());
-    let md5_hex = helper_functions::bytes_to_hex(&md5_digest);
-    sprintln!("MD5 test: {}", md5_hex);
-    // Testing SHA1
-    let sha1_digest = crypto::sha1("Hello".as_bytes());
-    let sha1_hex = helper_functions::bytes_to_hex(&sha1_digest);
-    sprintln!("SHA-1 test: {}", sha1_hex);
-    // Testing SHA2
-    let sha2_digest = crypto::sha256("Hello".as_bytes());
-    let sha2_hex = helper_functions::bytes_to_hex(&sha2_digest);
-    sprintln!("SHA-2 test: {}", sha2_hex);
-    // Testing SHA3
-    let sha3_digest = crypto::sha3_512("Hello".as_bytes());
-    let sha3_hex = helper_functions::bytes_to_hex(&sha3_digest);
-    sprintln!("SHA-3 test: {}", sha3_hex);
 
     
 

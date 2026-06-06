@@ -5,6 +5,8 @@
 //! MD5 is included solely for non-security checksum use cases. It must never
 //! be used in any new security-sensitive context.
 
+#![allow(dead_code)]
+
 /// Per-round shift amounts, as specified in RFC 1321, Section 3.4.
 /// Indexed as `MD5_SHIFTS[round]` where `round` is 0..63.
 #[rustfmt::skip]

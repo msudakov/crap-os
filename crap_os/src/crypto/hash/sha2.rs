@@ -1,5 +1,7 @@
 //! The SHA-256 Basic Hashing Algorithm
 
+#![allow(dead_code)]
+
 /// First 32 bits of the fractional parts of the cube roots of the first 64
 /// primes (FIPS 180-4, Section 4.2.2). Used as round constants.
 #[rustfmt::skip]

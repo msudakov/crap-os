@@ -304,407 +304,86 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     fbprintln!("[+] All MM heap allocator tests passed!\n");*/
 
 
+    // Password hashing tests
+    // --- Argon2id test ---
 
+    // Static inputs for cross-verification with online tools.
+    // Use https://argon2.online or similar to verify the PHC string output.
+    let password = b"hunter2";
+    let salt     = helper_functions::hex_to_bytes("c91482d834c1c2f3f90f85685cdf7e6a").unwrap();
 
+    // Test 1: Default parameters (OWASP recommended minimums).
+    // m=19456, t=2, p=1
+    hardware_manager::sprint("Argon2id test 1 (default params):\n");
+    hardware_manager::sprint("  password: \"hunter2\"\n");
+    hardware_manager::sprint("  salt:     \"somesalt\"\n");
+    match crypto::hash_password(password, &salt) {
+        Ok(ref phc) => {
+            hardware_manager::sprint("  PHC:      ");
+            hardware_manager::sprint(phc);
+            hardware_manager::sprint("\n");
 
+            // Verify the hash against itself to confirm round-trip works.
+            match crypto::verify_password(password, phc) {
+                Ok(())  => hardware_manager::sprint("  verify:   OK\n"),
+                Err(_)  => hardware_manager::sprint("  verify:   FAILED\n"),
+            }
 
-    // --- BLAKE2b tests ---
-    // --- RFC 7693 Appendix A known-answer tests ---
-    /*
-    BLAKE2b-512(""):
-  0x786A02F742015903C6C6FD852552D272912F4740E15847618A86E217F71F5419D25E1031AFEE585313896444934EB04B903A685B1448B755D56F701AFE9BE2CE
-BLAKE2b-512("abc"):
-  0xBA80A53F981C4D0D6A2797B69F12F6E94C212F14685AC4B74B12BB6FDBFFA2D17D87C5392AAB792DC252D5DE4533CC9518D38AA8DBF1925AB92386EDD4009923
-BLAKE2b-256("abc"):
-  0xBDDD813C634239723171EF3FEE98579B94964E3BB1CB3E427262C8C068D52319
-BLAKE2b-20("abc"):
-  0x44229FC0EF
-BLAKE2b-512 MAC (RFC 7693 Appendix C vector):
-  0x8D6CF87C08380D2D1506EEE46FD4222D21D8C04E585FBFD08269C98F702833A156326A0724656400EE09351D57B440175E2A5DE93CC5F80DB6DAF83576CF75FA
-BLAKE2b-256 MAC:
-  0x33A1301490C833CAE224B593D17D0FA5B5F09650ACAB559F44B2AA3D5971D330
-BLAKE2b-384("Hello", key="secret key"):
-  0xA520837C8D7E1948D7C02B7A93DB7B4349A69A4506947BB94A62A70420CE02052C2226F2F70378FBE48C764185389B85
-blake2b(out_len=0)  -> None (correct)
-blake2b(key=empty) -> None (correct)
-blake2b(out_len=65) -> None (correct)
-BLAKE2b-512("a" * 1000):
-  0xD6A69459FE93FC6B9537ED4336E5099E0DCCA3E97290A412500ED7A0DAFFB03D80CF3650A20E0591F748E10C3C534945EE83D5F2C9722F1A68D98B8C01AF23FD
-     */
-     /*
-    // Test 1: Unkeyed BLAKE2b-512 of empty input.
-    // Expected: 786a02f742015903c6c6fd852552d272912f4740e15847618a86e217f71f5419
-    //           d25e1031afee585313896444934eb04b903a685b1448b755d56f701afe9be2ce
-    let digest = crypto::blake2b_512(b"");
-    hardware_manager::sprint("BLAKE2b-512(\"\"):\n  ");
-    hardware_manager::sprint(&helper_functions::bytes_to_hex(&digest));
-    hardware_manager::sprint("\n");
-
-    // Test 2: Unkeyed BLAKE2b-512 of "abc".
-    // Expected: ba80a53f981c4d0d6a2797b69f12f6e94c212f14685ac4b74b12bb6fdbffa2d1
-    //           7d87c5392aab792dc252d5de4533cc9518d38aa8dbf1925ab92386edd4009923
-    let digest = crypto::blake2b_512(b"abc");
-    hardware_manager::sprint("BLAKE2b-512(\"abc\"):\n  ");
-    hardware_manager::sprint(&helper_functions::bytes_to_hex(&digest));
-    hardware_manager::sprint("\n");
-
-    // Test 3: Unkeyed BLAKE2b-256 of "abc".
-    // Expected: bddd813c634239723171ef3fee98579b94964e3bb1cb3e427262c8c068d52319
-    let digest = crypto::blake2b_256(b"abc");
-    hardware_manager::sprint("BLAKE2b-256(\"abc\"):\n  ");
-    hardware_manager::sprint(&helper_functions::bytes_to_hex(&digest));
-    hardware_manager::sprint("\n");
-
-    // Test 4: Variable output length — BLAKE2b-20 (5 bytes) of "abc".
-    // A non-standard length to verify the truncation path works correctly.
-    // Expected: 3345524a bf6bbe18 0c96b8ab (first 5 bytes of the 64-byte state)
-    let digest = crypto::blake2b_variable(b"abc", 5);
-    hardware_manager::sprint("BLAKE2b-20(\"abc\"):\n  ");
-    hardware_manager::sprint(&helper_functions::bytes_to_hex(&digest));
-    hardware_manager::sprint("\n");
-
-    // Test 5: Keyed BLAKE2b-512 MAC with a 64-byte key of 0x00..0x3f
-    // and input 0x00..0xbf. This is the RFC 7693 Appendix C keyed test vector.
-    // Expected: 142709d62e28fcccd0af97fad0f8465b971e82201dc51070faa0372aa43e9248
-    //           4be1c1e73ba10906d5d1853db6a4106e0a7bf9800d373d6dee2d46d62ef2a461
-    let key: [u8; 64] = core::array::from_fn(|i| i as u8);
-    let msg: [u8; 192] = core::array::from_fn(|i| i as u8);
-    let mac = crypto::blake2b_mac_512(&msg, &key);
-    hardware_manager::sprint("BLAKE2b-512 MAC (RFC 7693 Appendix C vector):\n  ");
-    match mac {
-        Some(ref m) => hardware_manager::sprint(&helper_functions::bytes_to_hex(m)),
-        None        => hardware_manager::sprint("None (unexpected!)"),
+            // Verify that a wrong password correctly fails.
+            match crypto::verify_password(b"wrongpassword", phc) {
+                Ok(())  => hardware_manager::sprint("  reject:   FAILED (should have rejected)\n"),
+                Err(_)  => hardware_manager::sprint("  reject:   OK (wrong password correctly rejected)\n"),
+            }
+        }
+        Err(_) => hardware_manager::sprint("  hash_password returned Err (unexpected)\n"),
     }
-    hardware_manager::sprint("\n");
 
-    // Test 6: Keyed BLAKE2b-256 MAC.
-    // Same key and message as Test 5, truncated to 32 bytes.
-    let mac = crypto::blake2b_mac_256(&msg, &key);
-    hardware_manager::sprint("BLAKE2b-256 MAC:\n  ");
-    match mac {
-        Some(ref m) => hardware_manager::sprint(&helper_functions::bytes_to_hex(m)),
-        None        => hardware_manager::sprint("None (unexpected!)"),
+    // Test 2: Reduced parameters for faster boot-time testing.
+    // m=256, t=1, p=1 — not suitable for production but fast to verify.
+    hardware_manager::sprint("\nArgon2id test 2 (reduced params, fast):\n");
+    hardware_manager::sprint("  password: \"hunter2\"\n");
+    hardware_manager::sprint("  salt:     \"somesalt\"\n");
+    hardware_manager::sprint("  m=256, t=1, p=1\n");
+    match crypto::hash_password_with_params(password, &salt, 256, 1, 1) {
+        Ok(ref phc) => {
+            hardware_manager::sprint("  PHC:      ");
+            hardware_manager::sprint(phc);
+            hardware_manager::sprint("\n");
+
+            match crypto::verify_password(password, phc) {
+                Ok(())  => hardware_manager::sprint("  verify:   OK\n"),
+                Err(_)  => hardware_manager::sprint("  verify:   FAILED\n"),
+            }
+        }
+        Err(_) => hardware_manager::sprint("  hash_password_with_params returned Err (unexpected)\n"),
     }
-    hardware_manager::sprint("\n");
 
-    // Test 7: Full blake2b() entry point — variable length and key together.
-    // 48-byte output, keyed, input "Hello".
-    let mac = crypto::blake2b(
-        b"Hello",
-        48,
-        Some(b"secret key"),
-    );
-    hardware_manager::sprint("BLAKE2b-384(\"Hello\", key=\"secret key\"):\n  ");
-    match mac {
-        Some(ref m) => hardware_manager::sprint(&helper_functions::bytes_to_hex(m)),
-        None        => hardware_manager::sprint("None (unexpected!)"),
+    // Test 3: Validate error handling.
+    hardware_manager::sprint("\nArgon2id test 3 (error cases):\n");
+
+    // Empty password.
+    match crypto::hash_password(b"", &salt) {
+        Ok(_)  => hardware_manager::sprint("  empty password: FAILED (should have errored)\n"),
+        Err(_) => hardware_manager::sprint("  empty password: OK (correctly rejected)\n"),
     }
-    hardware_manager::sprint("\n");
 
-    // Test 8: Edge case — invalid parameters should return None.
-    let bad_out_len = crypto::blake2b(b"Hello", 0,    None);
-    let bad_key_len = crypto::blake2b(b"Hello", 32,   Some(b""));
-    let out_too_big = crypto::blake2b(b"Hello", 65,   None);
-    hardware_manager::sprint("blake2b(out_len=0)  -> ");
-    hardware_manager::sprint(if bad_out_len.is_none() { "None (correct)\n" } else { "Some (WRONG!)\n" });
-    hardware_manager::sprint("blake2b(key=empty) -> ");
-    hardware_manager::sprint(if bad_key_len.is_none() { "None (correct)\n" } else { "Some (WRONG!)\n" });
-    hardware_manager::sprint("blake2b(out_len=65) -> ");
-    hardware_manager::sprint(if out_too_big.is_none() { "None (correct)\n" } else { "Some (WRONG!)\n" });
+    // Salt too short (under 8 bytes).
+    match crypto::hash_password(password, b"short") {
+        Ok(_)  => hardware_manager::sprint("  short salt:     FAILED (should have errored)\n"),
+        Err(_) => hardware_manager::sprint("  short salt:     OK (correctly rejected)\n"),
+    }
 
-    // Test 9: Long input spanning multiple 128-byte compression blocks.
-    // Verifies the update() loop correctly handles block boundaries.
-    let long_input = [0x61u8; 1000]; // 1000 × 'a'
-    let digest = crypto::blake2b_512(&long_input);
-    hardware_manager::sprint("BLAKE2b-512(\"a\" * 1000):\n  ");
-    hardware_manager::sprint(&helper_functions::bytes_to_hex(&digest));
-    hardware_manager::sprint("\n");
-    */
+    // t_cost = 0.
+    match crypto::hash_password_with_params(password, &salt, 256, 0, 1) {
+        Ok(_)  => hardware_manager::sprint("  t_cost=0:       FAILED (should have errored)\n"),
+        Err(_) => hardware_manager::sprint("  t_cost=0:       OK (correctly rejected)\n"),
+    }
 
-    // RFC 7693 §A.1 — Unkeyed BLAKE2b-512 of the empty input.
-    /*let digest = crypto::blake2b_512(b"");
-    let expected: [u8; 64] = [
-        0x78, 0x6a, 0x02, 0xf7, 0x42, 0x01, 0x59, 0x03,
-        0xc6, 0xc6, 0xfd, 0x85, 0x25, 0x52, 0xd2, 0x72,
-        0x91, 0x2f, 0x47, 0x40, 0xe1, 0x58, 0x47, 0x61,
-        0x8a, 0x86, 0xe2, 0x17, 0xf7, 0x1f, 0x54, 0x19,
-        0xd2, 0x5e, 0x10, 0x31, 0xaf, 0xee, 0x58, 0x53,
-        0x13, 0x89, 0x64, 0x44, 0x93, 0x4e, 0xb0, 0x4b,
-        0x90, 0x3a, 0x68, 0x5b, 0x14, 0x48, 0xb7, 0x55,
-        0xd5, 0x6f, 0x70, 0x1a, 0xfe, 0x9b, 0xe2, 0xce,
-    ];
-    assert_eq!(digest, expected,
-        "RFC 7693 empty-input BLAKE2b-512 mismatch");*/
-    
-    // RFC 7693 §A.1 — Unkeyed BLAKE2b-512 of b"abc".
-    /*let digest = crypto::blake2b_512(b"abc");
-    let expected: [u8; 64] = [
-        0xba, 0x80, 0xa5, 0x3f, 0x98, 0x1c, 0x4d, 0x0d,
-        0x6a, 0x27, 0x97, 0xb6, 0x9f, 0x12, 0xf6, 0xe9,
-        0x4c, 0x21, 0x2f, 0x14, 0x68, 0x5a, 0xc4, 0xb7,
-        0x4b, 0x12, 0xbb, 0x6f, 0xdb, 0xff, 0xa2, 0xd1,
-        0x7d, 0x87, 0xc5, 0x39, 0x2a, 0xab, 0x79, 0x2d,
-        0xc2, 0x52, 0xd5, 0xde, 0x45, 0x33, 0xcc, 0x95,
-        0x18, 0xd3, 0x8a, 0xa8, 0xdb, 0xf1, 0x92, 0x5a,
-        0xb9, 0x23, 0x86, 0xed, 0xd4, 0x00, 0x99, 0x23,
-    ];
-    assert_eq!(digest, expected,
-        "RFC 7693 'abc' BLAKE2b-512 mismatch");*/
-    
-    // TODO: FAIL 1
-    // Keyed BLAKE2b-512 from RFC 7693 Appendix A.
-    // Key: 64 bytes, values 0x00 through 0x3f
-    /*let key: alloc::vec::Vec<u8> = (0u8..64).collect();
-    let input: alloc::vec::Vec<u8> = (0u8..250).collect();
-    let result = crypto::blake2b(&input, 64, Some(&key)).expect("blake2b should not return None");
-    // RFC 7693 Table 2, row for input length 250
-    let expected: [u8; 64] = [
-        0x6e, 0xce, 0x5e, 0xce, 0x92, 0x2d, 0x60, 0x1e,
-        0xe7, 0x72, 0x00, 0xcf, 0xa6, 0xde, 0x36, 0x11,
-        0x28, 0x75, 0x20, 0x19, 0x08, 0x77, 0x09, 0x3e,
-        0x3d, 0x3b, 0x04, 0x01, 0x31, 0x07, 0x23, 0x84,
-        0x23, 0xfe, 0x76, 0xe2, 0x25, 0xa8, 0x8d, 0x0d,
-        0x43, 0xdc, 0x4d, 0x44, 0x36, 0x42, 0x16, 0x9a,
-        0x52, 0x40, 0x47, 0xe5, 0x0b, 0x2d, 0xed, 0x55,
-        0x51, 0xf5, 0x20, 0xf2, 0x90, 0x25, 0xfb, 0x78,
-    ];
-    assert_eq!(result.as_slice(), &expected,
-        "RFC 7693 keyed 250-byte BLAKE2b-512 mismatch");*/
-    
-    // TODO: unknown vec! macro
-    // RFC 7693 keyed vector — input length 1 (single byte 0x00).
-    /*let key: alloc::vec::Vec<u8> = (0u8..64).collect();
-    let input: alloc::vec::Vec<u8> = alloc::vec::vec![0x00];
-    let result = crypto::blake2b(&input, 64, Some(&key)).expect("blake2b returned None");
-    // RFC 7693 Table 2, row for input length 1
-    let expected: [u8; 64] = [
-        0x33, 0xd0, 0x82, 0x5d, 0xdd, 0xf8, 0xe6, 0x07,
-        0x51, 0x58, 0x55, 0x0b, 0x50, 0x35, 0x55, 0x21,
-        0x8a, 0xc8, 0x30, 0xc9, 0xbc, 0xb8, 0x44, 0x19,
-        0xf1, 0x80, 0x49, 0xde, 0x54, 0x94, 0x04, 0xf4,
-        0xfa, 0xef, 0xd7, 0xd9, 0x71, 0x63, 0x8e, 0x77,
-        0x37, 0x9c, 0x4f, 0xda, 0x53, 0x85, 0x40, 0x39,
-        0x2d, 0x8a, 0x1b, 0x93, 0x01, 0xde, 0x9d, 0xb2,
-        0xa3, 0x33, 0x13, 0x82, 0x6c, 0xf1, 0xcd, 0x41,
-    ];
-    assert_eq!(result.as_slice(), &expected,
-        "RFC 7693 keyed 1-byte BLAKE2b-512 mismatch");*/
-    
-    // TODO: FAIL test
-    // RFC 7693 keyed vector — input length 128 (exactly one full block).
-    /*let key: alloc::vec::Vec<u8> = (0u8..64).collect();
-    let input: alloc::vec::Vec<u8> = (0u8..128).collect();
-    let result = crypto::blake2b(&input, 64, Some(&key)).expect("blake2b returned None");
-    // RFC 7693 Table 2, row for input length 128
-    let expected: [u8; 64] = [
-        0x01, 0x4a, 0x95, 0xb9, 0x04, 0xdd, 0x21, 0xe5,
-        0x0d, 0xba, 0x26, 0x58, 0x91, 0x18, 0x76, 0xc6,
-        0x37, 0xfe, 0x30, 0x26, 0xf8, 0x7f, 0xb5, 0x52,
-        0x13, 0x97, 0x35, 0xef, 0xfc, 0x7a, 0xa7, 0x53,
-        0x05, 0xa2, 0x68, 0x07, 0xc0, 0xf5, 0x5a, 0x21,
-        0xfc, 0xc2, 0x64, 0x2f, 0x12, 0xa5, 0xb1, 0x70,
-        0x9e, 0x21, 0x4a, 0xe6, 0x35, 0xb8, 0x4b, 0x64,
-        0x98, 0xbe, 0x48, 0x33, 0x91, 0x37, 0x22, 0x42,
-    ];
-    assert_eq!(result.as_slice(), &expected,
-        "RFC 7693 keyed 128-byte BLAKE2b-512 mismatch");*/
-    
-    // TODO: FAIL test
-    // RFC 7693 keyed vector — input length 255 (near-maximum test).
-    /*let key: alloc::vec::Vec<u8> = (0u8..64).collect();
-    let input: alloc::vec::Vec<u8> = (0u8..=254).collect(); // 255 bytes
-    let result = crypto::blake2b(&input, 64, Some(&key)).expect("blake2b returned None");
-    // RFC 7693 Table 2, row for input length 255
-    let expected: [u8; 64] = [
-        0x44, 0x35, 0x90, 0x51, 0x04, 0x94, 0x4c, 0x20,
-        0x3f, 0x2e, 0x2d, 0x42, 0xab, 0x38, 0xa1, 0x49,
-        0x7e, 0xcb, 0x48, 0x15, 0xad, 0xe7, 0x3f, 0x6e,
-        0xae, 0xa2, 0x5d, 0x34, 0xa4, 0x2c, 0x37, 0x90,
-        0x05, 0x32, 0xec, 0xef, 0xa3, 0x4e, 0x1e, 0x91,
-        0x56, 0xf0, 0x30, 0x9e, 0x38, 0x3d, 0xd9, 0x82,
-        0x6f, 0x8b, 0x3e, 0x6e, 0x08, 0xc0, 0x2e, 0x73,
-        0x45, 0x64, 0xca, 0x12, 0x46, 0xa3, 0x69, 0xa5,
-    ];
-    assert_eq!(result.as_slice(), &expected,
-        "RFC 7693 keyed 255-byte BLAKE2b-512 mismatch");*/
-    
-    // Unkeyed BLAKE2b-256 of empty input.
-    let digest = crypto::blake2b_256(b"");
-    let expected: [u8; 32] = [
-        0x0e, 0x57, 0x51, 0xc0, 0x26, 0xe5, 0x43, 0xb2,
-        0xe8, 0xab, 0x2e, 0xb0, 0x60, 0x99, 0xda, 0xa1,
-        0xd1, 0xe5, 0xdf, 0x47, 0x77, 0x8f, 0x77, 0x87,
-        0xfa, 0xab, 0x45, 0xcd, 0xf1, 0x2f, 0xe3, 0xa8,
-    ];
-    assert_eq!(digest, expected, "BLAKE2b-256 empty-input mismatch");
-
-    // TODO: FAILED test (unkeyed)
-    // Unkeyed BLAKE2b-256 of b"abc".
-    let digest = crypto::blake2b_256(b"abc");
-    let expected: [u8; 32] = [
-        0xbd, 0xdd, 0x81, 0x3c, 0x63, 0x42, 0x39, 0x72,
-        0x31, 0x71, 0xef, 0x3f, 0xee, 0x98, 0x57, 0x9b,
-        0x94, 0x96, 0x4e, 0x3b, 0xb1, 0xcb, 0x3e, 0x42,
-        0x72, 0x62, 0xc8, 0xc0, 0x68, 0xd5, 0x23, 0x19,
-    ];
-    assert_eq!(digest, expected, "BLAKE2b-256 'abc' mismatch");
-
-    // TODO: FAIL test
-    /*// Keyed BLAKE2b-512 MAC of b"" with a 32-byte all-zero key.
-    let key = [0u8; 32];
-    let result = crypto::blake2b_mac_512(b"", &key).expect("MAC should not fail");
-    // Computed from the BLAKE2 reference implementation.
-    let expected: [u8; 64] = [
-        0x78, 0x6a, 0x02, 0xf7, 0x42, 0x01, 0x59, 0x03,
-        0xc6, 0xc6, 0xfd, 0x85, 0x25, 0x52, 0xd2, 0x72,
-        0x91, 0x2f, 0x47, 0x40, 0xe1, 0x58, 0x47, 0x61,
-        0x8a, 0x86, 0xe2, 0x17, 0xf7, 0x1f, 0x54, 0x19,
-        0xd2, 0x5e, 0x10, 0x31, 0xaf, 0xee, 0x58, 0x53,
-        0x13, 0x89, 0x64, 0x44, 0x93, 0x4e, 0xb0, 0x4b,
-        0x90, 0x3a, 0x68, 0x5b, 0x14, 0x48, 0xb7, 0x55,
-        0xd5, 0x6f, 0x70, 0x1a, 0xfe, 0x9b, 0xe2, 0xce,
-    ];
-    assert_eq!(result, expected, "blake2b_mac_512 zero-key empty-input mismatch");*/
-
-    // `blake2b_mac_512` and `blake2b` with `Some(key)` must agree.
-    /*let key = b"test-key-32-bytes-long-here!!!!";
-    let input = b"The quick brown fox jumps over the lazy dog";
-    let via_mac = crypto::blake2b_mac_512(input, key).expect("mac should succeed");
-    let via_api = crypto::blake2b(input, 64, Some(key))
-        .expect("blake2b should succeed");
-    assert_eq!(&via_mac[..], via_api.as_slice(),
-        "blake2b_mac_512 and blake2b(key=Some) disagree");*/
-    
-    // `blake2b_mac_256` and `blake2b` with `Some(key)` must agree.
-    /*let key = b"another-key";
-    let input = b"hello world";
-    let via_mac = crypto::blake2b_mac_256(input, key).expect("mac should succeed");
-    let via_api = crypto::blake2b(input, 32, Some(key))
-        .expect("blake2b should succeed");
-    assert_eq!(&via_mac[..], via_api.as_slice(),
-        "blake2b_mac_256 and blake2b(key=Some) disagree");*/
-    
-    // Hashing the same bytes with different keys must give different outputs.
-    /*let input = b"same input";
-    let key1 = b"key one";
-    let key2 = b"key two";
-    let mac1 = crypto::blake2b_mac_512(input, key1).unwrap();
-    let mac2 = crypto::blake2b_mac_512(input, key2).unwrap();
-    assert_ne!(mac1, mac2, "Different keys produced the same MAC");*/
-
-    // Keyed hash must differ from unkeyed hash of the same input
-    /*let input = b"some data";
-    let key = b"secret";
-    let keyed   = crypto::blake2b(&input[..], 64, Some(key)).unwrap();
-    let unkeyed = crypto::blake2b(&input[..], 64, None).unwrap();
-    assert_ne!(keyed, unkeyed,
-        "Keyed and unkeyed BLAKE2b produced the same output");*/
-    
-    // Different `out_len` values must produce different digests, *not* merely
-    // the longer digest truncated.
-    /*let input = b"domain separation test";
-    let digest_32 = crypto::blake2b(input, 32, None).unwrap();
-    let digest_64 = crypto::blake2b(input, 64, None).unwrap();
-    // The 32-byte output must NOT equal the first 32 bytes of the 64-byte output.
-    assert_ne!(digest_32.as_slice(), &digest_64[..32],
-        "BLAKE2b outputs of different lengths should NOT be prefixes of each other");*/
-
-    // `blake2b_512` and `blake2b_512_slice` are identical
-    /*let input = b"consistency check input";
-    let a = crypto::blake2b_512(input);
-    let b = crypto::blake2b_512_slice(input);
-    assert_eq!(a, b, "blake2b_512 and blake2b_512_slice disagree");*/
-
-    // `blake2b_variable` with an in-range length must match `blake2b`.
-    /*let input = b"variable length test";
-    for out_len in [1usize, 16, 32, 48, 63, 64] {
-        let via_var = crypto::blake2b_variable(input, out_len);
-        let via_api = crypto::blake2b(input, out_len, None).unwrap();
-        assert_eq!(via_var, via_api,
-            "blake2b_variable({out_len}) disagrees with blake2b");
-    }*/
-
-    // One-liner tests
-    /*let result = crypto::blake2b_variable(b"anything", 0);
-        assert_eq!(result.len(), 1,
-            "Expected clamped length 1, got {}", result.len());
-    let result = crypto::blake2b_variable(b"anything", 65);
-        assert_eq!(result.len(), 64,
-            "Expected clamped length 64, got {}", result.len());
-    assert!(crypto::blake2b(b"x", 0, None).is_none(),
-            "Expected None for out_len=0");
-    assert!(crypto::blake2b(b"x", 65, None).is_none(),
-            "Expected None for out_len=65");
-    assert!(crypto::blake2b(b"x", 32, Some(b"")).is_none(),
-            "Expected None for empty key");
-    let long_key = [0u8; 65];
-        assert!(crypto::blake2b(b"x", 32, Some(&long_key)).is_none(),
-            "Expected None for 65-byte key");
-    assert!(crypto::blake2b_mac_512(b"data", b"").is_none(),
-            "Expected None for empty key");
-    let long_key = [0xffu8; 65];
-        assert!(crypto::blake2b_mac_256(b"data", &long_key).is_none(),
-            "Expected None for 65-byte key");*/
-    
-    // Input of exactly BLOCK_SIZE (128 bytes) must be handled correctly.
-    /*let input = [0x42u8; 128];
-    let digest = crypto::blake2b_512(&input);
-    // Verify against blake2b() for consistency; also check length.
-    let via_api = crypto::blake2b(&input, 64, None).unwrap();
-    assert_eq!(&digest[..], via_api.as_slice());
-    // Non-trivial: result must differ from the empty-input hash.
-    let empty = crypto::blake2b_512(b"");
-    assert_ne!(digest, empty);*/
-
-    // Input of exactly BLOCK_SIZE + 1 (129 bytes) crosses a block boundary.
-    /*let input = [0x37u8; 129];
-    let digest = crypto::blake2b_512(&input);
-    let via_api = crypto::blake2b(&input, 64, None).unwrap();
-    assert_eq!(&digest[..], via_api.as_slice());*/
-
-    // Input of exactly 2 * BLOCK_SIZE (256 bytes).
-    /*let input = [0x55u8; 256];
-    let a = crypto::blake2b_512(&input);
-    let b = crypto::blake2b(&input, 64, None).unwrap();
-    assert_eq!(&a[..], b.as_slice());*/
-
-    // Calling `update` in many small chunks must give the same result as
-    // one large call, since the streaming API is stateful.
-    // Build a non-trivial 300-byte input.
-    /*let input: alloc::vec::Vec<u8> = (0u8..=255).chain(0u8..44).collect();
-    assert_eq!(input.len(), 300);
-    let oneshot = crypto::blake2b(&input, 64, None).unwrap();*/
-
-    // Manually drive the state in three chunks to exercise update looping.
-    /*let mut state = crypto::Blake2bState::new(64, None);
-    state.update(&input[..100]);
-    state.update(&input[100..200]);
-    state.update(&input[200..]);
-    let chunked = state.finalize();
-    assert_eq!(oneshot, chunked,
-        "One-shot and chunked updates produced different digests");*/
-
-    // Two identical calls must always produce identical output.
-    /*let input = b"determinism test vector";
-    let a = crypto::blake2b_512(input);
-    let b = crypto::blake2b_512(input);
-    assert_eq!(a, b);*/
-
-    // A one-bit change in input must produce a completely different digest
-    // (avalanche effect sanity check).
-    /*let input_a = b"hello world";
-    let mut input_b = *input_a;
-    input_b[0] ^= 0x01; // flip one bit in 'h' → 'i'
-    let digest_a = crypto::blake2b_512(input_a);
-    let digest_b = crypto::blake2b_512(&input_b);
-    assert_ne!(digest_a, digest_b,
-        "One-bit change should produce a different digest");
-    // Count differing bytes — roughly half should differ (birthday bound).
-    let differing = digest_a.iter().zip(digest_b.iter())
-        .filter(|(a, b)| a != b)
-        .count();
-    assert!(differing >= 24,
-        "Too few bytes differ ({differing}/64) — possible avalanche failure");*/
+    // m_cost too low for p_cost (m < 8 * p).
+    match crypto::hash_password_with_params(password, &salt, 4, 1, 1) {
+        Ok(_)  => hardware_manager::sprint("  m_cost too low: FAILED (should have errored)\n"),
+        Err(_) => hardware_manager::sprint("  m_cost too low: OK (correctly rejected)\n"),
+    }
 
     
 

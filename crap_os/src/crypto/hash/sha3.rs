@@ -1,5 +1,7 @@
 //! The SHA-3 512 Basic Hashing Algorithm
 
+#![allow(dead_code)]
+
 /// The Keccak-f[1600] round constants (FIPS 202, Section 3.4, Algorithm 5).
 ///
 /// There are 24 rounds in Keccak-f[1600]. Each constant is derived from a

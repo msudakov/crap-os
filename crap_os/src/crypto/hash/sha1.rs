@@ -5,6 +5,8 @@
 //! SHA-1 is included solely for non-security checksum use cases. It must never
 //! be used in any new security-sensitive context.
 
+#![allow(dead_code)]
+
 /// Computes the SHA-1 digest of `input` and returns the 160-bit (20-byte)
 /// result.
 ///

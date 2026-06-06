@@ -32,6 +32,8 @@
 //!     hardware-specific constant-time guarantees; avoid branching on secret
 //!     data in callers
 
+#![allow(dead_code)]
+
 /// BLAKE2b initialization vector.
 ///
 /// These are the same as the SHA-512 IV: the first 64 bits of the fractional
@@ -395,29 +397,87 @@ pub fn blake2b_512_slice(input: &[u8]) -> [u8; 64] {
     blake2b_512(input)
 }
 
-/// Computes an unkeyed BLAKE2b digest of a variable output length.
+/// Argon2id variable-length hash function H' (RFC 9106 section 3.3).
 ///
-/// Used by Argon2id's H' function to produce output blocks of arbitrary
-/// length during memory initialization and digest extraction.
+/// H' extends BLAKE2b to produce outputs of arbitrary length >= 1 byte.
+/// It is used by Argon2id in two contexts:
+///
+///   - During initialisation, to hash the H0 seed into the first two 1024-byte
+///     memory blocks of each lane.
+///   - At the end of the final pass, to produce the tag (the actual password
+///     hash output), which may be any length from 4 to 2^32-1 bytes.
+///
+/// The construction has two cases:
+///
+///  tau <= 64: H'(tau, X) = BLAKE2b(digest_size=tau, msg=LE32(tau) || X)
+///             A single BLAKE2b call. Note the LE32(tau) prefix: this
+///             distinguishes H' from a plain BLAKE2b call and is mandatory.
+///
+///   tau > 64: r = ceil(tau/32) - 2
+///             A[1]   = BLAKE2b-512(LE32(tau) || X)
+///             A[i]   = BLAKE2b-512(A[i-1])           for i in 2..=r
+///             A[r+1] = BLAKE2b(tau - 32*r, A[r])
+///             output = A[1][..32] || A[2][..32] || ... || A[r][..32] || A[r+1]
+///
+///             Each chaining step compresses 64 bytes into 64 bytes; the final
+///             step uses a shortened BLAKE2b to produce the remaining tail.
+///             Exactly 32 bytes are retained from each intermediate block.
 ///
 /// # Arguments
 ///
-/// * `input`   - The byte slice to hash.
-/// * `out_len` - Desired output length in bytes (1–64). Lengths outside this
-///               range are clamped: 0 is treated as 1, and values above 64
-///               are treated as 64. This clamping behaviour is intentional
-///               for the Argon2id H' use case; other callers should use
-///               `blake2b` directly if they need an error on invalid lengths.
+/// * `input` - The byte slice to hash (the H0 seed block or a memory block).
+/// * `tau`   - Desired output length in bytes. Any value in 1..=usize::MAX is
+///             accepted, though Argon2id constrains tau to 4..=2^32-1 for the
+///             tag and to exactly 1024 for block derivation.
 ///
 /// # Returns
 ///
-/// Returns a `Vec<u8>` of exactly `out_len` bytes.
-pub fn blake2b_variable(input: &[u8], out_len: usize) -> alloc::vec::Vec<u8> {
-    let clamped = out_len.clamp(1, MAX_OUT_LEN);
-    let mut state = Blake2bState::new(clamped, None);
-    state.update(input);
+/// Returns a `Vec<u8>` of exactly `tau` bytes.
+pub fn h_prime(input: &[u8], tau: usize) -> alloc::vec::Vec<u8> {
+    // Encode tau as a 4-byte little-endian prefix (LE32(tau) in the RFC)
+    let tau_bytes = (tau as u32).to_le_bytes();
 
-    state.finalize()
+    if tau <= 64 {
+        // Single BLAKE2b call; output is exactly tau bytes
+        let clamped = tau.max(1);  // tau=0 not valid per RFC, but guard anyway
+        let mut state = Blake2bState::new(clamped, None);
+        state.update(&tau_bytes);
+        state.update(input);
+        return state.finalize();
+    }
+
+    // tau > 64: chained construction.
+    // r is the number of 64-byte intermediate blocks whose first 32 bytes
+    // are concatenated. The final block may be shorter than 64 bytes.
+    let r = tau.div_ceil(32) - 2;  // ceil(tau/32) - 2
+
+    // A[1]: 64-byte hash of LE32(tau) || input
+    let mut a = {
+        let mut state = Blake2bState::new(64, None);
+        state.update(&tau_bytes);
+        state.update(input);
+        state.finalize()  // 64 bytes
+    };
+
+    let mut out = alloc::vec::Vec::with_capacity(tau);
+    out.extend_from_slice(&a[..32]);  // retain first 32 bytes of A[1]
+
+    // A[2] through A[r]: each is BLAKE2b-512 of the previous 64-byte block
+    for _ in 1..r {
+        let mut state = Blake2bState::new(64, None);
+        state.update(&a);
+        a = state.finalize();
+        out.extend_from_slice(&a[..32]);
+    }
+
+    // A[r+1]: final block with digest size tau - 32*r (between 1 and 64 bytes)
+    let last_len = tau - 32 * r;
+    let mut state = Blake2bState::new(last_len, None);
+    state.update(&a);
+    let last = state.finalize();
+    out.extend_from_slice(&last);
+
+    out
 }
 
 /// Computes an unkeyed BLAKE2b-256 digest (32-byte output).

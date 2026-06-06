@@ -15,10 +15,13 @@
 //! injection. Software-level side-channel hygiene (constant-time comparisons,
 //! secret-independent memory access patterns) is applied where relevant and
 //! noted in the documentation of each submodule.
+#![allow(unused_imports)]
 
 pub mod rng;
 mod hash;
 
 // Re-export public APIs
 pub use rng::{init_cpu, get_random_bytes_vec, get_pseudo_random_bytes_vec};
-pub use hash::{md5, sha1, sha256, sha3_512, blake2b_512, blake2b_256, blake2b_variable, blake2b_mac_512, blake2b_mac_256, blake2b, blake2b_512_slice};
+
+pub use hash::{md5, sha1, sha256, sha3_512};
+pub use hash::{hash_password, hash_password_with_params, verify_password};

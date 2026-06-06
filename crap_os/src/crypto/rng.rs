@@ -62,6 +62,8 @@
 //! .wrapping_add(s0)`) has better distribution in the high bits than the
 //! original "+" scrambler, at the cost of one extra addition.
 
+#![allow(dead_code)]
+
 use core::arch::asm;
 use crate::processor_control::{CpuId, PerCpu};
 use crate::helper_functions::{disable_interrupts_save, restore_interrupts};

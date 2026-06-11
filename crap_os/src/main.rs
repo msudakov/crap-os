@@ -304,89 +304,6 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     fbprintln!("[+] All MM heap allocator tests passed!\n");*/
 
 
-    // Password hashing tests
-    // --- Argon2id test ---
-
-    // Static inputs for cross-verification with online tools.
-    // Use https://argon2.online or similar to verify the PHC string output.
-    let password = b"hunter2";
-    let salt     = helper_functions::hex_to_bytes("c91482d834c1c2f3f90f85685cdf7e6a").unwrap();
-
-    // Test 1: Default parameters (OWASP recommended minimums).
-    // m=19456, t=2, p=1
-    hardware_manager::sprint("Argon2id test 1 (default params):\n");
-    hardware_manager::sprint("  password: \"hunter2\"\n");
-    hardware_manager::sprint("  salt:     \"somesalt\"\n");
-    match crypto::hash_password(password, &salt) {
-        Ok(ref phc) => {
-            hardware_manager::sprint("  PHC:      ");
-            hardware_manager::sprint(phc);
-            hardware_manager::sprint("\n");
-
-            // Verify the hash against itself to confirm round-trip works.
-            match crypto::verify_password(password, phc) {
-                Ok(())  => hardware_manager::sprint("  verify:   OK\n"),
-                Err(_)  => hardware_manager::sprint("  verify:   FAILED\n"),
-            }
-
-            // Verify that a wrong password correctly fails.
-            match crypto::verify_password(b"wrongpassword", phc) {
-                Ok(())  => hardware_manager::sprint("  reject:   FAILED (should have rejected)\n"),
-                Err(_)  => hardware_manager::sprint("  reject:   OK (wrong password correctly rejected)\n"),
-            }
-        }
-        Err(_) => hardware_manager::sprint("  hash_password returned Err (unexpected)\n"),
-    }
-
-    // Test 2: Reduced parameters for faster boot-time testing.
-    // m=256, t=1, p=1 — not suitable for production but fast to verify.
-    hardware_manager::sprint("\nArgon2id test 2 (reduced params, fast):\n");
-    hardware_manager::sprint("  password: \"hunter2\"\n");
-    hardware_manager::sprint("  salt:     \"somesalt\"\n");
-    hardware_manager::sprint("  m=256, t=1, p=1\n");
-    match crypto::hash_password_with_params(password, &salt, 256, 1, 1) {
-        Ok(ref phc) => {
-            hardware_manager::sprint("  PHC:      ");
-            hardware_manager::sprint(phc);
-            hardware_manager::sprint("\n");
-
-            match crypto::verify_password(password, phc) {
-                Ok(())  => hardware_manager::sprint("  verify:   OK\n"),
-                Err(_)  => hardware_manager::sprint("  verify:   FAILED\n"),
-            }
-        }
-        Err(_) => hardware_manager::sprint("  hash_password_with_params returned Err (unexpected)\n"),
-    }
-
-    // Test 3: Validate error handling.
-    hardware_manager::sprint("\nArgon2id test 3 (error cases):\n");
-
-    // Empty password.
-    match crypto::hash_password(b"", &salt) {
-        Ok(_)  => hardware_manager::sprint("  empty password: FAILED (should have errored)\n"),
-        Err(_) => hardware_manager::sprint("  empty password: OK (correctly rejected)\n"),
-    }
-
-    // Salt too short (under 8 bytes).
-    match crypto::hash_password(password, b"short") {
-        Ok(_)  => hardware_manager::sprint("  short salt:     FAILED (should have errored)\n"),
-        Err(_) => hardware_manager::sprint("  short salt:     OK (correctly rejected)\n"),
-    }
-
-    // t_cost = 0.
-    match crypto::hash_password_with_params(password, &salt, 256, 0, 1) {
-        Ok(_)  => hardware_manager::sprint("  t_cost=0:       FAILED (should have errored)\n"),
-        Err(_) => hardware_manager::sprint("  t_cost=0:       OK (correctly rejected)\n"),
-    }
-
-    // m_cost too low for p_cost (m < 8 * p).
-    match crypto::hash_password_with_params(password, &salt, 4, 1, 1) {
-        Ok(_)  => hardware_manager::sprint("  m_cost too low: FAILED (should have errored)\n"),
-        Err(_) => hardware_manager::sprint("  m_cost too low: OK (correctly rejected)\n"),
-    }
-
-    
-
     // Create and initialize the System process
     let system_process = globals::PROCESS_MANAGER.create_kernel_process(
         "System",
@@ -465,6 +382,11 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             );
         }
     }
+    
+
+    
+
+
 
 
 

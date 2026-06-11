@@ -49,6 +49,14 @@
 //!     addressing for the first half-pass, preventing timing side channels
 //!     during the most sensitive phase.
 
+// TODO: THIS IMPLEMENTATION IS BUGGY AND THE RESULTS DIFFER FROM THOSE OF
+//       SUPPORTED CRATES AND LIBRARIES, AS WELL AS ONLINE HASHERS. MUST BE
+//       REVISITED IN THE FUTURE AND FIXED BEFORE SYSTEM USE.
+
+// TODO: Blake2b might also be buggy, perhaps in its prime function used by
+//       Argon2id, or it may be ok. Tests showed that Blake2 itself is ok and
+//       matches other libraries.
+
 #![allow(dead_code)]
 
 use crate::helper_functions::{base64_encode, base64_decode};

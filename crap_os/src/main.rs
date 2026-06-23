@@ -385,6 +385,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     
 
 
+
     // Signal the Task Scheduler that the kernel has completed its
     // initialization sequence. After this, the idle task (this task) will only
     // be selected to run if no other tasks are available and ready to run.

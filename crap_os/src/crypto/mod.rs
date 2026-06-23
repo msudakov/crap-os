@@ -20,6 +20,7 @@
 pub mod rng;
 mod hash;
 mod hmac;
+mod cipher;
 
 // Re-export public APIs
 pub use rng::{init_cpu, get_random_bytes_vec, get_pseudo_random_bytes_vec};
@@ -27,3 +28,5 @@ pub use rng::{init_cpu, get_random_bytes_vec, get_pseudo_random_bytes_vec};
 pub use hash::{md5, sha1, sha256, sha3_512};
 pub use hash::{hash_password, hash_password_with_params, verify_password};
 pub use hmac::hmac_sha256;
+
+pub use cipher::{aes_gcm_encrypt, aes_gcm_decrypt};

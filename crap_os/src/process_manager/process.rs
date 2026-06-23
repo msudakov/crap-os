@@ -27,7 +27,7 @@
 //!                                         V
 //!                                  IrqSpinLock<Thread>
 //!
-//! - [`ProcessManager`] holds a strong `Arc` to each process
+//! - [`super::ProcessManager`] holds a strong `Arc` to each process
 //! - [`Process`] holds a strong `Arc` to each of its threads via a locked list
 //! - [`Thread`] holds a `Weak` back-reference to its owning process
 //! - No strong ownership cycles exist at any level
@@ -48,8 +48,8 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use crate::spinlock::IrqSpinLock;
 use super::thread::{Thread, ThreadId};
-use crate::task_scheduler::{insert_and_queue_task, SchedulerError};
-use crate::task_scheduler::task::Task;
+use crate::task_scheduler::{Task, insert_and_queue_task, SchedulerError};
+use crate::memory_manager::AddressSpace;
 
 /// Uniquely identifies a process within the process manager.
 ///
@@ -119,12 +119,10 @@ pub struct Process {
     /// Human-readable name for this process, used in debug output and logging.
     pub name: &'static str,
 
-    /// Physical address of this process's page table root (CR3 register value).
-    ///
-    /// Reserved for future user mode support. All current kernel processes
-    /// share the same address space, so this field is stored at construction
-    /// but not yet acted upon.
-    pub cr3: u64,
+    /// Virtual address space for this process, containing his process's page
+    /// table root (CR3/PML4) - among other fields. Kernel virtual address
+    /// space is shared, so this is mainly used for user-mode support.
+    pub address_space: AddressSpace,
 
     /// The list of threads owned by this process.
     ///
@@ -138,29 +136,6 @@ pub struct Process {
 
 #[allow(dead_code)]
 impl Process {
-    /// Creates a new empty process with the given name and page table root.
-    /// 
-    /// # Arguments
-    /// 
-    /// * `name` - Human-readable name for this process.
-    /// * `cr3`  - PML4 page table root physical address.
-    /// 
-    /// # Returns
-    ///
-    /// Returns the process wrapped in [`Arc`], with no threads yet. Callers
-    /// must immediately spawn at least one thread via [`spawn_thread`] to
-    /// satisfy the non-empty invariant. In practice, this is always done by
-    /// [`ProcessManager::create_process`], which is the intended entry point
-    /// for process creation.
-    pub(crate) fn new(name: &'static str, cr3: u64) -> Arc<Self> {
-        Arc::new(Process {
-            id: ProcessId::next(),
-            name,
-            cr3,
-            threads: IrqSpinLock::new(Vec::new()),
-        })
-    }
-
     /// Creates the idle process, which owns the idle thread and task.
     ///
     /// Uses [`ProcessId::IDLE`] instead of allocating a new ID. The idle
@@ -180,12 +155,74 @@ impl Process {
         Arc::new(Process {
             id: ProcessId::IDLE,
             name: "Idle",
-            cr3,
+            // Kernel processes wrap their existing PML4 - no new allocation
+            address_space: AddressSpace::from_existing(cr3),
             threads: IrqSpinLock::new(Vec::new()),
         })
     }
 
-    /// Spawns a new thread in this process.
+    /// Creates a new empty kernel process with the given name and page table
+    /// root.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `name` - Human-readable name for this process.
+    /// * `cr3`  - PML4 page table root physical address.
+    /// 
+    /// # Returns
+    ///
+    /// Returns the process wrapped in [`Arc`], with no threads yet. Callers
+    /// must immediately spawn at least one thread via [`spawn_thread`] to
+    /// satisfy the non-empty invariant. In practice, this is always done by
+    /// [`ProcessManager::create_process`], which is the intended entry point
+    /// for process creation.
+    pub(crate) fn new_kernel(name: &'static str, cr3: u64) -> Arc<Self> {
+        Arc::new(Process {
+            id: ProcessId::next(),
+            name,
+            // Kernel processes wrap their existing PML4 - no new allocation
+            address_space: AddressSpace::from_existing(cr3),
+            threads: IrqSpinLock::new(Vec::new()),
+        })
+    }
+
+    /// Creates a new user process with a fresh address space.
+    ///
+    /// Unlike `new_kernel`, which wraps an existing kernel PML4, this allocates
+    /// a brand-new PML4 for the process and copies the kernel's upper-half
+    /// entries into it. The result is an isolated address space with no user
+    /// mappings yet; the caller is responsible for mapping code, stack, and
+    /// any other regions before spawning threads.
+    ///
+    /// # Arguments
+    ///
+    /// * `name`             - Human-readable name for this process.
+    /// * `kernel_pml4_phys` - Physical address of the kernel's own PML4, used
+    ///                        as the source for the upper-half copy. This is
+    ///                        the same CR3 value used by all kernel processes.
+    pub fn new_user(name: &'static str, kernel_pml4_phys: u64) -> Arc<Self> {
+        Arc::new(Process {
+            id: ProcessId::next(),  // Allocate the next process ID value
+            name,
+
+            // Create and initialize a new user address space. This allocates a
+            // fresh PML4 page, zeroes the lower user-space half, and copies the
+            // kernel's upper-half PML4 entries.
+            address_space: AddressSpace::init(kernel_pml4_phys),
+
+            // Initialize an empty threads vector
+            threads: IrqSpinLock::new(Vec::new()),
+        })
+    }
+
+    /// Return the physical address of this process's PML4, suitable for
+    /// loading into CR3 or caching in a Task.
+    #[inline]
+    pub fn pml4_phys(&self) -> u64 {
+        self.address_space.pml4_phys
+    }
+
+    /// Spawns a new kernel thread in this process.
     ///
     /// Creates a [`Thread`], constructs and queues its backing [`Task`] in the
     /// scheduler, writes the assigned [`TaskId`] back into the thread, and
@@ -205,7 +242,7 @@ impl Process {
     /// the caller to hold a reference independently of the process thread list)
     /// if successful, or [`SchedulerError`] if the scheduler task table or run
     /// queue is full, in which case no thread or task is registered.
-    pub fn spawn_thread(
+    pub fn spawn_kernel_thread(
         self: &Arc<Self>,
         name: &'static str,
         entry: fn(u64),
@@ -215,13 +252,54 @@ impl Process {
         let thread = Thread::new(name, Arc::downgrade(self));
 
         // Create the new task object
-        let task = Task::new(entry, arg, Arc::downgrade(&thread));
+        let task = Task::new_kernel(entry, arg, Arc::downgrade(&thread));
 
         // Make the new task immediately eligible for scheduling, but the task
         // will not actually begin executing until the timer ISR next calls
         // `schedule()` and selects it from the head of the ready queue.
         let task_id = insert_and_queue_task(task)?;
         
+        // Set the thread's `TaskId` reference, returned by the scheduler
+        thread.lock().task_id = Some(task_id);
+
+        // Register the new thread with the parent process
+        self.threads.lock().push(Arc::clone(&thread));
+
+        // Return the thread reference
+        Ok(thread)
+    }
+
+    /// Spawns a user-mode thread in this process at the given virtual address.
+    ///
+    /// Allocates a kernel stack (for interrupt/syscall handling) and a user
+    /// stack, sets up the `iretq` frame, and queues the thread for scheduling.
+    ///
+    /// # Arguments
+    ///
+    /// * `name`       - Human-readable name for this thread.
+    /// * `user_entry` - Virtual address of the user-mode entry point in this
+    ///                  process's address space.
+    pub fn spawn_user_thread(
+        self: &Arc<Self>,
+        name: &'static str,
+        user_entry: u64,
+    ) -> Result<Arc<IrqSpinLock<Thread>>, SchedulerError> {
+        // Create the new thread object
+        let thread = Thread::new(name, Arc::downgrade(self));
+
+        // Create the new user-mode task object
+        let task = Task::new_user(
+            user_entry,
+            &self.address_space,
+            self.pml4_phys(),
+            Arc::downgrade(&thread),
+        );
+
+        // Make the new task immediately eligible for scheduling, but the task
+        // will not actually begin executing until the timer ISR next calls
+        // `schedule()` and selects it from the head of the ready queue.
+        let task_id = insert_and_queue_task(task)?;
+
         // Set the thread's `TaskId` reference, returned by the scheduler
         thread.lock().task_id = Some(task_id);
 

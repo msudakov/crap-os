@@ -1,11 +1,11 @@
-//! Kernel Task Representation Module
+//! Task Representation Module
 //!
-//! This module defines the data types that represent a kernel task and the
+//! This module defines the data types that represent a task and the
 //! instrumentation needed to construct a new task's initial stack frame, so
 //! that the generic context switcher (`switcher.rs`) can resume it for the very
 //! first time without any special handling.
 //!
-//! A task is an independent unit of kernel execution. Each task has:
+//! A task is an independent unit of execution. Each task has:
 //!   - An ID struct (`TaskId`), which is explained below;
 //!   - A lifecycle state (`TaskState`) visible to the scheduler;
 //!   - A private stack, heap-allocated as a `Box<[u8]>`;
@@ -14,14 +14,17 @@
 //!   - A `Thread` object as a `Weak` back-reference that ties this execution
 //!     unit to a `Process` object in the Process Manager.
 //!
-//! All tasks run at ring 0, for now, with interrupts enabled once they start
-//! executing.
+//! All tasks start executing with interrupts enabled.
 
 use core::sync::atomic::AtomicU64;
 use alloc::sync::Weak;
 use alloc::boxed::Box;
+use alloc::vec::Vec;
 use crate::spinlock::IrqSpinLock;
+use crate::task_scheduler::queue_task_reaper;
 use crate::process_manager::thread::{Thread, ThreadState};
+use crate::memory_manager::AddressSpace;
+use crate::processor_control::gdt::{USER_CS_RPL3, USER_DS_RPL3};
 
 /// Uniquely identifies a task within the scheduler's task table.
 ///
@@ -29,13 +32,13 @@ use crate::process_manager::thread::{Thread, ThreadState};
 /// which together allow O(1) lookup while guarding against stale references
 /// to recycled slots (ABA problem).
 ///
-/// A `TaskId` is considered valid iff:
-///   `tasks[slot_index].slot_generation == slot_generation`
-///   `tasks[slot_index].task.is_some()`
+/// A `TaskId` is considered valid if and only if:
+///   - `tasks[slot_index].slot_generation == slot_generation`
+///   - `tasks[slot_index].task.is_some()`
 ///
 /// If either condition is false, the slot has been recycled since this
-/// `TaskId` was issued, and the reference is stale. This plays a part in dis-
-/// regarding stale task IDs that are in the scheduler's Ready queue after
+/// `TaskId` was issued, and the reference is stale. This plays a part in
+/// disregarding stale task IDs that are in the scheduler's Ready queue after
 /// a task has been killed.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub struct TaskId {
@@ -92,16 +95,23 @@ impl TaskId {
 //   |  Ready  | ---------------------> | Running |
 //   |         | <--------------------- |         |
 //   +---------+   preempted / yields   +----|----+
-//        ^                                  | blocks on event
+//        ^                                  | blocks on event, timer, etc.
 //        |                                  v
 //        |    event arrives (wake)     +---------+
 //        ----------------------------- | Blocked |
-//                                      +----|----+
+//                                      +---------+
+//                                           |
 //                                           | (and eventually...)
-//                                           v
-//                                     +----------+
-//                                     |   Dead   |
-//                                     +----------+
+//                                           V
+//                                     +-----------+
+//                                     |   Dying   |
+//                                     +-----------+
+//                                           |
+//                                           |
+//                                           V
+//                                     +-----------+
+//                                     |    Dead   |
+//                                     +-----------+
 
 /// The lifecycle state of a task as tracked by the scheduler.
 #[allow(dead_code)]
@@ -123,9 +133,15 @@ pub enum TaskState {
 
     /// The task has finished executing (its entry function returned, or it
     /// explicitly terminated itself) or faulted. The `Task` struct (and its
-    /// stack allocation) remains alive until the scheduler performs a
-    /// "tombstone cleanup" on the next scheduling pass, at which point the
-    /// `Task` is dropped and the stack is freed.
+    /// stack allocation) remains alive until the task reaper runs and marks
+    /// it as [`TaskState::Dead`] on the next timer tick.
+    Dying,
+
+    /// The reaper has marked the task as dead, and the scheduler will perform
+    /// tombstone cleanup on the next scheduling pass, at which point the
+    /// `Task` is dropped and the stack is freed. During the tombstone cleanup,
+    /// the task's parent thread will also be marked as [`ThreadState::Dead`],
+    /// just before the task is dropped.
     Dead,
 }
 
@@ -140,12 +156,12 @@ pub enum TaskState {
 pub const TASK_STACK_SIZE: usize = 16 * 1024;  // 16 KB
 
 // =============================================================================
-// Initial stack frame layout
+// Kernel initial stack frame layout
 // =============================================================================
 //
 // The context switcher saves and restores a task's register state by pushing
 // and popping a fixed set of callee-saved GPRs onto/from the task's own stack.
-// When we create a new task, we have to manually write this exact frame
+// When we create a new kernel task, we have to manually write this exact frame
 // structure onto the new stack, so that the switcher can resume the new task
 // identically to how it would resume any already-running task, without any
 // special first-time-resume path.
@@ -186,13 +202,13 @@ pub const TASK_STACK_SIZE: usize = 16 * 1024;  // 16 KB
 // not be preserved across `switch_to`. R12 and R13 are callee-saved, appear on
 // the frame, and are correctly restored before `task_entry_stub` runs.
 
-/// The software context frame written at the top of a new task's stack.
+/// The software context frame written at the top of a new kernel task's stack.
 ///
 /// `repr(C, packed)` ensures the fields are laid out in declaration order with
 /// no padding, matching the exact byte sequence that `switch_to` pops via
 /// `pop r15; pop r14; pop r13; pop r12; pop rbx; pop rbp; ret`.
 #[repr(C, packed)]
-struct InitialFrame {
+struct KernelInitialFrame {
     /// Popped first into R15. Zero - no meaningful initial value for R15.
     r15: u64,
 
@@ -219,14 +235,15 @@ struct InitialFrame {
     rip: u64,
 }
 
-/// Naked trampoline that every new task executes first when it is scheduled
-/// for the very first time.
+/// Naked trampoline that every new kernel task executes first when it is
+/// scheduled for the very first time.
 ///
-/// This trampoline exists because, after `switch_to` pops the `InitialFrame`
-/// and executes `ret`, RSP and all callee-saved registers are in the state we
-/// wrote into the frame. But, the actual task entry function expects its
-/// argument in RDI (per the System V ABI), not in R13. This stub bridges that
-/// gap: it moves R13 into RDI and then calls the entry function through R12.
+/// This trampoline exists because, after `switch_to` pops the
+/// `KernelInitialFrame` and executes `ret`, RSP and all callee-saved registers
+/// are in the state we wrote into the frame. But, the actual task entry
+/// function expects its argument in RDI (per the System V ABI), not in R13.
+/// This stub bridges that gap: it moves R13 into RDI and then calls the entry
+/// function through R12.
 ///
 /// Upon entry to this stub, R12 contains the entry function pointer
 /// (`fn(u64)`), R13 has the `u64` argument, and all other caller-saved
@@ -240,7 +257,7 @@ struct InitialFrame {
 /// # Safety
 /// 
 /// This function must never be called directly; it is only ever jumped to by
-/// `switch_to` via the `rip` field of an `InitialFrame`. The register
+/// `switch_to` via the `rip` field of an `KernelInitialFrame`. The register
 /// preconditions described above must hold.
 #[unsafe(naked)]
 unsafe extern "C" fn task_entry_stub() {
@@ -274,15 +291,111 @@ unsafe extern "C" fn task_entry_stub() {
     );
 }
 
-/// A kernel task (kernel-mode cooperative/preemptive execution unit).
+// =============================================================================
+// User initial stack frame layout
+// =============================================================================
+// 
+// When a kernel thread starts, `switch_to` lands on a `KernelInitialFrame` and
+// `rets` into `kernel_task_entry_stub`, which calls the entry function
+// directly. User threads can't work that way, as we can't just call into ring
+// 3. The only architectural mechanism to enter ring 3 is `iretq`, which
+// atomically restores `RIP`, `CS`, `RFLAGS`, `RSP`, and `SS` from a frame on
+// the kernel stack and transitions privilege.
+// 
+// So, the initial kernel stack for a user thread needs to look like this when
+// it's first scheduled:
+// 
+// high address ->  +-----------------+
+//                  | SS              |  <- USER_DS | 3
+//                  | RSP (user)      |  <- top of user stack
+//                  | RFLAGS          |  <- IF=1, IOPL=0, reserved bits correct
+//                  | CS              |  <- USER_CS | 3
+//                  | RIP             |  <- user entry point
+//                  |-----------------|  <- iretq reads from here upward
+//                  | r15             |
+//                  | r14             |
+//                  | r13             |
+//                  | r12             |
+//                  | rbx             |
+//                  | rbp             |  <- saved_rsp points here
+// low address  ->  +-----------------+     (bottom of KernelInitialFrame)
+
+/// The RFLAGS value we hand to a fresh user thread via iretq.
+///
+/// Bit 9 (IF)       = 1: interrupts enabled in user mode from the start.
+/// Bit 1 (reserved) = 1: always must be set per the x86-64 spec.
+/// All other bits clear: no trap flag, IOPL=0 (no direct I/O port access),
+/// no direction flag, no alignment check.
+const USER_RFLAGS: u64 = (1 << 9) | (1 << 1);
+
+/// Initial stack layout for a new user thread.
+///
+/// `switch_to` pops the callee-saved registers (bottom six fields) and
+/// `ret`s into `user_task_entry_stub`. The stub executes `iretq`, which
+/// consumes the top five fields and transitions to ring 3 at `rip` with
+/// `rsp` pointing to the user stack.
+///
+/// Field order is from low address (bottom of struct) to high address (top),
+/// matching the push/pop order on the stack.
+#[repr(C, packed)]
+struct UserInitialFrame {
+    // Callee-saved registers, popped by `switch_to`; this is the same layout
+    // as in `KernelInitialFrame`.
+    r15: u64,
+    r14: u64,
+    r13: u64,
+    r12: u64,
+    rbx: u64,
+    rbp: u64,
+
+    // ret target: lands here after `switch_to` pops registers
+    rip: u64,  // address of `user_task_entry_stub`
+
+    // These are consumed by `iretq` inside `user_task_entry_stub`
+    iretq_rip:    u64,  // user entry point virtual address
+    iretq_cs:     u64,  // USER_CS | 3
+    iretq_rflags: u64,  // IF=1, reserved bit=1
+    iretq_rsp:    u64,  // top of user stack (virtual address)
+    iretq_ss:     u64,  // USER_DS | 3
+}
+
+/// Naked entry trampoline for new user-mode tasks.
+///
+/// This runs in ring 0 on the task's kernel stack immediately after the
+/// first `switch_to` lands on it. Its only job is to execute `iretq`, which
+/// atomically:
+///   - Loads RIP from the kernel stack  -> user entry point
+///   - Loads CS  from the kernel stack  -> USER_CS | RPL3 (ring 3)
+///   - Loads RFLAGS                     -> IF=1
+///   - Loads RSP from the kernel stack  -> user stack top
+///   - Loads SS  from the kernel stack  -> USER_DS | RPL3 (ring 3)
+///   - Transitions the CPU to ring 3
+///
+/// After `iretq` the kernel stack is idle, and it will be reused the next time
+/// this thread is interrupted or makes a syscall (the CPU pushes a new `iretq`
+/// frame onto it at that point, and `TSS.rsp[0]` ensures it finds this stack).
+#[unsafe(naked)]
+unsafe extern "C" fn user_task_entry_stub() {
+    core::arch::naked_asm!(
+        // At this point, we are in ring 0, on the task's kernel stack.
+        // The UserInitialFrame's `iretq` fields (rip, cs, rflags, rsp, and ss)
+        // are sitting at [rsp+0..rsp+39] exactly as `iretq` expects them.
+        // We now re-enable interrupts and transfer the execution to ring 3.
+        "sti",
+        "iretq",
+    );
+}
+
+/// A task is the underlying execution unit of process threads.
 ///
 /// Each `Task` owns its execution stack for its entire lifetime. The stack
 /// is heap-allocated, so the kernel heap must be initialized before any task
 /// is created.
 ///
-/// Tasks are created via `Task::new` and managed by the scheduler in
-/// `scheduler.rs`. The scheduler holds `Task` values behind an `IrqSpinLock`
-/// so that task state is consistent even when modified from interrupt context.
+/// Tasks are created via [`Task::new_kernel`] or [`Task::new_user`] and managed
+/// by the scheduler in `scheduler.rs`. The scheduler holds `Task` values behind
+/// an `IrqSpinLock`, so that task state is consistent even when modified from
+/// interrupt context.
 ///
 /// When a `Task` is dropped (e.g., after tombstone cleanup), `Box<[u8]>` drops
 /// its allocation, freeing the stack back to the kernel heap. The scheduler
@@ -290,10 +403,9 @@ unsafe extern "C" fn task_entry_stub() {
 pub struct Task {
     /// The unique identifier for this task within the scheduler's task table.
     ///
-    /// It gets nitialized to [`TaskId::PENDING`] by [`Task::new`] at
-    /// construction time, since the slot index is not yet known. The real
-    /// `TaskId` is assigned by `insert_and_queue_task` once the task has been
-    /// placed into a slot:
+    /// It gets initialized to [`TaskId::PENDING`] at construction time, since
+    /// the slot index is not yet known. The real `TaskId` is assigned by
+    /// `insert_and_queue_task` once the task has been placed into a slot.
     ///
     /// After insertion, `id` is stable and never changes for the lifetime of
     /// the task. On removal, the slot's generation is incremented, rendering
@@ -317,14 +429,14 @@ pub struct Task {
     /// voluntarily yields, and read back when the task is next resumed.
     ///
     /// The value is a byte offset into `_stack` (specifically, it points at
-    /// the bottom of an `InitialFrame` or a live `switch_to` frame inside
-    /// the stack allocation). It is stored as `u64` rather than `*mut u64` for
-    /// these reasons:
+    /// the bottom of a `KernelInitialFrame`, a `UserInitialFrame`, or a live
+    /// `switch_to` frame inside the stack allocation). It is stored as `u64`
+    /// rather than `*mut u64` for these reasons:
     ///   - `u64` is `Send`; raw pointers are not. This allows `Task` to
-    ///      implement `Send` with a single `unsafe impl` rather than requiring
-    ///      a wrapper type.
+    ///     implement `Send` with a single `unsafe impl` rather than requiring
+    ///     a wrapper type.
     ///   - The pointer arithmetic is done entirely inside `unsafe` assembly in
-    ///      the switcher, so there is no benefit to maintaining the Rust type.
+    ///     the switcher, so there is no benefit to maintaining the Rust type.
     ///
     /// Invariant: between scheduler invocations (i.e., when no `switch_to`
     /// is in progress), `saved_rsp` always points to a valid frame inside
@@ -333,15 +445,31 @@ pub struct Task {
     /// switch-away and will be overwritten by the next `switch_to`).
     pub saved_rsp: u64,
 
-    /// The number of system clock ticks remaining in the quantum of this task.
-    /// 
-    /// This starts out at max quantum ticks and gets decremented every clock
-    /// tick. When it reaches 1 (not 0, because that check happens at the end
-    /// of the task's tick period), the task is scheduled for preemption.
-    /// 
-    /// TODO: migrate this to Process Control structure when per-CPU storage is
-    /// implemented. On SMP, this should live on the running core, not the task,
-    /// to avoid needing the scheduler lock in the timer ISR hot path.
+    /// The fixed top of the kernel stack allocated for this task, used to
+    /// populate TSS.rsp[0], so the CPU has somewhere to land on ring 3 -> ring
+    /// 0 transitions. Every task, including user tasks, has one of these,
+    /// because even user tasks need a kernel stack to handle their interrupts
+    /// and syscalls.
+    pub kernel_stack_top: u64,
+
+    /// Used to signal the scheduler and context switcher whether `TSS.rsp[0]`
+    /// needs to be updated on context switch. If this is true, `TSS.rsp[0]` is
+    /// updated on switch; otherwise (i.e., it's a kernel task), the update is
+    /// skipped on switch.
+    pub is_user_task: bool,
+    
+    /// The read-only PML4 address value cached from the parent process's
+    /// address space. It is used for fast checking whether `TSS.rsp[0]` needs
+    /// to be updated when the scheduler's
+    /// [`crate::task_scheduler::scheduler::schedule`] routine calls
+    /// [`crate::task_scheduler::switcher::switch_to`]. Having this value cached
+    /// here saves critical time during context switches.
+    pub cr3: u64,
+
+    /// The number of ticks remaining in this task's quantum, stored here as the
+    /// value to load into the per-CPU `CPU_TICKS_REMAINING` slot when this task
+    /// is next scheduled in. The live countdown during execution lives in
+    /// `globals::CPU_TICKS_REMAINING`, not here.
     pub ticks_remaining: u32,
 
     /// The total number of system clock ticks this task has consumed; used for
@@ -405,14 +533,21 @@ impl Task {
         // value at that moment, making the idle task resumable. The state is
         // initialized to `Running` because this task is the currently
         // executing context at the time `new_idle` is called.
+        //
+        // `kernel_stack_top` is set to 0, as the idle task never runs in ring
+        // 3; so, TSS.rsp[0] is always overwritten before any user task runs.
+        // Thus, initializing it to 0 here is safe.
         Task {
-            id:              TaskId::IDLE,
-            state:           TaskState::Running,
-            saved_rsp:       0,
-            ticks_remaining: crate::globals::TASK_QUANTUM_TICKS,
-            ticks_executed:  AtomicU64::new(0),
+            id:               TaskId::IDLE,
+            state:            TaskState::Running,
+            saved_rsp:        0,
+            kernel_stack_top: 0,
+            is_user_task:     false,
+            cr3:              0,
+            ticks_remaining:  crate::globals::TASK_QUANTUM_TICKS,
+            ticks_executed:   AtomicU64::new(0),
             thread,
-            _stack:          stack,
+            _stack:           stack,
         }
     }
 
@@ -420,8 +555,8 @@ impl Task {
     /// scheduled; the task is immediately associated with its parent `Thread`.
     ///
     /// Allocates a `TASK_STACK_SIZE`-byte stack from the kernel heap, writes
-    /// an `InitialFrame` at the top of the stack, and sets `saved_rsp` to point
-    /// at the bottom of that frame so the switcher can resume the task
+    /// an `KernelInitialFrame` at the top of the stack, and sets `saved_rsp` to
+    /// point at the bottom of that frame so the switcher can resume the task
     /// correctly. The new task starts in `TaskState::Ready` and will not run
     /// until the scheduler places it on the run queue and eventually calls
     /// `switch_to`.
@@ -439,7 +574,7 @@ impl Task {
     /// Panics if the kernel heap cannot satisfy the stack allocation. This may
     /// happen if `TASK_STACK_SIZE` bytes are unavailable, and the heap cannot
     /// grow.
-    pub fn new(
+    pub fn new_kernel(
         entry: fn(u64),
         arg: u64,
         thread: Weak<IrqSpinLock<Thread>>,
@@ -457,17 +592,22 @@ impl Task {
             v.into_boxed_slice()
         };
 
-        // Compute the frame pointer. We place the `InitialFrame` just below
-        // the top of the stack, aligned to 16 bytes, so that after `switch_to`
-        // pops the frame and executes `ret`, RSP lands on a 16-byte aligned
-        // address as required by the ABI. The `& !0xF` mask clears the low 4
-        // bits, rounding down to 16 bytes.
-        //let stack_top = stack.as_mut_ptr() as usize + TASK_STACK_SIZE;
+        // Compute the frame pointer. We place the `KernelInitialFrame` just
+        // below the top of the stack, aligned to 16 bytes, so that after
+        // `switch_to` pops the frame and executes `ret`, RSP lands on a 16-byte
+        // aligned address as required by the ABI. The `& !0xF` mask clears the
+        // low 4 bits, rounding down to 16 bytes.
+        //
+        // `stack_top` is the highest usable address in this task's kernel
+        // stack, aligned to 16 bytes. This is what `TSS.rsp[0]` must point to,
+        // so that the CPU lands on a valid stack when entering the kernel from
+        // ring 3.
         let stack_top = (stack.as_mut_ptr() as usize + TASK_STACK_SIZE) & !0xF;
-        let frame_ptr = ((stack_top - core::mem::size_of::<InitialFrame>())
-            & !0xF) as *mut InitialFrame;
+        let frame_ptr = (
+            (stack_top - core::mem::size_of::<KernelInitialFrame>()) & !0xF)
+            as *mut KernelInitialFrame;
 
-        // Write the `InitialFrame`.
+        // Write the `KernelInitialFrame`.
         // For R15, R14, RBX: no meaningful initial value; zero is conventional.
         // R13 is the task argument; `task_entry_stub` moves this into RDI.
         // R12 is the entry function pointer; `task_entry_stub` calls this.
@@ -478,12 +618,12 @@ impl Task {
         //   - `frame_ptr` was computed from `stack.as_mut_ptr()`, an address
         //     within the live `stack` allocation.
         //   - The subtraction and alignment ensure `frame_ptr` is at least
-        //     `size_of::<InitialFrame>()` bytes below `stack_top`, so the
+        //     `size_of::<KernelInitialFrame>()` bytes below `stack_top`, so the
         //     entire write falls within the allocation bounds.
         //   - `stack` is zero-initialized, so there are no pre-existing invalid
         //     values at `frame_ptr` that we would be reading through later.
         unsafe {
-            frame_ptr.write(InitialFrame {
+            frame_ptr.write(KernelInitialFrame {
                 r15: 0,
                 r14: 0,
                 r13: arg,
@@ -503,10 +643,92 @@ impl Task {
             id: TaskId::PENDING, // Gets replaced with proper ID after insertion
             state: TaskState::Ready,
             saved_rsp,
+            kernel_stack_top: stack_top as u64,
+            is_user_task: false,
+            cr3: 0,  // Kernel task, so no CR3 switch needed
             ticks_remaining: crate::globals::TASK_QUANTUM_TICKS,
             ticks_executed: AtomicU64::new(0),
             thread,
             _stack: stack,
+        }
+    }
+
+    /// Creates a new user-mode task.
+    ///
+    /// Allocates a kernel stack for interrupt/syscall handling and sets up a
+    /// [`UserInitialFrame`], so that the first `switch_to` lands in
+    /// [`user_task_entry_stub`], which `iretq`s into ring 3 at `user_entry`.
+    /// A user stack is already allocated and provided inside `address_space`.
+    ///
+    /// # Arguments
+    ///
+    /// * `user_entry`    - Virtual address of the user-mode entry point. This
+    ///                     is a raw address in the process's virtual address
+    ///                     space, not a Rust function pointer.
+    /// * `address_space` - The process's address space, where the user stack
+    ///                     is mapped.
+    /// * `pml4_phys`     - Physical address of the process's PML4, cached into
+    ///                     the task for use by `switch_to`.
+    /// * `thread`        - `Weak` reference to the owning thread.
+    pub fn new_user(
+        user_entry: u64,
+        address_space: &AddressSpace,
+        pml4_phys: u64,
+        thread: Weak<IrqSpinLock<Thread>>,
+    ) -> Self {
+        // Allocate the kernel stack. This stack is used whenever the CPU
+        // enters ring 0 on behalf of this thread (interrupts, syscalls, etc).
+        // TSS.rsp[0] is updated to kernel_stack_top on every switch to
+        // this task so the CPU always finds a valid kernel stack.
+        let mut kernel_stack: Box<[u8]> = {
+            let mut stack_vector = Vec::with_capacity(TASK_STACK_SIZE);
+            stack_vector.resize(TASK_STACK_SIZE, 0u8);
+            stack_vector.into_boxed_slice()
+        };
+        let kernel_stack_top =
+            (kernel_stack.as_mut_ptr() as usize + TASK_STACK_SIZE) & !0xF;
+
+        // Build the UserInitialFrame at the top of the kernel stack.
+        // The frame must be 16-byte aligned per the ABI.
+        let frame_ptr = ((kernel_stack_top
+            - core::mem::size_of::<UserInitialFrame>()) & !0xF)
+            as *mut UserInitialFrame;
+
+        // Write the `UserInitialFrame`
+        unsafe {
+            frame_ptr.write(UserInitialFrame {
+                // Callee-saved registers are all zero for a fresh task
+                r15: 0,
+                r14: 0,
+                r13: 0,
+                r12: 0,
+                rbx: 0,
+                rbp: 0,
+
+                // `switch_to` will `ret` to `user_task_entry_stub`, which
+                // executes `iretq` using the fields below.
+                rip: user_task_entry_stub as *const () as u64,
+
+                // iretq frame, consumed atomically by `iretq` in the stub.
+                iretq_rip:    user_entry,
+                iretq_cs:     USER_CS_RPL3,
+                iretq_rflags: USER_RFLAGS,
+                iretq_rsp:    address_space.user_stack_top,  // user stack start
+                iretq_ss:     USER_DS_RPL3,
+            });
+        }
+
+        Task {
+            id:               TaskId::PENDING,
+            state:            TaskState::Ready,
+            saved_rsp:        frame_ptr as u64,
+            kernel_stack_top: kernel_stack_top as u64,
+            is_user_task:     true,
+            cr3:              pml4_phys,
+            ticks_remaining:  crate::globals::TASK_QUANTUM_TICKS,
+            ticks_executed:   AtomicU64::new(0),
+            thread,
+            _stack:           kernel_stack,
         }
     }
 }
@@ -514,39 +736,51 @@ impl Task {
 /// Handles a task's normal return and exit.
 /// 
 /// This gets called automatically by `task_entry_stub` when a task's entry
-/// function returns normally. It marks the current task as `Dead`, marks its
+/// function returns normally. It marks the current task as `Dying`, marks its
 /// parent `Thread` as `Dying`, and immediately yields to the scheduler. The
-/// actual stack and task table cleanup (tombstone cleanup) is deferred to the
-/// `dead_task_reaper` `SystemTask`, which runs at the next timer tick. This
-/// function never returns.
+/// actual stack and task table cleanup (tombstone cleanup) are deferred by two
+/// timer ticks. This function never returns.
 pub fn task_exit() -> ! {
-    // Mark this task as `Dead`. We do this in a block, so the scheduler lock
+    // Disable interrupts for the entire exit sequence to close the race
+    // window between marking this task Dying and calling schedule(). If a
+    // timer fires between those two points, schedule() will see a Dying task
+    // as current and produce a null old_rsp_ptr, corrupting the switch.
+    // schedule() will re-enable interrupts after the switch via
+    // restore_interrupts(), so we don't need to restore them here.
+    unsafe { core::arch::asm!("cli", options(nomem, nostack)) };
+
+    // Mark this task as `Dying`. We do this in a block, so the scheduler lock
     // is dropped before we call `schedule()` (which will acquire it again
     // internally), and we must not hold it across that call.
     {
-        let mut scheduler = super::scheduler::SCHEDULER.lock();
-        let this_id = scheduler.current;
+        // TODO: Remove the commented lines after testing
+        //let mut scheduler = super::scheduler::SCHEDULER.lock();
+        //let this_id = scheduler.current;
+        let this_id = super::scheduler::get_current_task_id();
+        let mut scheduler = super::scheduler::GLOBAL_SCHEDULER.lock();
+        
         if let Some(task) = scheduler.get_task_mut(this_id) {
-            task.state = TaskState::Dead;
+            task.state = TaskState::Dying;
 
             // We also mark the task's parent thread as dying
             task.thread.upgrade().unwrap().lock().state = ThreadState::Dying;
+
+            // Queue task reaper to mark the task as dead on the next tick
+            if queue_task_reaper(this_id).is_err() {
+                crate::hardware_manager::sprint(
+                    "\n[REAPER] Failed to queue task reaper...\n");
+            }
         }
         // The lock is dropped here
     }
 
-    // Enqueue the `dead_task_reaper` `SystemTask`, so tombstone cleanup runs
-    // on the next timer tick. The reaper will find this task's slot marked
-    // `Dead` and free it.
-    crate::helper_functions::queue_dead_task_reaper_no_dupe();
-
-    // With the status set to `Dead`, we now hand off to the next ready task.
-    // This task will never be rescheduled, because `Dead` tasks are not
+    // With the status set to `Dying`, we now hand off to the next ready task.
+    // This task will never be rescheduled, because `Dying` tasks are not
     // re-queued. The reaper will free this task's stack at the next timer tick,
     // by which point we are no longer running on it.
     unsafe { super::scheduler::schedule() };
 
     // Truly unreachable, as `schedule()` switches the stack away and never
-    // returns to a `Dead` task. If we somehow land here, fault loudly.
-    unreachable!("task_exit: schedule() returned to a dead task");
+    // returns to a `Dying` task. If we somehow land here, fault loudly.
+    unreachable!("task_exit: schedule() returned to a dying/dead task");
 }

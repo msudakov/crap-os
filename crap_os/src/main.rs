@@ -6,14 +6,14 @@
 mod globals;
 mod spinlock;
 mod macros;
+mod processor_control;
 mod helper_functions;
 mod hardware_manager;
 mod memory_manager;
 mod system_core;
 mod task_scheduler;
 mod process_manager;
-pub mod gdt;
-pub mod idt;
+mod crypto;
 mod tests;
 
 use hardware_manager::FramebufferInfo;
@@ -97,8 +97,9 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // Parse ACPI info to find APIC addresses. This must be done before Memory
     // Manager init sequence.
     let rsdp_virt = memory_map.rsdp_addr + globals::KERNEL_PHYSICAL_MAP_BASE;
-    let apic_info = unsafe {
-        hardware_manager::parse_acpi(rsdp_virt).expect("ACPI/MADT not found")
+    let (apic_info, cpu_topology) = unsafe {
+        hardware_manager::parse_acpi(rsdp_virt, memory_map.bsp_apic_id).expect(
+            "ACPI/MADT not found")
     };
     let hpet_info = unsafe {
         hardware_manager::parse_hpet(rsdp_virt).expect(
@@ -164,11 +165,43 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // We can now use serial port IRQ-safe global spinlock macros
     sprint_debug!(DebugLevel::INFO, "[INFO] Serial initialized successfully");
 
+
+
+    // CPU parsing test
+    {
+        sprintln!("[INFO] CPU topology from ACPI MADT:");
+        sprintln!("[INFO]   BSP APIC ID (bootloader CPUID): {}", cpu_topology.bsp_apic_id);
+        sprintln!("[INFO]   Total CPUs in MADT: {}", cpu_topology.cpu_count);
+        sprintln!("[INFO]   Usable CPUs (enabled or online-capable): {}", cpu_topology.get_usable_cpu_count());
+ 
+        for cpu in cpu_topology.iter() {
+            sprintln!("[INFO]   CPU | APIC ID: {:#04x} | ACPI UID: {:#04x} | Enabled: {} | Online-capable: {} | BSP: {}",
+                cpu.apic_id,
+                cpu.acpi_uid,
+                cpu.enabled,
+                cpu.online_capable,
+                cpu.apic_id == cpu_topology.bsp_apic_id,
+            );
+        }
+        if cpu_topology.bsp().is_none() {
+            panic!("BSP APIC ID {:#x} not found in MADT — firmware bug or struct layout mismatch", cpu_topology.bsp_apic_id);
+        }
+    }
+
+    // Initialize CPU topology
+    processor_control::init_cpu_topology(cpu_topology);
+
+
+
     // Initialie kernel heap and pre-map 16 pages (64 KB)
     globals::KERNEL_HEAP.heap.lock().init(16);
 
-    unsafe { crate::gdt::init_gdt(); }  // Initialize Global Descriptor Table
-    unsafe { crate::idt::init_idt(); }  // Initialize Interrupt Descriptor Table
+    // Initialize Global Descriptor Table
+    unsafe { processor_control::gdt::init_gdt(); }
+
+    // Initialize Interrupt Descriptor Table
+    unsafe { crate::processor_control::init_idt(); }
+    unsafe { crate::processor_control::load_idt(); }
 
     // Initialize framebuffer writer for global macros
     {
@@ -212,6 +245,11 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // Configure the APIC timer (currently 1ms tick rate)
         unsafe { hardware_manager::configure_timer(apic_ticks_per_ms) };
         sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Timer interrupt initialized");
+
+        // Initialize cryptographically-secure random number generator
+        unsafe { crypto::init_cpu(&hpet.as_ref().unwrap()); }
+        // To initialize RNG on an AP as part of bring up:
+        // unsafe { crypto::init_cpu(&HPET); } // Use global HpetInfo
     }
 
     // Unmask the keyboard IRQ in the I/O APIC
@@ -265,8 +303,9 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     sprintln!("[+] All MM heap allocator tests passed!\n");
     fbprintln!("[+] All MM heap allocator tests passed!\n");*/
 
+
     // Create and initialize the System process
-    let system_process = globals::PROCESS_MANAGER.create_process(
+    let system_process = globals::PROCESS_MANAGER.create_kernel_process(
         "System",
         cr3,
         nop_thread_stub,
@@ -274,7 +313,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     ).expect("[FATAL ERROR] Failed to create System process");
 
     // Spawn keyboard buffer reader thread in the System process
-    system_process.spawn_thread("Keyboard reader", task_keyboard, 0).expect(
+    system_process.spawn_kernel_thread("Keyboard reader", task_keyboard, 0).expect(
         "Failed to spawn keyboard thread");
     
     // Testing keyboard interrupts
@@ -282,23 +321,69 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     fbprintln!("[*] Testing keyboard interrupts. Type some stuff...");
 
     // Create Test process
-    let test_process_1 = globals::PROCESS_MANAGER.create_process(
+    let test_process_1 = globals::PROCESS_MANAGER.create_kernel_process(
         "Test Proc 1",
         cr3,
         task_a,
         0
     ).expect("Failed to create test process");
-    test_process_1.spawn_thread("P1 T2", task_b, 0).expect("failed to spawn task B");
+    test_process_1.spawn_kernel_thread("P1 T2", task_b, 0).expect("failed to spawn task B");
     
-    let test_process_2 = globals::PROCESS_MANAGER.create_process(
-        "Test Proc 2",
-        cr3,
-        task_c,
-        0
-    ).expect("Failed to create test process");
-    test_process_2.spawn_thread("Fault task", task_fault, 0).expect("failed to spawn Fault Task");
-    let thread_c = test_process_2.spawn_thread("Task C", task_c, 0).expect("failed to spawn task C");
+    //let test_process_2 = globals::PROCESS_MANAGER.create_kernel_process(
+    //    "Test Proc 2",
+    //    cr3,
+    //    task_c,
+    //    0
+    //).expect("Failed to create test process");
+    test_process_1.spawn_kernel_thread("Fault task", task_fault, 0).expect("failed to spawn Fault Task");
+    let thread_c = test_process_1.spawn_kernel_thread("Task C", task_c, 0).expect("failed to spawn task C");
     crate::process_manager::thread::exit_thread(thread_c);
+
+    // Testing user-mode processes. This is very clunky and is only here for
+    // testing purposes...
+    // This opcode sequence is: push rax; pop rax; jmp -4
+    // It exercises the user stack without doing anything privileged
+    const USER_PAYLOAD: &[u8] = &[0x50, 0x58, 0xEB, 0xFC];
+    const USER_CODE_VIRT: u64 = 0x0000_0000_0040_0000;
+    // Allocate and populate the code page
+    let code_phys = {
+        let mut mm_guard = globals::MEMORY_MANAGER.lock();
+        let mm = mm_guard.as_mut().unwrap();
+        let phys = mm.alloc_page()
+            .expect("[FATAL] OOM allocating user code page");
+        let virt = phys + globals::KERNEL_PHYSICAL_MAP_BASE;
+        unsafe {
+            core::ptr::copy_nonoverlapping(
+                USER_PAYLOAD.as_ptr(),
+                virt as *mut u8,
+                USER_PAYLOAD.len(),
+            );
+        }
+        phys
+    };
+    // Create the process - AddressSpace::init runs here, PML4 is fresh
+    let user_process = globals::PROCESS_MANAGER.create_user_process(
+        "User Test",
+        cr3,
+        USER_CODE_VIRT,
+    ).expect("Could not create user process");
+    // Map the code page into the process's address space now that
+    // we have the PML4. This must happen before interrupts are enabled so the
+    // thread cannot be scheduled before the mapping is in place.
+    {
+        let mut mm_guard = globals::MEMORY_MANAGER.lock();
+        let mm = mm_guard.as_mut().unwrap();
+        unsafe {
+            mm.map_page(
+                user_process.pml4_phys(),
+                USER_CODE_VIRT,
+                code_phys,
+                crate::memory_manager::PRESENT | crate::memory_manager::USER,
+            );
+        }
+    }
+    
+
 
 
     // Signal the Task Scheduler that the kernel has completed its
@@ -312,7 +397,8 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // re-enable maskable hardware interrupts.
     unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
 
-    globals::PROCESS_MANAGER.print_processes();
+
+    //globals::PROCESS_MANAGER.print_processes();
 
     // Enter halt loop on the idle task
     let mut count = 0;
@@ -406,24 +492,28 @@ fn task_keyboard(_arg: u64) {
     }
 }
 
-
+#[allow(dead_code)]
 fn task_a(_arg: u64) {
     loop {
-        crate::hardware_manager::sprint("\n* HELLO from Process 1 Thread 1");
-        fbprint!("\n* HELLO from Process 1 Thread 1");
-        sleep(2);
+        //crate::hardware_manager::sprint("\n* HELLO from Process 1 Thread 1");
+        //fbprint!("\n* HELLO from Process 1 Thread 1");
+        crate::hardware_manager::sprint("A");
+        sleep(1);
     }
 }
 
+#[allow(dead_code)]
 fn task_b(_arg: u64) {
-    loop {
-    //for _ in 0..10 {
-        crate::hardware_manager::sprint("\n# HOWDY from Process 1 Thread 2");
-        fbprint!("\n# HOWDY from Process 1 Thread 2");
-        sleep(2);
+    //loop {
+    for _ in 0..3 {
+        crate::hardware_manager::sprint("Hello, world");
+        //crate::hardware_manager::sprint("\n# HOWDY from Process 1 Thread 2");
+        //fbprint!("\n# HOWDY from Process 1 Thread 2");
+        sleep(1);
     }
 }
 
+#[allow(dead_code)]
 fn task_fault(_arg: u64) {
     for _ in 0..1_000_000 {
         unsafe { core::arch::asm!("nop"); }
@@ -440,10 +530,12 @@ fn task_fault(_arg: u64) {
     }
 }
 
+#[allow(dead_code)]
 fn task_c(_arg: u64) {
     loop {
-        crate::hardware_manager::sprint("\n% HOLA from Process 2 Thread 1");
-        fbprint!("\n% HOLA from Process 2 Thread 1");
-        sleep(2);
+        //crate::hardware_manager::sprint("\n% HOLA from Process 2 Thread 1");
+        //fbprint!("\n% HOLA from Process 2 Thread 1");
+        crate::hardware_manager::sprint(".");
+        sleep(1);
     }
 }

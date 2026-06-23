@@ -29,7 +29,7 @@
 //!   - `Active`  :  Alive and schedulable; Ready/Running in `TaskState`
 //!   - `Waiting` :  Voluntarily blocked, awaiting a call to [`wake`]
 //!   - `Dying`   :  Exit is initiated (async), and the reaper is queued
-//!   - `Dead`    :  The reaper has completed, and it is safe to drop
+//!   - `Dead`    :  Reaper and cleanup have completed, and it is safe to drop
 //!
 //! The scheduler owns `TaskState`; the process manager owns `ThreadState`.
 //! They are kept in sync at transition points by the scheduler, reaper,
@@ -103,14 +103,14 @@ pub enum ThreadState {
     /// waiting to be explicitly woken via `wake`.
     Waiting,
 
-    /// The thread has begun exiting. Its task has been marked as
-    /// `TaskState::Dead`, and the reaper has been queued, but cleanup is not
-    /// yet complete.
+    /// The thread has begun exiting. Its task has also been marked as
+    /// `TaskState::Dying`, and the reaper has been queued. But cleanup is not
+    /// yet complete, and it is not safe to drop the thread yet.
     Dying,
 
-    /// The reaper has finished cleanup. The thread is safe to drop.
-    /// At this point [`Thread::task_id`] has been set to `None` by the
-    /// scheduler.
+    /// The reaper has run, and tombstone cleanup has finished. At this point,
+    /// [`Thread::task_id`] has been set to `None` by the scheduler, and the
+    /// thread is safe to drop. 
     Dead,
 }
 
@@ -235,11 +235,10 @@ impl Thread {
         thread
     }
 
-    /// Initiates exit of this thread by queueing two `SystemTask`s in order:
-    /// 1. `task_killer` to mark the backing task as `TaskState::Dead`
-    ///    and signal a forced reschedule if it is currently running;
-    /// 2. `dead_task_reaper` to run tombstone cleanup to free the slot
-    ///
+    /// Initiates exit of this thread by queueing the `task_killer` `SystemTask`
+    ///  to mark the backing task as `TaskState::Dying` and signal a forced
+    /// reschedule if it is currently running.
+    /// 
     /// If thread is already [`ThreadState::Dying`] or [`ThreadState::Dead`],
     /// this is a no-op to prevent double-exit. Can be called by the [`Thread`]
     /// itself or externally via [`exit_thread`].
@@ -255,21 +254,14 @@ impl Thread {
             self.task_id.unwrap());
 
         // Queue the task killer `SystemTask` to prepare the thread's task for
-        // termination and drop.
+        // termination and drop. Reaper and tombstone cleanup will be called by
+        // this `SystemTask`.
         crate::system_core::queue_system_task(
             crate::system_core::system_tasks::task_killer, task_id_u64);
-
-        // Here we always want to enqueue a reaper run even if one is already in
-        // the queue in front of us. This is because here we want the reaper
-        // to run again behind us, after the call to kill a task. So, we use
-        // the regular queue function instead of the helper
-        // `queue_dead_task_reaper_no_dupe`.
-        crate::system_core::queue_system_task(
-            crate::system_core::system_tasks::dead_task_reaper, 0);
     }
 }
 
-/// Locks the given thread and initiates its exit sequence.
+/// Initiates a thread's exit sequence.
 ///
 /// This is the public entry point for exiting a thread from outside the
 /// thread itself. It acquires the [`IrqSpinLock`] and delegates to

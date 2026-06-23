@@ -1,7 +1,7 @@
 use crate::globals;
 //use crate::sprintln;
 //use crate::fbprintln;
-use crate::memory_manager::{PRESENT, WRITABLE};
+use crate::memory_manager::{KERNEL_PML4, PRESENT, WRITABLE};
 
 macro_rules! mm {
     () => {
@@ -22,9 +22,9 @@ pub fn test_memory_manager() {
         // get_physical_addr resolves it correctly.
         // =====================================================================
         let phys1 = mm!().alloc_page().expect("Test 1: alloc failed");
-        mm!().map_page(virt1, phys1, PRESENT | WRITABLE);
+        mm!().map_page(KERNEL_PML4, virt1, phys1, PRESENT | WRITABLE);
 
-        match mm!().get_physical_addr(virt1) {
+        match mm!().get_physical_addr(KERNEL_PML4, virt1) {
             Some(resolved) => assert!(resolved == phys1,
                 "Test 1 FAILED: expected {:#x}, got {:#x}", phys1, resolved),
             None => panic!("Test 1 FAILED: address not mapped"),
@@ -37,9 +37,9 @@ pub fn test_memory_manager() {
         // Verifies that after unmapping, the virtual address resolves to None,
         // and that the freed physical page can be re-allocated.
         // =====================================================================
-        mm!().unmap_and_free_page(virt1);
+        mm!().unmap_and_free_page(KERNEL_PML4, virt1);
 
-        assert!(mm!().get_physical_addr(virt1).is_none(),
+        assert!(mm!().get_physical_addr(KERNEL_PML4, virt1).is_none(),
             "Test 2 FAILED: address should be unmapped after unmap_and_free_page");
 
         // The freed page should be at the top of the free list and come back on
@@ -59,10 +59,10 @@ pub fn test_memory_manager() {
         // should not be back in the free list yet.
         // =====================================================================
         let phys3 = mm!().alloc_page().expect("Test 3: alloc failed");
-        mm!().map_page(virt2, phys3, PRESENT | WRITABLE);
-        mm!().unmap_page(virt2);
+        mm!().map_page(KERNEL_PML4, virt2, phys3, PRESENT | WRITABLE);
+        mm!().unmap_page(KERNEL_PML4, virt2);
 
-        assert!(mm!().get_physical_addr(virt2).is_none(),
+        assert!(mm!().get_physical_addr(KERNEL_PML4, virt2).is_none(),
             "Test 3 FAILED: address should be unmapped");
 
         // Allocate a fresh page - it should not be phys3, since we never freed it
@@ -77,7 +77,7 @@ pub fn test_memory_manager() {
         // =====================================================================
         // Test 4: Unmapping an already-unmapped address returns false
         // =====================================================================
-        let result = mm!().unmap_page(virt3);
+        let result = mm!().unmap_page(KERNEL_PML4, virt3);
         assert!(!result, "Test 4 FAILED: expected false for unmapped address");
         //sprintln!("Test 4 passed: unmap_page returns false for unmapped address");
         //fbprintln!("Test 4 passed: unmap_page returns false for unmapped address");
@@ -89,13 +89,13 @@ pub fn test_memory_manager() {
         // =====================================================================
         let free_before = mm!().free_page_count();
         let phys5 = mm!().alloc_page().expect("Test 5: alloc failed");
-        mm!().map_page(virt4, phys5, PRESENT | WRITABLE);
+        mm!().map_page(KERNEL_PML4, virt4, phys5, PRESENT | WRITABLE);
 
         // Mapping consumed: 1 data page + 1 PT + 1 PD + 1 PDPT = 4 pages
         assert!(mm!().free_page_count() == free_before - 4,
             "Test 5 FAILED: expected 4 pages consumed after map");
 
-        mm!().unmap_and_free_page(virt4);
+        mm!().unmap_and_free_page(KERNEL_PML4, virt4);
 
         // All 4 should be back
         assert!(mm!().free_page_count() == free_before,

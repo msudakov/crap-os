@@ -9,9 +9,8 @@ use crate::spinlock::StaticIrqSpinLock;
 use crate::hardware_manager::{SerialWriter, FramebufferWriter};
 use crate::memory_manager::{MemoryManager, LockedHeap};
 use crate::process_manager::{ProcessManager};
-use crate::gdt::{Gdt, GdtEntry, Tss, IstStack, DOUBLE_FAULT_IST_SIZE};
-use crate::idt::{Idt, IdtEntry};
 use crate::hardware_manager::hpet::HpetInfo;
+use crate::processor_control::per_cpu::PerCpu;
 
 // =============================================================================
 // Basic Globals
@@ -25,6 +24,10 @@ pub const DEBUG_LEVEL: DebugLevel = DebugLevel::INFO;
 
 /// Upper hexadecimal character set.
 pub const HEX_CHARS_UPPER: &[u8; 16] = b"0123456789ABCDEF";
+
+/// Standard Base64 alphabet.
+pub const BASE64_CHARS: &[u8; 64] =
+    b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 // Base addresses for the higher-half kernel mappings
 pub const KERNEL_PHYSICAL_MAP_BASE: u64        = 0xFFFF800000000000;
@@ -70,56 +73,9 @@ pub static KERNEL_HEAP: LockedHeap = LockedHeap::new(
 /// Global Process Manager singleton.
 pub static PROCESS_MANAGER: ProcessManager = ProcessManager::new();
 
-/// The kernel's single TSS instance.
-///
-/// Declared `static mut` for the same reasons as `DOUBLE_FAULT_STACK`:
-/// the CPU holds a direct virtual-address pointer to this struct (via the
-/// TSS base address encoded in the GDT descriptor), so it must have a
-/// stable, permanent address. It is written once in `init_gdt()`, then
-/// only ever accessed by the CPU hardware on exception entry. This does not
-/// need to be in a spinlock.
-pub static mut TSS: Tss = Tss::new();
-
-/// The double-fault IST stack storage.
-///
-/// Declared as `static mut`, so that its address is known at link time, is
-/// stable for the lifetime of the kernel, and is accessible without going
-/// through an allocator. The address of the top of this stack (base + size) is
-/// written into `TSS.ist[0]` during `init_gdt()`. This does not need to be in
-/// a spinlock.
-pub static mut DOUBLE_FAULT_STACK: IstStack = IstStack(
-    [0u8; DOUBLE_FAULT_IST_SIZE]
-);
-
-/// The global GDT instance.
-///
-/// Slots [3] and [4] are initialized to null here and patched with the real
-/// TSS descriptor in `init_gdt()` at runtime because
-/// they encode the virtual address of the `TSS` static, which is not a `const`
-/// expression in Rust. Therefore, the entire GDT must be a `static mut`. This
-/// does not need to be in a spinlock.
-pub static mut GDT: Gdt = Gdt {
-    entries: [
-        GdtEntry::NULL,           // 0x00 - null (required)
-        GdtEntry::KERNEL_CODE64,  // 0x08 - kernel code
-        GdtEntry::KERNEL_DATA64,  // 0x10 - kernel data
-        GdtEntry::NULL,           // 0x18 - TSS low  (patched at runtime)
-        GdtEntry::NULL,           // 0x20 - TSS high (patched at runtime)
-    ],
-};
-
-/// The global IDT instance.
-/// 
-/// `static mut` is safe here for the same reason as the GDT: the IDT is written
-/// once during single-threaded init (before interrupts are enabled) and is
-/// read-only after that from Rust's perspective. The CPU reads it on every
-/// exception/interrupt, but never writes to it. So, this does not need to be
-/// in a spinlock.
-pub static mut IDT: Idt = Idt {
-    entries: [IdtEntry::missing(); 256],
-};
-
-/// Global monotonic tick counter, incremented by the APIC timer IRQ handler.
+/// Global monotonic tick counter, incremented by the BSP's timer ISR on every
+/// tick. Used as a wall-clock reference for sleep and timeout calculations. On
+/// SMP, this remains BSP-only.
 ///
 /// `AtomicU64` makes the counter safe to read from any context (interrupt
 /// handlers, kernel threads) without a lock. `Relaxed` ordering is acceptable
@@ -140,15 +96,16 @@ pub static HPET: StaticIrqSpinLock<Option<HpetInfo>> =
 /// ready to be executed in the Task Scheduler's queue.
 pub static SYS_FLAG_KERNEL_INIT_COMPLETE: AtomicBool = AtomicBool::new(false);
 
-/// Atomic boolean flag to track if the dead task reaper `SystemTask` (and its
-/// tombstone cleanup routine) has been added to the system task queue. Since
-/// that SystemTask can be enqueued from several locations, this flag helps
-/// avoid double-queueing that would otherwise waste the CPU time in the middle
-/// of the timer tick processing and task scheduling.
-pub static SYS_FLAG_TASK_REAPER_QUEUED: AtomicBool = AtomicBool::new(false);
+/// Atomic boolean flag used to signal the timer ISR on a given CPU to disregard
+/// the result of task quantum check and force the scheduler to run regardless.
+/// This is set by SystemTask routines tied to task and process management
+/// (e.g., when a task is being killed).
+pub static CPU_FORCE_RESCHEDULE: PerCpu<AtomicBool> = PerCpu::new();
 
-/// Atomic boolean flag used to signal the timer ISR to disregard the result of
-/// task quantum check and force the scheduler to run regardless. This is set
-/// by `SystemTask` routines tied to task and process management; e.g., when a
-/// task is being killed.
-pub static SYS_FLAG_FORCE_RESCHEDULE: AtomicBool = AtomicBool::new(false);
+/// Per-CPU quantum countdown. Holds the number of timer ticks remaining in
+/// the current task's time slice on each CPU. Decremented by the timer ISR
+/// directly, with no scheduler lock needed.
+///
+/// Initialized for the BSP during scheduler init. Each AP initializes its
+/// own slot during AP bring-up.
+pub static CPU_TICKS_REMAINING: PerCpu<u32> = PerCpu::new();

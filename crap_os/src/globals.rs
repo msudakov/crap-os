@@ -6,7 +6,7 @@
 use core::sync::atomic::{AtomicU64, AtomicBool};
 use crate::{DebugLevel};
 use crate::spinlock::StaticIrqSpinLock;
-use crate::hardware_manager::{SerialWriter, FramebufferWriter};
+use crate::hardware_manager::{SerialWriter, FramebufferWriter, WallClock};
 use crate::memory_manager::{MemoryManager, LockedHeap};
 use crate::process_manager::{ProcessManager};
 use crate::hardware_manager::hpet::HpetInfo;
@@ -75,7 +75,8 @@ pub static PROCESS_MANAGER: ProcessManager = ProcessManager::new();
 
 /// Global monotonic tick counter, incremented by the BSP's timer ISR on every
 /// tick. Used as a wall-clock reference for sleep and timeout calculations. On
-/// SMP, this remains BSP-only.
+/// SMP, this remains BSP-only. Use [`WALL_CLOCK`] instead for all real-time
+/// clock references.
 ///
 /// `AtomicU64` makes the counter safe to read from any context (interrupt
 /// handlers, kernel threads) without a lock. `Relaxed` ordering is acceptable
@@ -86,6 +87,13 @@ pub static TIMER_TICKS: AtomicU64 = AtomicU64::new(0);
 /// Global High Precision Event Timer (HPET) information structure, used in
 /// calibrating the system clock timer.
 pub static HPET: StaticIrqSpinLock<Option<HpetInfo>> =
+    StaticIrqSpinLock::new(None);
+
+/// Global wall-clock anchor, derived once at boot from the CMOS RTC and
+/// paired with an HPET counter snapshot. `WallClock::now()` uses this to
+/// compute the current Unix epoch time without re-reading the (slow,
+/// whole-second-resolution) RTC hardware.
+pub static WALL_CLOCK: StaticIrqSpinLock<Option<WallClock>> =
     StaticIrqSpinLock::new(None);
 
 /// Atomic boolean flag to track if the kernel's initialization sequence has

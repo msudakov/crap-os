@@ -21,7 +21,7 @@ pub struct SerialWriter {
 /// 
 /// Executes inline assembly.
 #[inline(always)]
-fn inb(port: u16) -> u8 {
+pub(super) fn inb(port: u16) -> u8 {
     let value: u8;
     unsafe {
         core::arch::asm!(
@@ -45,7 +45,7 @@ fn inb(port: u16) -> u8 {
 /// 
 /// Executes inline assembly.
 #[inline(always)]
-fn outb(port: u16, value: u8) {
+pub(super) fn outb(port: u16, value: u8) {
     unsafe {
         core::arch::asm!(
             "out dx, al",

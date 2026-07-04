@@ -235,6 +235,20 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         let mut hpet = globals::HPET.lock();
         *hpet = Some(hpet_info);
 
+        // Anchor wall-clock time from the CMOS RTC, paired with an HPET
+        // counter snapshot. This must happen while `rsdp_virt` is still valid
+        // and after the HPET main counter is confirmed running (which is
+        // guaranteed since `parse_hpet()`` already succeeded above).
+        let wall_clock = unsafe {
+            hardware_manager::read_rtc_epoch_anchor(
+                rsdp_virt, hpet.as_ref().unwrap())
+        };
+        {
+            let mut wc = globals::WALL_CLOCK.lock();
+            *wc = Some(wall_clock);
+        }
+        sprint_debug!(DebugLevel::INFO, "[INFO] Wall clock anchored from RTC");
+
         // Calculate the number of APIC timer ticks per millisecond
         let apic_ticks_per_ms = unsafe {
             hardware_manager::calibrate_timer(hpet.as_ref().unwrap())
@@ -302,6 +316,15 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     tests::memory::test_heap_allocator();
     sprintln!("[+] All MM heap allocator tests passed!\n");
     fbprintln!("[+] All MM heap allocator tests passed!\n");*/
+
+    // Testing RTC and the wall clock
+    let epoch_timestamp = unsafe {
+        let hpet = globals::HPET.lock();
+        let wc = globals::WALL_CLOCK.lock();
+        wc.as_ref().unwrap().now(hpet.as_ref().unwrap())
+    };
+    fbprintln!("[+] Real time clock initialized: {}", epoch_timestamp);
+    sprintln!("[+] Real time clock initialized: {}", epoch_timestamp);
 
 
     // Create and initialize the System process

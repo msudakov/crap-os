@@ -249,6 +249,16 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         }
         sprint_debug!(DebugLevel::INFO, "[INFO] Wall clock anchored from RTC");
 
+        // All ACPI-table consumers (MADT/APIC parsing, HPET table parsing, and
+        // the RTC's FADT century lookup) have now finished. Reclaim the
+        // EfiACPIReclaimMemory pages back to the PMM.
+        {
+            let mut mm_guard = globals::MEMORY_MANAGER.lock();
+            let mm = mm_guard.as_mut().unwrap();
+            mm.reclaim_acpi_memory(&memory_map);
+        }
+        sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Reclaimed ACPI table memory");
+
         // Calculate the number of APIC timer ticks per millisecond
         let apic_ticks_per_ms = unsafe {
             hardware_manager::calibrate_timer(hpet.as_ref().unwrap())

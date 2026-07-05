@@ -110,7 +110,7 @@ unsafe fn get_or_create_table(
 /// be a real, PMM-owned physical page address. Caller must ensure the virtual
 /// address is not already mapped to a different frame unless intentionally
 /// remapping.
-pub unsafe fn map_page(
+pub(super) unsafe fn map_page(
     pmm: &mut PhysicalMemoryManager,
     pml4_addr: *mut u64,
     virtual_addr: u64,
@@ -163,7 +163,7 @@ pub unsafe fn map_page(
 /// Dereferences raw pointers derived from the page-table walk.
 /// `pml4_addr` must point to a valid, mapped PML4 table. The page table
 /// hierarchy it points to must not be concurrently modified.
-pub unsafe fn get_physical_addr(pml4_addr: *mut u64, virtual_addr: u64
+pub(super) unsafe fn get_physical_addr(pml4_addr: *mut u64, virtual_addr: u64
 ) -> Option<u64> {
     let pml4_index = (virtual_addr >> 39) & 0x1FF;
     let pdpt_index = (virtual_addr >> 30) & 0x1FF;
@@ -256,7 +256,7 @@ unsafe fn is_table_empty(table: *mut u64) -> bool {
 /// # Safety
 ///
 /// Dereferences raw pointers derived from the page-table walk.
-pub fn unmap_page(pmm: &mut PhysicalMemoryManager, pml4_addr: *mut u64,
+pub(super) fn unmap_page(pmm: &mut PhysicalMemoryManager, pml4_addr: *mut u64,
     virtual_addr: u64
 ) -> bool {
     let pml4_index = (virtual_addr >> 39) & 0x1FF;
@@ -525,7 +525,7 @@ pub fn init_page_tables(pmm: &mut PhysicalMemoryManager,
 /// * `pmm` - The physical memory manager, used to allocate page-table pages.
 /// * `pml4` - Raw pointer to the root of the current active page table (PML4).
 /// * `memory_map` - The UEFI memory map describing all physical memory regions.
-pub fn build_direct_map(pmm: &mut PhysicalMemoryManager, pml4: *mut u64,
+pub(super) fn build_direct_map(pmm: &mut PhysicalMemoryManager, pml4: *mut u64,
     memory_map: &MemoryMapInfo
 ) {
     // The virtual base at which physical address 0 will appear.
@@ -617,7 +617,7 @@ pub fn build_direct_map(pmm: &mut PhysicalMemoryManager, pml4: *mut u64,
 /// * `pmm` - Physical memory manager (for allocating page-table pages).
 /// * `pml4` - Root of the active page table.
 /// * `framebuffer_info` - UEFI-provided information about the framebuffer.
-pub fn map_framebuffer_higher_half(
+pub(super) fn map_framebuffer_higher_half(
     pmm: &mut PhysicalMemoryManager,
     pml4: *mut u64,
     framebuffer_info: &crate::FramebufferInfo,
@@ -665,7 +665,7 @@ pub fn map_framebuffer_higher_half(
 /// # Safety
 /// 
 /// Uses inline assembly to store and reload GDTR and IDTR.
-pub fn reload_gdt_and_idt() {
+pub(super) fn reload_gdt_and_idt() {
     // Buffers to hold the 10-byte (2 bytes limit + 8 bytes base) GDTR and IDTR
     // pseudo-descriptor structures.
     let mut gdt_desc = [0u8; 10];
@@ -734,7 +734,7 @@ pub fn reload_gdt_and_idt() {
 /// # Safety
 /// 
 /// Uses `write_volatile` to prevent the compiler from optimising these away.
-pub fn remove_identity_maps(pml4_phys: u64) {
+pub(super) fn remove_identity_maps(pml4_phys: u64) {
     // Convert the physical PML4 address to a virtual address through the
     // direct physical map that we just built.
     let pml4_virt = (pml4_phys + KERNEL_PHYSICAL_MAP_BASE) as *mut u64;
@@ -791,7 +791,7 @@ pub fn remove_identity_maps(pml4_phys: u64) {
 /// themselves, which could be catastrophic. By keeping it a separate
 /// function call, the stack frame is set up and torn down cleanly.
 #[inline(never)]
-pub fn reclaim_boot_memory(pmm: &mut PhysicalMemoryManager,
+pub(super) fn reclaim_boot_memory(pmm: &mut PhysicalMemoryManager,
     memory_map: &MemoryMapInfo
 ) {
     // Obtain the virtual address of the first descriptor
@@ -848,6 +848,72 @@ pub fn reclaim_boot_memory(pmm: &mut PhysicalMemoryManager,
             }
 
             // All safety checks passed; return this page to the free list
+            pmm.free_page(page_start);
+        }
+    }
+}
+
+/// Frees `EfiACPIReclaimMemory` pages back to the physical memory manager.
+///
+/// These pages hold the RSDP-reachable ACPI tables (XSDT/RSDT, MADT, FADT,
+/// HPET table, etc.) walked during `parse_acpi()`, `parse_hpet()`, and
+/// `read_rtc_epoch_anchor()`. All useful information from those tables has
+/// already been copied into owned kernel structures (`ApicInfo`,
+/// `CpuTopology`, `HpetInfo`, `WallClock`) by the time this runs, so the
+/// underlying physical pages are safe to reclaim as general-purpose RAM.
+///
+/// This intentionally does not remove the pages' direct-map mappings. The
+/// direct map built by `build_direct_map()` is this kernel's permanent,
+/// universal access path for all physical RAM, not a temporary or
+/// special-purpose alias; every free page the PMM manages is expected to
+/// remain reachable at `KERNEL_PHYSICAL_MAP_BASE + phys` indefinitely (see
+/// `PhysicalMemoryManager::alloc_page`/`free_page`, which assume this
+/// unconditionally). This matches `reclaim_boot_memory()`'s handling of its
+/// own reclaimed region types.
+///
+/// # Arguments
+///
+/// * `pmm`        - The physical memory manager to free pages back into.
+/// * `memory_map` - The UEFI memory map (accessed through the direct map
+///   using its virtual address).
+///
+/// # Safety
+///
+/// Must only be called after every ACPI-table consumer (`parse_acpi`,
+/// `parse_hpet`, `read_rtc_epoch_anchor`, and anything else that reads
+/// RSDP-reachable tables) has completed and copied out everything it needs.
+/// Calling this earlier frees memory still being read, causing use-after-free
+/// the next time that physical page is allocated.
+#[inline(never)]
+pub(super) fn reclaim_acpi_memory(
+    pmm: &mut PhysicalMemoryManager,
+    memory_map: &MemoryMapInfo,
+) {
+    let mut descriptor_addr = memory_map.memory_map_addr
+        + KERNEL_PHYSICAL_MAP_BASE;
+    let num_segments = memory_map.memory_map_size / memory_map.descriptor_size;
+
+    for _ in 0..num_segments {
+        let desc = EfiMemoryDescriptor::new(descriptor_addr);
+        descriptor_addr += memory_map.descriptor_size;
+
+        if !matches!(desc.region_type, EfiMemoryType::EfiACPIReclaimMemory) {
+            continue;
+        }
+
+        for i in 0..desc.num_pages {
+            let page_start = desc.physical_start + i * PAGE_SIZE;
+            if page_start == 0 {
+                continue;  // Skip the null/zero page
+            }
+
+            // The direct-map mapping for this page was already established
+            // by build_direct_map() and must remain in place permanently,
+            // exactly like every other page of usable RAM — the direct map
+            // is this kernel's sole general-purpose physical-access window,
+            // not a temporary alias to be torn down. Simply returning the
+            // frame to the free list is correct and matches
+            // reclaim_boot_memory()'s handling of its own reclaimed types.
             pmm.free_page(page_start);
         }
     }

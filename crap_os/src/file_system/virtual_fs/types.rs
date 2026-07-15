@@ -30,6 +30,8 @@
 //!   - [`OpenFileKey`]        : Composite key used to look up a file's master
 //!                              record in the VFS open-file table.
 
+#![allow(dead_code)]
+
 /// Canonical error type for all VFS and filesystem driver operations.
 ///
 /// Every fallible function in the VFS layer returns `Result<T,

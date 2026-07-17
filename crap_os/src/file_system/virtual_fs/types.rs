@@ -242,9 +242,9 @@ impl AccessMode {
 /// The VFS supports two states:
 ///
 /// * [`FileLockState::Unlocked`]: writes from any write-capable handle are
-///     permitted  without coordination.
+///     permitted without coordination.
 /// * [`FileLockState::WriteExclusive`]: one handle holds the lock; all other
-///     write attempts on this file are rejected until the lock is released of
+///     write attempts on this file are rejected until the lock is released or
 ///     the holding handle is closed.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileLockState {

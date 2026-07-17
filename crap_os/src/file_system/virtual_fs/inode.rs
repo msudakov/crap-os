@@ -82,7 +82,7 @@ pub struct Inode {
     ///
     /// For regular files, this is the file's current byte length. For symlinks,
     /// this is the byte length of the target path string. For directories, this
-    /// field is filesystem-defined and callers should not rely on it for
+    /// field is filesystem-defined, and callers should not rely on it for
     /// anything other than passing it through to a stat snapshot.
     pub size: u64,
 

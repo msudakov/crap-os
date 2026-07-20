@@ -1,4 +1,4 @@
-//! # Virtual File System - Filesystem Driver Traits
+//! Virtual File System - Filesystem Driver Traits
 //!
 //! This module defines the two traits that every filesystem driver must
 //! implement to plug into the VFS:

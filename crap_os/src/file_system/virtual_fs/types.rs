@@ -32,6 +32,8 @@
 
 #![allow(dead_code)]
 
+use crate::kernel_hashmap::KernelHash;
+
 /// Canonical error type for all VFS and filesystem driver operations.
 ///
 /// Every fallible function in the VFS layer returns `Result<T,
@@ -448,5 +450,32 @@ impl OpenFileKey {
     /// Returns a new `OpenFileKey` combining both identifiers.
     pub fn new(filesystem_id: u64, inode_number: u64) -> Self {
         Self { filesystem_id, inode_number }
+    }
+}
+
+/// Implements [`crate::kernel_hashmap::KernelHash`] for [`OpenFileKey`] so
+/// that it can be used as a key in [`crate::kernel_hashmap::KernelHashMap`].
+impl KernelHash for OpenFileKey {
+    /// Computes the hash by running FNV-1a over `filesystem_id` first (via its
+    /// own [`crate::kernel_hashmap::KernelHash`] impl), then continuing the
+    /// FNV-1a state over the bytes of `inode_number`. Chaining the two fields
+    /// through a single FNV-1a pass (rather than XOR-ing two independent hashes
+    /// together) ensures that field order contributes to the result, so
+    /// `(a, b)` and `(b, a)` produce different hash values and the risk of
+    /// systematic collisions between transposed key pairs is avoided.
+    /// 
+    /// # Returns
+    ///
+    /// Returns the computed hash as [`u64`].
+    fn kernel_hash(&self) -> u64 {
+        const FNV_PRIME: u64 = 0x00000100000001b3;
+        let mut hash = self.filesystem_id.kernel_hash();
+
+        for &byte in &self.inode_number.to_ne_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(FNV_PRIME);
+        }
+
+        hash
     }
 }

@@ -36,6 +36,8 @@
 //! allocation. The VFS never reasons about block boundaries or block size
 //! except to query `block_size()` once at mount time for cache manager use.
 
+#![allow(dead_code)]
+
 use alloc::sync::Arc;
 use alloc::vec::Vec;
 use alloc::string::String;

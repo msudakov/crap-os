@@ -15,6 +15,8 @@ mod task_scheduler;
 mod process_manager;
 mod crypto;
 mod tests;
+mod kernel_hashmap;
+mod file_system;
 
 use hardware_manager::FramebufferInfo;
 use memory_manager::{MemoryManager, GlobalHeapAllocator};

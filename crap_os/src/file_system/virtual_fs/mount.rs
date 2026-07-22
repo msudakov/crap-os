@@ -33,6 +33,8 @@
 //! directory is a mounted root (and, if so, what its host directory is) in O(1)
 //! without scanning the entire mount table.
 
+#![allow(dead_code)]
+
 use alloc::sync::Arc;
 use super::directory::Directory;
 use super::driver::FileSystemInstance;

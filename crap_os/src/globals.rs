@@ -11,6 +11,7 @@ use crate::memory_manager::{MemoryManager, LockedHeap};
 use crate::process_manager::{ProcessManager};
 use crate::hardware_manager::hpet::HpetInfo;
 use crate::processor_control::per_cpu::PerCpu;
+use crate::file_system::virtual_fs::vfs::VirtualFileSystem;
 
 // =============================================================================
 // Basic Globals
@@ -117,3 +118,13 @@ pub static CPU_FORCE_RESCHEDULE: PerCpu<AtomicBool> = PerCpu::new();
 /// Initialized for the BSP during scheduler init. Each AP initializes its
 /// own slot during AP bring-up.
 pub static CPU_TICKS_REMAINING: PerCpu<u32> = PerCpu::new();
+
+/// The kernel's virtual file system instance.
+///
+/// Initialized during kernel boot after the first filesystem driver is
+/// registered and the boot volume is mounted. All kernel code that performs
+/// filesystem operations (path resolution, file I/O, directory mutation,
+/// volume mounting) does so by locking this global and calling through the
+/// [`crate::file_system::virtual_fs::vfs::VirtualFileSystem`] API.
+pub static VIRTUAL_FILE_SYSTEM: StaticIrqSpinLock<Option<VirtualFileSystem>> = 
+    StaticIrqSpinLock::new(None);

@@ -349,6 +349,10 @@ impl<T> IrqSpinLock<T> {
     /// Disables hardware interrupts, then acquires the inner spinlock,
     /// spinning until it is available.
     /// 
+    /// # Arguments
+    ///
+    /// None.
+    ///
     /// # Returns
     /// 
     /// Returns an IrqSpinLockGuard that, when dropped, releases the
@@ -366,7 +370,7 @@ impl<T> IrqSpinLock<T> {
         // lock between the above two steps because we disabled interrupts
         // first.
         IrqSpinLockGuard {
-            guard: self.0.lock(),
+            guard: Some(self.0.lock()),
             flags,  // Save the old flags here so we can restore them on drop
         }
     }
@@ -378,6 +382,10 @@ impl<T> IrqSpinLock<T> {
     /// `None` so callers are not left in an interrupt-disabled state
     /// unexpectedly.
     /// 
+    /// # Arguments
+    ///
+    /// None.
+    ///
     /// # Returns
     ///
     /// Returns `Some(guard)` if successful, or `None` if the lock was already
@@ -389,7 +397,10 @@ impl<T> IrqSpinLock<T> {
         let flags = crate::helper_functions::disable_interrupts_save();
         
         match self.0.try_lock() {
-            Ok(guard) => Some(IrqSpinLockGuard { guard, flags }),
+            Ok(guard) => Some(IrqSpinLockGuard {
+                guard: Some(guard),
+                flags,
+            }),
             Err(_) => {
                 // Lock is busy. Restore interrupt state before returning so
                 // the caller is not stuck with interrupts disabled.
@@ -413,54 +424,77 @@ impl<T> IrqSpinLock<T> {
 /// When dropped, it releases the SpinLock and restores the interrupt-enable
 /// state to whatever it was before `lock()` was called.
 pub struct IrqSpinLockGuard<'a, T> {
-    // The underlying SpinLock guard. Dropping this releases the AtomicBool.
-    guard: SpinLockGuard<'a, T>,
+    // `Some` while held. Drop takes the inner guard so Rust cannot release the
+    // SpinLock a second time after interrupt state has been restored.
+    guard: Option<SpinLockGuard<'a, T>>,
 
     // The saved x86 RFLAGS value captured immediately before interrupts were
     // disabled. Passed to `restore_interrupts()` on drop.
     flags: usize,
 }
 
-/// Transparent read access to the protected `T` through the guard.
+/// Provides transparent read access to the protected `T` through the guard.
 impl<T> Deref for IrqSpinLockGuard<'_, T> {
     type Target = T;
+
+    /// Borrows the protected value while the inner guard remains present.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Returns a shared reference to the protected value.
     fn deref(&self) -> &T {
-        // Delegates to SpinLockGuard's Deref, which performs the unsafe
-        // dereference.
-        &self.guard
+        self.guard
+            .as_deref()
+            .expect("IRQ spinlock guard was already released")
     }
 }
 
-/// Transparent write access to the protected `T` through the guard.
+/// Provides transparent write access to the protected `T` through the guard.
 impl<T> DerefMut for IrqSpinLockGuard<'_, T> {
+    /// Mutably borrows the protected value while the inner guard is held.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Returns an exclusive reference to the protected value.
     fn deref_mut(&mut self) -> &mut T {
-        // Delegates to SpinLockGuard's DerefMut.
-        &mut self.guard
+        self.guard
+            .as_deref_mut()
+            .expect("IRQ spinlock guard was already released")
     }
 }
 
-/// Releases the SpinLock and restores interrupt state when the guard is
-/// dropped.
+/// Releases the SpinLock before restoring the saved interrupt state.
 ///
-/// Drop order matters here: `self.guard` is dropped implicitly by Rust after
-/// this `drop` body runs (fields are dropped in declaration order), which
-/// stores `false` to `locked` with `Release` ordering. Then, we call
-/// `restore_interrupts` to re-enable interrupts if they were enabled before we
-/// took the lock.
+/// Rust drops struct fields after this method returns. Taking the inner guard
+/// leaves `None` in its place, so dropping it here releases the lock exactly
+/// once while interrupts remain disabled. Only then can interrupts be
+/// restored. Restoring them first could let an interrupt handler try to
+/// acquire the lock before it has been released.
 ///
-/// Interrupts are restored after the SpinLock is released (because the guard
-/// field is dropped first due to declaration order), which is the safe
-/// ordering. We don't want an interrupt to fire and try to acquire the same
-/// lock before we've actually released it.
 impl<T> Drop for IrqSpinLockGuard<'_, T> {
+    /// Takes and drops the inner guard, then restores interrupt state.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Returns no value.
     fn drop(&mut self) {
-        // Explicitly drop the spinlock guard before re-enabling interrupts.
-        // If we restore interrupts first, a timer IRQ can fire and attempt
-        // to acquire the same spinlock before we've fully released it, causing
-        // a deadlock on a single-core system.
-        unsafe { core::ptr::drop_in_place(&mut self.guard) };
+        // Take the guard to prevent Rust's later field drop from releasing
+        // this lock again, then release it before enabling interrupts.
+        drop(self.guard.take());
 
-        // With the guard dropped, it is now safe to restore interrupts
+        // With the lock released, it is now safe to restore interrupts.
         crate::helper_functions::restore_interrupts(self.flags);
     }
 }

@@ -18,12 +18,7 @@ mod tests;
 mod kernel_hashmap;
 mod file_system;
 
-
-
 use file_system::stub_fs::vfs_tests;
-
-
-
 
 use hardware_manager::FramebufferInfo;
 use memory_manager::{MemoryManager, GlobalHeapAllocator};
@@ -426,16 +421,8 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     }
 
 
-
-
-
     // Testing VFS via Stub-FS
     crate::vfs_tests::run_vfs_tests();
-
-
-
-    
-
 
 
     // Signal the Task Scheduler that the kernel has completed its

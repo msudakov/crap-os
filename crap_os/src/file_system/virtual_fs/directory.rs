@@ -3,7 +3,7 @@
 //! This module defines the [`Directory`] struct, which is the VFS-layer
 //! in-memory representation of a mounted directory. It wraps an [`Inode`] and
 //! adds the state that the VFS needs to traverse the directory tree: a lazily
-//! loaded child list, a weak reference to the parent directory, and an
+//! loaded child list, a reference to the parent directory, and an
 //! optional mount-root pointer for crossing mount boundaries.
 //!
 //! [`Directory`] is distinct from the [`Inode`] it wraps. The [`Inode`]
@@ -15,18 +15,18 @@
 //! A [`Directory`]'s `children` field starts as `None`. The first time the path
 //! resolver needs to descend into the directory, it calls
 //! [`Directory::ensure_children_loaded`], which dispatches to the filesystem
-//! driver to populate the child list. Subsequent traversals reuse the
-//! in-memory list without further driver calls. This is the primary lazy
-//! loading seam; the future cache manager will extend it with eviction
-//! support.
+//! driver to populate the child list. Traversals through that same wrapper
+//! reuse the list without further driver calls. The resolver can currently
+//! create separate wrappers for the same inode, so their child lists can
+//! disagree. A future canonical directory cache must address that issue.
 //!
 //! When a filesystem is mounted on a directory, the VFS sets `mount_flag` on
 //! the directory's [`Inode`] and populates `mount_root` on the [`Directory`]
 //! wrapper with an [`Arc<Directory>`] pointing to the root of the mounted
 //! filesystem. During downward path resolution, the resolver checks
-//! `mount_root` and crosses the boundary transparently. During upward
-//! resolution (`..`), the resolver detects that the current directory is a
-//! mounted root and crosses back to the host directory.
+//! `mount_flag` and obtains the mounted root from the mount table. During
+//! upward resolution (`..`), it detects the mounted root and crosses back
+//! to the host directory.
 
 #![allow(dead_code)]
 
@@ -36,31 +36,39 @@ use alloc::vec::Vec;
 use super::inode::{Inode, DirectoryEntry};
 use super::types::FileSystemError;
 
+/// Ownership of a directory wrapper's parent in the namespace.
+pub enum DirectoryParent {
+    /// Keeps an ordinary parent alive for `..` traversal.
+    Ordinary(Arc<Directory>),
+
+    /// Avoids a cycle between a mount host and its mounted root.
+    MountedRoot(Weak<Directory>),
+}
+
 /// The VFS-layer in-memory wrapper for a directory inode.
 ///
-/// A [`Directory`] is created by the VFS the first time a directory inode is
-/// resolved during path traversal, and it remains alive as long as any
-/// [`Arc<Directory>`] reference exists, held by a parent's child list, by the
-/// `VirtualFileSystem` root pointer, or by an active path resolution on the
-/// call stack.
+/// A [`Directory`] is created when the VFS resolves a directory inode during
+/// path traversal. More than one wrapper can currently represent the same
+/// inode. A wrapper remains alive as long as any
+/// [`Arc<Directory>`] reference exists, held by the `VirtualFileSystem` root
+/// pointer, a child wrapper, a working directory, or an active path resolution.
 ///
-/// The `children` field is the lazy-loaded list of this directory's immediate
-/// children. It is `None` until the first traversal demand, at which point the
-/// VFS populates it via the filesystem driver. This design keeps memory usage
-/// proportional to the portion of the directory tree that has actually been
-/// accessed, not the total size of the filesystem.
+/// The `children` field is this wrapper's lazy-loaded list of immediate
+/// children. It is `None` until the first traversal demand, at which point
+/// the VFS populates it via the filesystem driver. Other wrappers for the
+/// same inode may have different cached child lists until directory identity
+/// is made canonical.
 ///
-/// The `parent` field is a [`Weak<Directory>`] to avoid reference cycles. The
-/// global root directory has `parent` set to `None`; all other directories
-/// have a valid weak reference to their parent. Upgrading a `Weak` parent
-/// reference must always succeed while the directory is live, as a failure
-/// indicates a kernel invariant violation.
+/// Ordinary directories hold a strong reference to their parent so `..` can
+/// traverse from a retained wrapper after the path walk that created it ends.
+/// The global root has no parent. A mounted root holds a weak host reference
+/// because its host already holds the mounted root through `mount_root`.
 ///
 /// The `mount_root` field is `None` for ordinary directories. When a
 /// filesystem is mounted on this directory, the VFS sets it to
 /// `Some(Arc<Directory>)` pointing to the root of the mounted filesystem, and
-/// sets `mount_flag` on the underlying `Inode`. The path resolver uses this
-/// field to cross mount boundaries downward without a separate table lookup.
+/// sets `mount_flag` on the underlying `Inode`. The path resolver currently
+/// uses the mount table to cross downward after detecting `mount_flag`.
 pub struct Directory {
     /// The underlying inode for this directory.
     ///
@@ -74,23 +82,20 @@ pub struct Directory {
     ///
     /// `None` means the child list has not yet been loaded from disk. The
     /// first call to `ensure_children_loaded` dispatches to the filesystem
-    /// driver and populates this field. Once `Some`, the list is the
-    /// authoritative in-memory view of the directory's contents and is updated
-    /// directly when children are created or deleted through the VFS.
+    /// driver and populates this field. Once `Some`, the list is reused by
+    /// this wrapper and updated when operations act through this wrapper.
+    /// Other wrappers for the same inode can retain stale child lists.
     ///
     /// Each [`DirectoryEntry`] in the list starts with `inode` set to `None`
     /// and is promoted to `Some(Arc<Inode>)` lazily when the entry is
     /// individually resolved.
     pub children: Option<Vec<DirectoryEntry>>,
 
-    /// A weak reference to this directory's parent in the namespace.
+    /// The parent wrapper used for `..` traversal.
     ///
-    /// `None` only for the global root directory. For all other directories,
-    /// this must be a valid weak reference that can always be successfully
-    /// upgraded while the [`Directory`] is live. The path resolver upgrades
-    /// this reference when handling `..` components. Upgrade failure is
-    /// treated as an internal kernel error.
-    pub parent: Option<Weak<Directory>>,
+    /// `None` only for the global root. Ordinary children retain their parent;
+    /// mounted roots use a weak host reference to avoid a reference cycle.
+    pub parent: Option<DirectoryParent>,
 
     /// The root directory of a filesystem mounted on top of this directory,
     /// if any.
@@ -99,7 +104,7 @@ pub struct Directory {
     /// the VFS sets this to `Some(Arc<Directory>)` pointing to the mounted
     /// filesystem's root, and simultaneously sets `mount_flag` on `self.inode`
     /// as a fast-path signal. The path resolver checks `mount_flag` first; if
-    /// set, it follows `mount_root` to cross the boundary rather than
+    /// set, it retrieves the mounted root from the mount table rather than
     /// descending into this directory's own children.
     ///
     /// Set by `VirtualFileSystem::mount` and cleared by
@@ -117,6 +122,10 @@ impl Directory {
     /// # Arguments
     ///
     /// * `inode` - The directory inode this wrapper represents.
+    ///
+    /// # Returns
+    ///
+    /// Returns a root wrapper with no parent or loaded children.
     pub fn new_root(inode: Arc<Inode>) -> Self {
         Self {
             inode,
@@ -127,21 +136,48 @@ impl Directory {
     }
 
     /// Constructs a new [`Directory`] wrapper around the given inode with a
-    /// known parent and no children loaded.
+    /// strong parent reference and no children loaded.
     ///
     /// Used by the VFS when materializing a directory during path traversal
-    /// or lazy child loading.
+    /// or lazy child loading. Retaining the parent keeps `..` valid after the
+    /// path walk releases its own reference to that parent.
     ///
     /// # Arguments
     ///
     /// * `inode`  - The directory inode this wrapper represents.
-    /// * `parent` - A weak reference to this directory's parent in the
-    ///   namespace.
-    pub fn new(inode: Arc<Inode>, parent: Weak<Directory>) -> Self {
+    /// * `parent` - The ordinary parent directory in the namespace.
+    ///
+    /// # Returns
+    ///
+    /// Returns a wrapper that keeps its ordinary parent alive.
+    pub fn new(inode: Arc<Inode>, parent: Arc<Directory>) -> Self {
         Self {
             inode,
             children:   None,
-            parent:     Some(parent),
+            parent:     Some(DirectoryParent::Ordinary(parent)),
+            mount_root: None,
+        }
+    }
+
+    /// Constructs a mounted root whose host retains the mounted root.
+    ///
+    /// The host owns a strong `mount_root` reference, so the reverse parent
+    /// reference must be weak to avoid keeping both wrappers alive forever.
+    /// The mount table retains the host while the filesystem is mounted.
+    ///
+    /// # Arguments
+    ///
+    /// * `inode` - The root inode of the mounted filesystem.
+    /// * `host`  - The directory covered by the mount.
+    ///
+    /// # Returns
+    ///
+    /// Returns a mounted-root wrapper with a weak host reference.
+    pub fn new_mounted_root(inode: Arc<Inode>, host: &Arc<Directory>) -> Self {
+        Self {
+            inode,
+            children:   None,
+            parent:     Some(DirectoryParent::MountedRoot(Arc::downgrade(host))),
             mount_root: None,
         }
     }
@@ -299,22 +335,28 @@ impl Directory {
         self.inode.mount_flag
     }
 
-    /// Upgrades the weak parent reference and returns the parent directory.
+    /// Returns the parent directory, upgrading a mounted root's weak host.
     ///
     /// This method should only be called when the caller knows a parent
-    /// exists (i.e., `is_root()` is `false`). If the upgrade fails, it means
-    /// the parent [`Directory`] was dropped while this directory was still
-    /// live, which is a kernel invariant violation.
+    /// exists (i.e., `is_root()` is `false`). Ordinary parents remain alive
+    /// through their child's strong reference. A mounted root's host remains
+    /// alive through the mount table until unmount.
+    ///
+    /// # Arguments
+    ///
+    /// None.
     ///
     /// # Returns
     ///
-    /// Returns `Ok(Arc<Directory>)` if the parent reference could be upgraded,
-    /// or `Err(FileSystemError::InternalError)` if this directory has no
-    /// parent or the weak reference could not be upgraded.
+    /// Returns the parent, or `InternalError` if there is no parent or a
+    /// mounted root's weak host reference cannot be upgraded.
     pub fn parent(&self) -> Result<Arc<Directory>, FileSystemError> {
-        self.parent
-            .as_ref()
-            .and_then(|weak| weak.upgrade())
-            .ok_or(FileSystemError::InternalError)
+        match self.parent.as_ref() {
+            Some(DirectoryParent::Ordinary(parent)) => Ok(Arc::clone(parent)),
+            Some(DirectoryParent::MountedRoot(host)) => {
+                host.upgrade().ok_or(FileSystemError::InternalError)
+            }
+            None => Err(FileSystemError::InternalError),
+        }
     }
 }

@@ -113,17 +113,16 @@ pub enum FileSystemError {
     /// holds an exclusive write lock on the same file.
     FileLocked,
 
-    /// The supplied handle value did not correspond to any live entry in the
-    /// calling process's handle table.
+    /// A file handle was closed, was not registered with this VFS, or did not
+    /// belong to the expected open-file master record.
     InvalidHandle,
 
     /// The path string was empty, contained illegal characters, or exceeded
     /// the maximum supported length.
     InvalidPath,
 
-    /// An operation was attempted on an inode that has been marked for
-    /// deletion (all directory entries removed) and is awaiting final
-    /// reclamation once its last handle closes.
+    /// An operation was attempted on a file whose last directory entry was
+    /// removed and whose storage awaits reclamation after its last close.
     PendingDeletion,
 
     /// A mount point could not be established because the target directory
@@ -257,12 +256,12 @@ pub enum FileLockState {
     /// [`holder_handle`]. No other handle may write to this file until the lock
     /// is released.
     ///
-    /// The [`holder_handle`] field stores the process-local handle value (a
-    /// `u32`) of the handle that acquired the lock, allowing the VFS to
-    /// identify and validate lock-release requests.
+    /// The [`holder_handle`] field stores the VFS-wide identifier of the
+    /// handle that acquired the lock. Process-local handle values are not
+    /// unique across processes and cannot identify a lock holder here.
     WriteExclusive {
-        /// The process-local handle value of the lock holder.
-        holder_handle: u32,
+        /// The VFS-wide identifier of the lock holder.
+        holder_handle: u64,
     },
 }
 

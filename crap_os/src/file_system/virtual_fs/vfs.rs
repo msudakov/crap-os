@@ -97,6 +97,13 @@ pub struct VirtualFileSystem {
     /// when the last handle is closed.
     pub(super) open_files: KernelHashMap<OpenFileKey, Arc<File>>,
 
+    /// The next VFS-wide identifier for a newly opened file handle.
+    ///
+    /// Each successful open receives a distinct identifier, including opens
+    /// of the same inode by different processes. A failed overflow check
+    /// prevents identifiers from being reused.
+    pub(super) next_handle_id: u64,
+
     /// Monotonically incrementing counter for assigning unique IDs to mounted
     /// filesystem instances.
     ///
@@ -114,14 +121,17 @@ impl VirtualFileSystem {
     /// Called once during kernel boot after the boot filesystem driver has
     /// mounted the root volume and produced the root [`Directory`]. The
     /// driver registry, mount table, mounted-root index, and open-file table
-    /// all start empty. The `next_filesystem_id` counter starts at `1`
-    /// (reserving `0` as an invalid sentinel, consistent with the handle value
-    /// convention).
+    /// all start empty. Filesystem and handle identifiers start at `1`,
+    /// reserving `0` as an invalid sentinel.
     ///
     /// # Arguments
     ///
     /// * `root` - The root directory of the boot volume, representing `/` in
     ///   the unified namespace.
+    ///
+    /// # Returns
+    ///
+    /// Returns a VFS with empty tables and fresh filesystem and handle IDs.
     pub fn new(root: Arc<Directory>) -> Self {
         Self {
             root,
@@ -129,6 +139,7 @@ impl VirtualFileSystem {
             mounts:              KernelHashMap::new(),
             mounted_root_index:  KernelHashMap::new(),
             open_files:          KernelHashMap::new(),
+            next_handle_id:      1,
             next_filesystem_id:  1,
         }
     }
@@ -234,11 +245,11 @@ impl VirtualFileSystem {
             return Err(FileSystemError::NotADirectory);
         }
 
-        // Wrap the root inode in a Directory, with the host directory as
-        // its parent so that .. at the mounted root crosses back up correctly.
-        let mounted_root = Arc::new(Directory::new(
+        // The host owns the mounted root through mount_root. Keep the reverse
+        // parent reference weak to avoid a reference cycle across the mount.
+        let mounted_root = Arc::new(Directory::new_mounted_root(
             root_inode,
-            Arc::downgrade(&host_dir),
+            &host_dir,
         ));
 
         // Set mount_flag on the host directory's inode. This is the fast-path

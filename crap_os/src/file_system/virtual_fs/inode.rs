@@ -135,27 +135,14 @@ pub struct Inode {
     /// writeback.
     pub dirty: bool,
 
-    /// Indicates that all directory entries pointing to this inode have been
-    /// removed, but one or more open file handles still hold a live `Arc`
-    /// reference to it.
-    ///
-    /// While `pending_deletion` is `true`, the inode remains accessible
-    /// through existing handles but cannot be opened by name (it has no
-    /// directory entries). When the last handle closes and the `Arc<Inode>`
-    /// reference count drops to zero, the VFS instructs the filesystem driver
-    /// to free the inode's data blocks and release the inode slot. This
-    /// implements POSIX unlink semantics, where a file can be deleted from
-    /// the namespace while remaining readable and writable through any handles
-    /// that were already open.
-    pub pending_deletion: bool,
 }
 
 impl Inode {
     /// Constructs a new `Inode` with the supplied identity, type, and
     /// metadata.
     ///
-    /// `mount_flag`, `dirty`, and `pending_deletion` are all initialized to
-    /// `false`. The caller is responsible for supplying an accurate `size`
+    /// `mount_flag` and `dirty` are initialized to `false`. The caller is
+    /// responsible for supplying an accurate `size`
     /// for files and symlinks; for directories, `0` is an acceptable initial
     /// value.
     ///
@@ -188,7 +175,6 @@ impl Inode {
             link_count,
             mount_flag: false,
             dirty: false,
-            pending_deletion: false,
         }
     }
 
@@ -243,17 +229,6 @@ impl Inode {
     /// Returns `true` when `dirty` is set, and `false` otherwise.
     pub fn is_dirty(&self) -> bool {
         self.dirty
-    }
-
-    /// Checks if all directory entries referencing this inode have
-    /// been removed and the inode is waiting for its last open handle to
-    /// close before its data blocks are freed.
-    ///
-    /// # Returns
-    ///
-    /// Returns `true` when `pending_deletion` is set, and `false` otherwise.
-    pub fn is_pending_deletion(&self) -> bool {
-        self.pending_deletion
     }
 
     /// Constructs an [`super::types::InodeStat`] snapshot from this inode's

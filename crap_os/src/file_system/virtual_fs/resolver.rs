@@ -280,8 +280,8 @@ impl VirtualFileSystem {
                     continue;
                 }
 
-                // Normal upward move via the weak parent reference. Upgrade
-                // failure is a kernel invariant violation.
+                // Normal upward move through the parent reference. Ordinary
+                // parents remain live through their child's strong reference.
                 current = current.parent()?;
 
                 if is_last {
@@ -344,7 +344,7 @@ impl VirtualFileSystem {
 
                     let child_dir = Arc::new(Directory::new(
                         child_inode,
-                        Arc::downgrade(&current),
+                        Arc::clone(&current),
                     ));
 
                     // Check for a downward mount boundary. If mount_flag is
@@ -558,7 +558,7 @@ impl VirtualFileSystem {
 
                     let child_dir = Arc::new(Directory::new(
                         child_inode,
-                        Arc::downgrade(&current),
+                        Arc::clone(&current),
                     ));
 
                     if child_dir.inode.mount_flag {

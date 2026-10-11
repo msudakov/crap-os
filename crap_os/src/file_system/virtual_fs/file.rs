@@ -4,11 +4,10 @@
 //!
 //! - [`File`] is the master record for an open file. There is exactly one
 //!   `File` per unique inode that has at least one open handle anywhere in
-//!   the system. It is owned by the object manager and persists from the
+//!   the system. It is owned by the VFS open-file table and persists from the
 //!   moment the first handle to a given inode is opened until the last handle
-//!   is closed. It tracks all live handles, enforces the write-lock state, and
-//!   carries the `pending_deletion` flag used to implement POSIX unlink
-//!   semantics.
+//!   is closed. It tracks registered handles and enforces the write-lock
+//!   state and whether its last directory entry has been removed.
 //!
 //! - [`FileHandle`] is the per-handle instance created for each individual
 //!   `open()` call. It is owned by the calling process's handle table entry.
@@ -18,17 +17,18 @@
 //!   the master record, keeping the master record alive for at least as long
 //!   as the handle exists.
 //!
-//! The object manager holds the sole [`Arc<File>`] that owns each master
+//! The VFS open-file table holds an [`Arc<File>`] for each master
 //! record. Process handle tables hold [`Arc<FileHandle>`] values. The [`File`]
 //! master record holds [`Weak<FileHandle>`] references to track active handles
 //! without preventing their cleanup.
 //!
-//! When a process closes a handle or is terminated by the process manager,
-//! the [`Arc<FileHandle>`] is dropped. When the last [`Arc<FileHandle>`] for a
-//! given [`File`] is dropped, the object manager removes the [`Arc<File>`] from
-//! its open-file table, dropping the master record. If `pending_deletion` is
-//! set on the master record at that point, the VFS instructs the filesystem
-//! driver to free the inode's data blocks.
+//! The VFS registers each handle before returning from `open`. A successful
+//! `close` removes that exact registration and invalidates all `Arc` clones of
+//! the handle. When the last registration is removed, the VFS removes the
+//! master record from its open-file table. If the master is pending deletion,
+//! the VFS first asks the driver to free its storage; a driver failure leaves
+//! the registration intact for a retry. Handle owners must call `close`
+//! explicitly before dropping their last `Arc` reference.
 //!
 //! Write locking is a dynamic operation on top of an already-open
 //! write-capable handle. Holding a `WriteOnly` or `ReadWrite` handle does not
@@ -43,6 +43,8 @@
 use alloc::sync::{Arc, Weak};
 use alloc::vec::Vec;
 
+use crate::spinlock::SpinLock;
+
 use super::inode::Inode;
 use super::types::{AccessMode, FileLockState, FileSystemError};
 
@@ -53,12 +55,11 @@ use super::types::{AccessMode, FileLockState, FileSystemError};
 /// inode and destroyed when the last handle to it is closed.
 ///
 /// The [`File`] does not directly track per-handle state such as read position
-/// or access mode - those live on [`FileHandle`]. It tracks the things that are
-/// shared across all handles to the same inode: the inode itself, the current
-/// write-lock state, the set of live handles (as `Weak` references), and
-/// whether the inode is pending deletion after all handles close.
+/// or access mode. It holds the inode and protects the write-lock state and
+/// registered handle list and deferred-deletion state shared by all opens of
+/// that inode.
 ///
-/// Owned exclusively by the object manager's open-file table, keyed by
+/// Owned by the VFS open-file table, keyed by
 /// [`super::types::OpenFileKey`].
 pub struct File {
     /// The inode this master record is open for.
@@ -69,127 +70,173 @@ pub struct File {
     /// pointing to it.
     pub inode: Arc<Inode>,
 
-    /// The current write-lock state of this file.
-    ///
-    /// `Unlocked` by default. A process holding a write-capable [`FileHandle`]
-    /// may request an exclusive write lock, transitioning this state to
-    /// `WriteExclusive`. While locked, all other write attempts through any
-    /// handle on this [`File`] return `FileSystemError::FileLocked`. The lock
-    /// is released when the holding handle is explicitly unlocked or closed.
-    pub lock_state: FileLockState,
+    /// Mutable bookkeeping shared by all handles. VFS callers hold the global
+    /// IRQ-safe lock before taking this short inner lock.
+    state: SpinLock<FileState>,
+}
 
-    /// Weak references to all live [`FileHandle`] instances for this file,
-    /// across all processes.
-    ///
-    /// Weak references are used so that handle cleanup is driven by the
-    /// process manager dropping [`Arc<FileHandle>`] values from process handle
-    /// tables, not by the master record keeping handles alive. Stale [`Weak`]
-    /// entries (where `upgrade()` returns `None`) accumulate only if a handle
-    /// is closed without the VFS being notified, which must not happen under
-    /// normal operation, as the process manager guarantees explicit cleanup on
-    /// both normal and abnormal process exit.
-    ///
-    /// This list is used to count active handles (for determining when the
-    /// master record should be destroyed) and to enforce write-lock semantics
-    /// (for verifying that the lock holder's handle is still live before
-    /// honouring a lock-release request).
-    pub handles: Vec<Weak<FileHandle>>,
+/// Mutable bookkeeping for the handles open on one inode.
+struct FileState {
+    /// Exclusive write-lock owner, identified by a VFS-wide handle ID.
+    lock_state: FileLockState,
 
-    /// Indicates that all directory entries referencing the underlying inode
-    /// have been removed (via `VirtualFileSystem::delete`), but at least one
-    /// open handle still holds an [`Arc<Inode>`] reference.
-    ///
-    /// While `true`, no new handles can be opened to this inode by name (it
-    /// has no directory entries), but existing handles may continue to read
-    /// and write it. When the last [`FileHandle`] is dropped, and this flag is
-    /// `true`, the object manager calls the filesystem driver to free the
-    /// inode's data blocks, completing the deletion. This implements POSIX
-    /// unlink semantics.
-    pub pending_deletion: bool,
+    /// Weak registrations for handles returned by successful VFS opens.
+    handles: Vec<Weak<FileHandle>>,
+
+    /// Set after the last directory entry is removed, until the last close
+    /// successfully frees the inode through the filesystem driver.
+    pending_deletion: bool,
 }
 
 impl File {
     /// Constructs a new `File` master record for the given inode.
     ///
-    /// The initial lock state is `Unlocked`, the handle list is empty, and
-    /// `pending_deletion` is `false`. The first [`FileHandle`] should be
-    /// registered via `register_handle` immediately after construction.
+    /// The initial write-lock state is `Unlocked`, the handle list is empty,
+    /// and deletion is not pending. The VFS registers the first handle before
+    /// returning from `open`.
     ///
     /// # Arguments
     ///
     /// * `inode` - The inode this master record represents.
+    ///
+    /// # Returns
+    ///
+    /// Returns a master record with no registered handles.
     pub fn new(inode: Arc<Inode>) -> Self {
         Self {
             inode,
-            lock_state:       FileLockState::Unlocked,
-            handles:          Vec::new(),
-            pending_deletion: false,
+            state: SpinLock::new(FileState {
+                lock_state: FileLockState::Unlocked,
+                handles: Vec::new(),
+                pending_deletion: false,
+            }),
         }
     }
 
     /// Registers a new [`FileHandle`] with this master record.
     ///
-    /// Appends a weak reference to `handle` to the `handles` list. Must be
-    /// called each time a new [`Arc<FileHandle>`] is created for this file, so
-    /// that the master record can track the total number of live handles and
-    /// enforce write-lock semantics across all of them.
+    /// Appends a weak reference before the VFS returns a newly opened handle.
     ///
     /// # Arguments
     ///
     /// * `handle` - The newly created [`FileHandle`] to register.
-    pub fn register_handle(&mut self, handle: &Arc<FileHandle>) {
-        self.handles.push(Arc::downgrade(handle));
-    }
-
-    /// Removes any stale weak handle references from the `handles` list and
-    /// returns the count of handles that are still live.
-    ///
-    /// A stale entry is one where [`Weak::upgrade()`] returns [`None`], meaning
-    /// the corresponding [`Arc<FileHandle>`] has been dropped. Under normal
-    /// operation, the process manager closes handles explicitly before they are
-    /// dropped, but this method provides a reliable way to recount live handles
-    /// without assuming the list is perfectly clean.
     ///
     /// # Returns
     ///
-    /// Returns the number of live handles remaining after pruning stale
-    /// entries.
-    pub fn prune_and_count_handles(&mut self) -> usize {
-        self.handles.retain(|weak| weak.upgrade().is_some());
-        self.handles.len()
+    /// Returns no value.
+    pub(super) fn register_handle(&self, handle: &Arc<FileHandle>) {
+        self.state.lock().handles.push(Arc::downgrade(handle));
     }
 
-    /// Gets the count of handles in the `handles` list.
-    ///
-    /// # Returns
-    ///
-    /// Returns the number of live handles in the list.
-    pub fn count_handles(&mut self) -> usize {
-        self.handles.len()
-    }
-
-    /// Checks if the given handle value currently holds the exclusive
-    /// write lock on this file.
+    /// Checks whether the exact handle is registered with this master record.
     ///
     /// # Arguments
     ///
-    /// * `handle_value` - The process-local handle value to check against the
-    ///   current lock holder.
+    /// * `handle` - The handle whose allocation identity is checked.
     ///
     /// # Returns
     ///
-    /// Returns `true` if `lock_state` is `WriteExclusive` and `holder_handle`
-    /// equals `handle_value`, and `false` otherwise.
-    pub fn is_lock_holder(&self, handle_value: u32) -> bool {
-        matches!(
-            self.lock_state,
+    /// Returns `true` if this exact handle has an entry in the master record.
+    pub(super) fn has_handle(&self, handle: &Arc<FileHandle>) -> bool {
+        let ptr = Arc::as_ptr(handle);
+        self.state.lock().handles.iter().any(|weak| weak.as_ptr() == ptr)
+    }
+
+    /// Counts the handles registered with this master record.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Returns the number of registrations that have not been closed.
+    pub(super) fn registered_handle_count(&self) -> usize {
+        self.state.lock().handles.len()
+    }
+
+    /// Marks this open-file master for reclamation on its last close.
+    ///
+    /// Called after the filesystem driver removes the inode's last directory
+    /// entry. The VFS serializes this operation with open and close.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Returns no value.
+    pub(super) fn mark_pending_deletion(&self) {
+        self.state.lock().pending_deletion = true;
+    }
+
+    /// Checks whether this master must free its inode on the last close.
+    ///
+    /// # Arguments
+    ///
+    /// None.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` when the inode has no directory entries and its storage
+    /// awaits reclamation.
+    pub(super) fn is_pending_deletion(&self) -> bool {
+        self.state.lock().pending_deletion
+    }
+
+    /// Removes one registered handle and releases its write lock, if held.
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` - The exact handle to unregister after a successful close.
+    ///
+    /// # Returns
+    ///
+    /// Returns the remaining registration count, or `InvalidHandle` if the
+    /// handle was not registered.
+    pub(super) fn unregister_handle(
+        &self,
+        handle: &Arc<FileHandle>,
+    ) -> Result<usize, FileSystemError> {
+        let mut state = self.state.lock();
+        let ptr = Arc::as_ptr(handle);
+        let index = state.handles.iter()
+            .position(|weak| weak.as_ptr() == ptr)
+            .ok_or(FileSystemError::InvalidHandle)?;
+        state.handles.swap_remove(index);
+
+        if matches!(
+            &state.lock_state,
             FileLockState::WriteExclusive { holder_handle }
-            if holder_handle == handle_value
+                if *holder_handle == handle.id
+        ) {
+            state.lock_state = FileLockState::Unlocked;
+        }
+
+        Ok(state.handles.len())
+    }
+
+    /// Checks whether a VFS-wide handle ID owns the exclusive write lock.
+    ///
+    /// # Arguments
+    ///
+    /// * `handle_id` - The VFS-wide identifier to check.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` if this ID owns the lock, and `false` otherwise.
+    pub(super) fn is_lock_holder(&self, handle_id: u64) -> bool {
+        let state = self.state.lock();
+        matches!(
+            &state.lock_state,
+            FileLockState::WriteExclusive { holder_handle }
+            if *holder_handle == handle_id
         )
     }
 
     /// Attempts to acquire an exclusive write lock on behalf of the handle
-    /// identified by `handle_value`.
+    /// identified by `handle_id`.
     ///
     /// Succeeds only when the file is currently `Unlocked`. If another handle
     /// already holds the lock, returns `FileSystemError::LockContention`
@@ -197,57 +244,54 @@ impl File {
     ///
     /// # Arguments
     ///
-    /// * `handle_value` - The process-local handle value of the handle
-    ///   requesting the lock. Stored in `FileLockState::WriteExclusive` so
-    ///   that future lock-release requests can be validated against the
-    ///   original holder.
+    /// * `handle_id` - The VFS-wide identifier of the requesting handle.
     ///
     /// # Returns
     ///
     /// Returns `Ok(())` if the lock was successfully acquired, or
     /// `Err(FileSystemError::LockContention)` if the file is already locked
     /// by another handle.
-    pub fn acquire_write_lock(
-        &mut self,
-        handle_value: u32,
+    pub(super) fn acquire_write_lock(
+        &self,
+        handle_id: u64,
     ) -> Result<(), FileSystemError> {
-        match self.lock_state {
-            FileLockState::Unlocked => {
-                self.lock_state = FileLockState::WriteExclusive {
-                    holder_handle: handle_value,
-                };
-                Ok(())
-            }
-            FileLockState::WriteExclusive { .. } => {
-                Err(FileSystemError::LockContention)
-            }
+        let mut state = self.state.lock();
+        if state.lock_state != FileLockState::Unlocked {
+            return Err(FileSystemError::LockContention);
         }
+        state.lock_state = FileLockState::WriteExclusive {
+            holder_handle: handle_id,
+        };
+        Ok(())
     }
 
     /// Releases the exclusive write lock, provided the caller is the current
     /// lock holder.
     ///
     /// If the file is not locked, or the lock is held by a different handle
-    /// than `handle_value`, the lock state is not modified, and an error is
+    /// than `handle_id`, the lock state is not modified, and an error is
     /// returned.
     ///
     /// # Arguments
     ///
-    /// * `handle_value` - The process-local handle value of the handle
-    ///   attempting to release the lock. Must match the `holder_handle`
-    ///   recorded when the lock was acquired.
+    /// * `handle_id` - The VFS-wide identifier of the releasing handle.
     ///
     /// # Returns
     ///
     /// Returns `Ok(())` if the lock was successfully released, or
     /// `Err(FileSystemError::InvalidHandle)` if the file is not locked or
-    /// `handle_value` does not match the current lock holder.
-    pub fn release_write_lock(
-        &mut self,
-        handle_value: u32,
+    /// `handle_id` does not match the current lock holder.
+    pub(super) fn release_write_lock(
+        &self,
+        handle_id: u64,
     ) -> Result<(), FileSystemError> {
-        if self.is_lock_holder(handle_value) {
-            self.lock_state = FileLockState::Unlocked;
+        let mut state = self.state.lock();
+        if matches!(
+            &state.lock_state,
+            FileLockState::WriteExclusive { holder_handle }
+                if *holder_handle == handle_id
+        ) {
+            state.lock_state = FileLockState::Unlocked;
             return Ok(());
         }
 
@@ -257,25 +301,25 @@ impl File {
     /// Checks if a write operation through the given handle should be
     /// blocked by the current lock state.
     ///
-    /// A write is blocked when the file is `WriteExclusive` and `handle_value`
+    /// A write is blocked when the file is `WriteExclusive` and `handle_id`
     /// is not the lock holder. A write is always permitted when the file is
-    /// `Unlocked`, or when `handle_value` is the lock holder.
+    /// `Unlocked`, or when `handle_id` is the lock holder.
     ///
     /// # Arguments
     ///
-    /// * `handle_value` - The process-local handle value of the handle
-    ///   attempting to write.
+    /// * `handle_id` - The VFS-wide identifier of the writing handle.
     ///
     /// # Returns
     ///
     /// Returns `true` if the write should be rejected with
     /// `FileSystemError::FileLocked`, and `false` if the write is permitted
     /// by the current lock state.
-    pub fn is_write_blocked(&self, handle_value: u32) -> bool {
+    pub(super) fn is_write_blocked(&self, handle_id: u64) -> bool {
+        let state = self.state.lock();
         matches!(
-            self.lock_state,
+            &state.lock_state,
             FileLockState::WriteExclusive { holder_handle }
-            if holder_handle != handle_value
+            if *holder_handle != handle_id
         )
     }
 }
@@ -289,9 +333,9 @@ impl File {
 /// position and access mode.
 ///
 /// The [`FileHandle`] holds a strong [`Arc<File>`] reference to the master
-/// record, ensuring the master record stays alive for at least as long as the
-/// handle exists. The master record holds a corresponding [`Weak<FileHandle>`]
-/// back to this handle for tracking purposes.
+/// record. The master record holds a corresponding [`Weak<FileHandle>`] until
+/// VFS close unregisters this open handle. Clones of its `Arc` refer to the
+/// same open handle and become invalid together when it is closed.
 ///
 /// Owned by the process's handle table entry. Dropped when the process closes
 /// the handle explicitly or when the process manager tears down the process's
@@ -300,16 +344,17 @@ pub struct FileHandle {
     /// The master record for the file this handle is open on.
     ///
     /// Shared with all other handles to the same inode. Provides access to
-    /// the inode, the write-lock state, and the pending-deletion flag.
+    /// the inode, shared write-lock state, and deferred-deletion state.
     pub file: Arc<File>,
 
-    /// The current byte offset for the next read or write operation.
+    /// Identifier unique among VFS opens, including opens by other processes.
+    pub(super) id: u64,
+
+    /// Position and closed state shared by all `Arc` clones of this handle.
     ///
-    /// Starts at `0` when the handle is created. Advanced automatically after
-    /// each successful read or write by the number of bytes transferred.
-    /// May also be set explicitly via `VirtualFileSystem::seek`. Independent
-    /// of the position of any other handle to the same file.
-    pub position: u64,
+    /// The lock remains held through a synchronous driver transfer and its
+    /// position update. VFS callers hold the global IRQ-safe lock first.
+    pub(super) state: SpinLock<FileHandleState>,
 
     /// The access rights granted to this handle at open time.
     ///
@@ -320,22 +365,39 @@ pub struct FileHandle {
     pub access_mode: AccessMode,
 }
 
+/// State shared by references to one open handle, not by separate opens.
+pub(super) struct FileHandleState {
+    /// Byte offset for the next read or write through this handle.
+    pub(super) position: u64,
+
+    /// Set after successful close so every remaining `Arc` clone is invalid.
+    pub(super) closed: bool,
+}
+
 impl FileHandle {
     /// Constructs a new [`FileHandle`] for the given master record with the
     /// specified access mode.
     ///
-    /// The initial position is `0`. The caller is responsible for registering
-    /// this handle with the master record via [`File::register_handle`]
-    /// immediately after wrapping it in an [`Arc`].
+    /// The initial position is `0`, and the handle starts open. The VFS wraps
+    /// it in an [`Arc`] and registers it before returning from `open`.
     ///
     /// # Arguments
     ///
     /// * `file`        - The master record for the file being opened.
+    /// * `id`          - Identifier assigned by the VFS to this open handle.
     /// * `access_mode` - The access rights granted to this handle.
-    pub fn new(file: Arc<File>, access_mode: AccessMode) -> Self {
+    ///
+    /// # Returns
+    ///
+    /// Returns a handle at byte offset `0` with the requested access mode.
+    pub(super) fn new(file: Arc<File>, id: u64, access_mode: AccessMode) -> Self {
         Self {
             file,
-            position: 0,
+            id,
+            state: SpinLock::new(FileHandleState {
+                position: 0,
+                closed: false,
+            }),
             access_mode,
         }
     }
@@ -360,31 +422,25 @@ impl FileHandle {
         self.access_mode.can_write()
     }
 
-    /// Advances the handle's position by `bytes_transferred` bytes.
-    ///
-    /// Called internally by the VFS after each successful read or write to
-    /// keep the position consistent with the amount of data transferred.
-    /// Saturates at [`u64::MAX`] rather than wrapping, which is sufficient
-    /// given that no real file can be that large.
-    ///
-    /// # Arguments
-    ///
-    /// * `bytes_transferred` - The number of bytes successfully read or
-    ///   written in the most recent operation.
-    pub fn advance_position(&mut self, bytes_transferred: usize) {
-        self.position = self.position.saturating_add(bytes_transferred as u64);
-    }
-
     /// Sets the handle's read/write position to an absolute byte offset.
     ///
-    /// Does not validate the offset against the file's current size; the VFS
-    /// `seek` implementation is responsible for any bounds checking required
-    /// by the calling context.
+    /// The state lock serializes this update with reads, writes, and close on
+    /// the same handle. Seeking beyond the file's current size is permitted.
     ///
     /// # Arguments
     ///
     /// * `offset` - The absolute byte offset to seek to.
-    pub fn seek_to(&mut self, offset: u64) {
-        self.position = offset;
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` after setting the position, or `InvalidHandle` if
+    /// this handle has been closed.
+    pub(super) fn seek_to(&self, offset: u64) -> Result<(), FileSystemError> {
+        let mut state = self.state.lock();
+        if state.closed {
+            return Err(FileSystemError::InvalidHandle);
+        }
+        state.position = offset;
+        Ok(())
     }
 }

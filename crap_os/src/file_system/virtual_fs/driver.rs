@@ -312,14 +312,15 @@ pub trait FileSystemInstance: Send + Sync {
 
     /// Frees the inode slot and all data blocks belonging to `inode`.
     ///
-    /// Called by the VFS when an inode's link count reaches zero and all open
-    /// handles to it have been closed, signaling that the inode's storage may
-    /// be reclaimed. The driver must mark the inode slot as free in its
+    /// Called by the VFS when an inode's link count reaches zero and no
+    /// further operation through an open handle can access its storage. The
+    /// driver must mark the inode slot as free in its
     /// allocation structure and return all data blocks to the free-block pool.
     ///
-    /// This method must not be called while any open handle still holds a
-    /// reference to the inode. The VFS guarantees this by deferring the call
-    /// until the last [`super::file::FileHandle`] for the inode is dropped.
+    /// On deferred deletion, the VFS calls this method during the last close,
+    /// before unregistering that handle. The global VFS lock prevents another
+    /// handle operation during the call. If the driver returns an error, the
+    /// handle stays open so close can retry reclamation.
     ///
     /// # Arguments
     ///

@@ -16,16 +16,14 @@
 //!   unified namespace.
 //! * `drivers` - a registry of named [`super::driver::FileSystemDriver`]
 //!   implementations, populated at boot.
-//! * `mounts` - the primary mount table, keyed by host directory inode number,
+//! * `mounts` - the primary mount table, keyed by host filesystem and inode,
 //!   mapping each mount point to its [`super::mount::MountPoint`] object.
-//! * `mounted_root_index` - a secondary index keyed by mounted-root inode
-//!   number, used by the path resolver to cross mount boundaries upward during
+//! * `mounted_root_index` - a secondary index keyed by mounted-root identity,
+//!   used by the path resolver to cross mount boundaries upward during
 //!   `..` traversal in O(1).
 //! * `open_files` - the system-wide open-file table, mapping
 //!   [`super::types::OpenFileKey`] to the [`super::file::File`] master record
 //!   for every inode that currently has at least one open handle.
-//! * `next_filesystem_id` - a monotonically incrementing counter used to
-//!   assign a unique ID to each mounted filesystem instance.
 //!
 //! The [`VirtualFileSystem`] struct has no interior locking of its own. It is
 //! wrapped in a [`crate::spinlock::StaticIrqSpinLock`] at the global level,
@@ -37,10 +35,9 @@
 
 use alloc::sync::Arc;
 use crate::kernel_hashmap::KernelHashMap;
-use super::directory::Directory;
+use super::directory::{Directory, DirectoryParent};
 use super::driver::{BlockDevice, FileSystemDriver};
 use super::file::File;
-use super::inode::Inode;
 use super::mount::MountPoint;
 use super::types::{FileSystemError, OpenFileKey};
 
@@ -72,21 +69,20 @@ pub struct VirtualFileSystem {
 
     /// The primary mount table.
     ///
-    /// Keyed by the inode number of the host directory (the directory in the
-    /// parent filesystem on which a volume is mounted). Each value is the
+    /// Keyed by the instance ID and inode number of the host directory (the
+    /// directory in the parent filesystem on which a volume is mounted). Each value is the
     /// [`MountPoint`] object for that mount. Used during unmount and for
     /// mount enumeration.
-    pub(super) mounts: KernelHashMap<u64, MountPoint>,
+    pub(super) mounts: KernelHashMap<OpenFileKey, MountPoint>,
 
-    /// A secondary index from mounted-root inode number to host directory
-    /// inode number.
+    /// A secondary index from mounted-root identity to host identity.
     ///
     /// Allows the path resolver to check if the current directory is the root
     /// of a mounted filesystem in O(1) during upward `..` traversal, without
     /// scanning the primary mount table. The value is the host directory's
-    /// inode number, which can then be used to retrieve the full [`MountPoint`]
+    /// composite identity, which retrieves the full [`MountPoint`]
     /// from [`VirtualFileSystem::mounts`].
-    pub(super) mounted_root_index: KernelHashMap<u64, u64>,
+    pub(super) mounted_root_index: KernelHashMap<OpenFileKey, OpenFileKey>,
 
     /// The system-wide open-file table.
     ///
@@ -104,14 +100,6 @@ pub struct VirtualFileSystem {
     /// prevents identifiers from being reused.
     pub(super) next_handle_id: u64,
 
-    /// Monotonically incrementing counter for assigning unique IDs to mounted
-    /// filesystem instances.
-    ///
-    /// Incremented by one each time [`VirtualFileSystem::mount`] is called.
-    /// The assigned ID is stored in the [`MountPoint`] and used as the
-    /// `filesystem_id` component of [`OpenFileKey`] for all inodes on that
-    /// volume.
-    next_filesystem_id: u64,
 }
 
 impl VirtualFileSystem {
@@ -121,8 +109,8 @@ impl VirtualFileSystem {
     /// Called once during kernel boot after the boot filesystem driver has
     /// mounted the root volume and produced the root [`Directory`]. The
     /// driver registry, mount table, mounted-root index, and open-file table
-    /// all start empty. Filesystem and handle identifiers start at `1`,
-    /// reserving `0` as an invalid sentinel.
+    /// all start empty. Handle identifiers start at `1`, reserving `0` as an
+    /// invalid sentinel.
     ///
     /// # Arguments
     ///
@@ -131,7 +119,7 @@ impl VirtualFileSystem {
     ///
     /// # Returns
     ///
-    /// Returns a VFS with empty tables and fresh filesystem and handle IDs.
+    /// Returns a VFS with empty tables and a fresh handle ID counter.
     pub fn new(root: Arc<Directory>) -> Self {
         Self {
             root,
@@ -140,7 +128,6 @@ impl VirtualFileSystem {
             mounted_root_index:  KernelHashMap::new(),
             open_files:          KernelHashMap::new(),
             next_handle_id:      1,
-            next_filesystem_id:  1,
         }
     }
 
@@ -172,14 +159,12 @@ impl VirtualFileSystem {
     /// 3. Look up the named driver in the registry.
     /// 4. Call [`super::driver::FileSystemDriver::mount`] to produce a live
     ///    [`super::driver::FileSystemInstance`].
-    /// 5. Assign the instance a unique filesystem ID.
+    /// 5. Read the driver's unique filesystem instance ID.
     /// 6. Load the mounted filesystem's root inode via the new instance.
     /// 7. Wrap the root inode in a [`super::directory::Directory`] with a
     ///    weak parent reference to the host directory.
-    /// 8. Set `mount_flag` on the host directory's inode.
-    /// 9. Set `mount_root` on the host [`super::directory::Directory`] wrapper.
-    /// 10. Insert a [`MountPoint`] into the primary mount table and the
-    ///     mounted-root inode number into the secondary index.
+    /// 8. Insert a [`MountPoint`] into the primary mount table and the
+    ///     mounted-root identity into the secondary index.
     ///
     /// `mount_path` must refer to an existing directory. Mounting on a
     /// non-directory inode, on a path that does not exist, or on a directory
@@ -208,16 +193,18 @@ impl VirtualFileSystem {
         mount_path: &str,
         working_directory: Option<Arc<Directory>>,
     ) -> Result<(), FileSystemError> {
-        // Resolve the mount path to its host directory. We need the Directory
-        // wrapper (not just the inode), so we can set mount_root on it, but
-        // resolve_to_directory gives us an Arc<Directory> directly.
-        let host_dir = self.resolve_to_directory(
+        // Resolve to the covered host even when this path currently names a
+        // mounted root. The table below determines whether it is occupied.
+        let host_dir = self.resolve_mount_host(
             mount_path,
             working_directory,
         )?;
 
         // Reject the mount if a filesystem is already mounted here.
-        if host_dir.inode.mount_flag {
+        let host_key = OpenFileKey::new(
+            host_dir.inode.filesystem.instance_id(), host_dir.inode.inode_number,
+        );
+        if self.mounts.get(&host_key).is_some() {
             return Err(FileSystemError::AlreadyMounted);
         }
 
@@ -230,9 +217,8 @@ impl VirtualFileSystem {
         // Ask the driver to mount the device and produce a live instance.
         let instance = driver.mount(device)?;
 
-        // Assign a unique filesystem ID to this instance.
-        let filesystem_id = self.next_filesystem_id;
-        self.next_filesystem_id += 1;
+        // The driver supplies the instance ID used in VFS identity keys.
+        let filesystem_id = instance.instance_id();
 
         // Load the mounted filesystem's root inode. Filesystem drivers
         // conventionally use inode number 1 for the root; if a driver uses
@@ -245,37 +231,19 @@ impl VirtualFileSystem {
             return Err(FileSystemError::NotADirectory);
         }
 
-        // The host owns the mounted root through mount_root. Keep the reverse
-        // parent reference weak to avoid a reference cycle across the mount.
+        // The mount table retains the host. Keep the reverse parent reference
+        // weak to avoid a reference cycle across the mount.
         let mounted_root = Arc::new(Directory::new_mounted_root(
             root_inode,
             &host_dir,
         ));
 
-        // Set mount_flag on the host directory's inode. This is the fast-path
-        // signal that the path resolver checks on every directory visit.
-        //
-        // Safety: we hold the VFS lock and have exclusive access to the inode.
-        // No other thread can be reading or modifying mount_flag concurrently.
-        unsafe {
-            let inode_ptr = Arc::as_ptr(&host_dir.inode) as *mut Inode;
-            (*inode_ptr).mount_flag = true;
-        }
-
-        // Set mount_root on the host Directory wrapper for the fast-path
-        // single-pointer follow during downward traversal.
-        //
-        // Safety: same justification as above.
-        unsafe {
-            let dir_ptr = Arc::as_ptr(&host_dir) as *mut Directory;
-            (*dir_ptr).mount_root = Some(Arc::clone(&mounted_root));
-        }
-
-        // Record the filesystem ID on the instance so inode loads can
-        // embed it in OpenFileKey values. We achieve this by storing it in
-        // the MountPoint and making it available via host_inode_number lookup.
-        let host_inode_number = host_dir.inode.inode_number;
-        let mounted_root_inode_number = mounted_root.inode.inode_number;
+        // Retain the instance's ID in the mount record and index its root by
+        // the same identity that inode and open-file lookups use.
+        let mounted_root_key = OpenFileKey::new(
+            mounted_root.inode.filesystem.instance_id(),
+            mounted_root.inode.inode_number,
+        );
 
         let mount_point = MountPoint::new(
             filesystem_id,
@@ -284,14 +252,10 @@ impl VirtualFileSystem {
             instance,
         );
 
-        // Insert into the primary mount table (host inode number -> MountPoint)
-        // and the secondary index (mounted root inode number -> host inode
-        // number) for O(1) upward boundary crossing during .. resolution.
-        self.mounts.insert(host_inode_number, mount_point);
-        self.mounted_root_index.insert(
-            mounted_root_inode_number,
-            host_inode_number,
-        );
+        // Index both sides by filesystem instance and inode number. Separate
+        // mounted volumes may assign the same inode numbers.
+        self.mounts.insert(host_key, mount_point);
+        self.mounted_root_index.insert(mounted_root_key, host_key);
 
         Ok(())
     }
@@ -305,10 +269,8 @@ impl VirtualFileSystem {
     /// 2. Verify a filesystem is currently mounted there.
     /// 3. Verify no open file handles exist on the mounted volume.
     /// 4. Remove the [`MountPoint`] from the primary mount table and the
-    ///    mounted-root inode number from the secondary index.
-    /// 5. Clear `mount_flag` on the host directory's inode and `mount_root`
-    ///    on its [`super::directory::Directory`] wrapper.
-    /// 6. Call [`super::driver::FileSystemInstance::unmount`] on the instance,
+    ///    mounted-root identity from the secondary index.
+    /// 5. Call [`super::driver::FileSystemInstance::unmount`] on the instance,
     ///    which flushes pending writes and releases driver resources.
     ///
     /// The `mount_path` must refer to a directory that currently has a
@@ -334,25 +296,30 @@ impl VirtualFileSystem {
         working_directory: Option<Arc<Directory>>,
     ) -> Result<(), FileSystemError> {
         // Resolve the path to the host directory inode.
-        let host_dir = self.resolve_to_directory(
+        let host_dir = self.resolve_mount_host(
             mount_path,
             working_directory,
         )?;
 
-        let host_inode_number = host_dir.inode.inode_number;
+        let host_key = OpenFileKey::new(
+            host_dir.inode.filesystem.instance_id(), host_dir.inode.inode_number,
+        );
 
         // Verify a filesystem is actually mounted here.
-        if !host_dir.inode.mount_flag {
+        if self.mounts.get(&host_key).is_none() {
             return Err(FileSystemError::NotMounted);
         }
 
         // Retrieve the MountPoint so that we can check for open handles and
-        // obtain the mounted-root inode number for the secondary index.
+        // obtain the mounted-root identity for the secondary index.
         let mount_point = self.mounts
-            .get(&host_inode_number)
+            .get(&host_key)
             .ok_or(FileSystemError::NotMounted)?;
 
-        let mounted_root_inode_number = mount_point.mounted_root_inode_number();
+        let mounted_root_key = OpenFileKey::new(
+            mount_point.mounted_root.inode.filesystem.instance_id(),
+            mount_point.mounted_root.inode.inode_number,
+        );
         let filesystem_id = mount_point.filesystem_id;
 
         // Reject the unmount if any open file handles exist on this volume.
@@ -365,27 +332,13 @@ impl VirtualFileSystem {
             return Err(FileSystemError::FileLocked);
         }
 
-        // Remove the MountPoint from both tables before clearing the host
-        // directory's flags, so that no concurrent path resolution (in an SMP
-        // context) can observe a partially unmounted state.
+        // The global VFS lock prevents another path walk from observing the
+        // two table removals separately.
         let mount_point = self.mounts
-            .remove(&host_inode_number)
+            .remove(&host_key)
             .ok_or(FileSystemError::InternalError)?;
 
-        self.mounted_root_index.remove(&mounted_root_inode_number);
-
-        // Clear mount_flag on the host inode and mount_root on the host
-        // Directory wrapper.
-        //
-        // Safety: we hold the VFS lock and have confirmed via the mount table
-        // that no other context holds a reference to this mount point's state.
-        unsafe {
-            let inode_ptr = Arc::as_ptr(&host_dir.inode) as *mut Inode;
-            (*inode_ptr).mount_flag = false;
-
-            let dir_ptr = Arc::as_ptr(&host_dir) as *mut Directory;
-            (*dir_ptr).mount_root = None;
-        }
+        self.mounted_root_index.remove(&mounted_root_key);
 
         // Call the driver's unmount to flush pending writes and release
         // resources. The MountPoint is dropped at the end of this scope,
@@ -436,6 +389,34 @@ impl VirtualFileSystem {
         self.resolve_to_dir_wrapper(path, working_directory)
     }
 
+    /// Resolves a mount path to the directory covered by that mount.
+    ///
+    /// Ordinary path resolution crosses into a mounted filesystem. Mount and
+    /// unmount instead need its host directory when the terminal component is
+    /// already mounted. The mounted root's weak parent points to that host.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Path of the mount host or its currently visible root.
+    /// * `working_directory` - Starting directory for a relative path.
+    ///
+    /// # Returns
+    ///
+    /// Returns the mount host, or the resolved ordinary directory when no
+    /// mount covers it. Resolution and parent-upgrade failures are returned.
+    fn resolve_mount_host(
+        &self,
+        path: &str,
+        working_directory: Option<Arc<Directory>>,
+    ) -> Result<Arc<Directory>, FileSystemError> {
+        let directory = self.resolve_to_directory(path, working_directory)?;
+        if matches!(directory.parent.as_ref(), Some(DirectoryParent::MountedRoot(_))) {
+            directory.parent()
+        } else {
+            Ok(directory)
+        }
+    }
+
     /// Resolves `path` to the [`Directory`] wrapper for the terminal
     /// component, without loading a separate inode.
     ///
@@ -443,7 +424,7 @@ impl VirtualFileSystem {
     /// [`Directory`] wrapper for the final component rather than its
     /// [`Inode`]. It is used by [`VirtualFileSystem::resolve_to_directory`]
     /// and by [`VirtualFileSystem::mount`] and [`VirtualFileSystem::unmount`],
-    /// which need the wrapper to mutate `mount_flag` and `mount_root`.
+    /// which need to identify the covered host directory.
     ///
     /// # Arguments
     ///

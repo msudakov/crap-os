@@ -27,7 +27,9 @@
 //! 12. **POSIX deferred delete** - checks two independent opens, cached-name
 //!     rejection, final-close reclamation, and deletion relative to a working
 //!     directory.
-//! 13. **Unmount** - unmounts the root volume cleanly.
+//! 13. **Wrapper consistency** - compares retained and fresh namespace views.
+//! 14. **Mounted wrappers** - checks mount visibility and real unmount lookup.
+//! 15. **Teardown** - drops the root volume cleanly.
 
 extern crate alloc;
 
@@ -49,7 +51,8 @@ use crate::sprintln;
 /// Runs all VFS tests against the stub filesystem.
 ///
 /// Initializes the global [`VirtualFileSystem`], registers the stub driver,
-/// mounts the stub volume, runs all operation tests in order, then unmounts.
+/// mounts the stub volume, runs all operation tests in order, then tears down
+/// the root VFS instance.
 /// Panics on the first assertion failure with a message identifying the
 /// failing test. All pass/fail output is written to the serial port.
 ///
@@ -71,6 +74,8 @@ pub fn run_vfs_tests() {
     test_rename();
     test_delete();
     test_posix_deferred_delete();
+    test_retained_directory_namespace();
+    test_mount_wrapper_consistency();
     test_unmount();
 
     sprintln!("[VFS TEST] ----------------------------------------");
@@ -202,8 +207,8 @@ fn test_mount_and_register() {
         *guard = Some(VirtualFileSystem::new(Arc::clone(&root_dir)));
     }
 
-    // Register the stub driver and mount via the VFS API so the mount table
-    // and secondary index are populated correctly.
+    // Register the stub driver for additional mount-point tests. The root
+    // instance itself has no host directory or mount-table entry.
     with_vfs(|vfs| {
         vfs.register_driver(Arc::new(StubFileSystemDriver));
     });
@@ -880,7 +885,7 @@ fn test_delete() {
 fn test_posix_deferred_delete() {
     sprintln!("[VFS TEST] POSIX deferred delete ...");
 
-    // Retain a wrapper with a cached entry, then open the file twice.
+    // Retain a wrapper with a loaded entry, then open the file twice.
     let etc_dir = expect_ok(
         with_vfs(|vfs| vfs.resolve_dir_with_budget(
             "/etc",
@@ -891,7 +896,7 @@ fn test_posix_deferred_delete() {
     );
     expect_ok(
         with_vfs(|vfs| vfs.stat("config.txt", Some(Arc::clone(&etc_dir)), false)),
-        "cache config.txt in retained /etc wrapper",
+        "load config.txt in retained /etc wrapper",
     );
     let first = expect_ok(
         with_vfs(|vfs| vfs.open("/etc/config.txt", AccessMode::ReadOnly, None)),
@@ -1024,7 +1029,217 @@ fn test_posix_deferred_delete() {
     sprintln!("[VFS TEST] POSIX deferred delete ... PASS");
 }
 
-/// Unmounts the stub filesystem cleanly.
+/// Checks namespace changes through an already loaded working directory.
+///
+/// # Arguments
+///
+/// None.
+///
+/// # Returns
+///
+/// Returns no value; panics when retained and fresh lookups disagree.
+fn test_retained_directory_namespace() {
+    sprintln!("[VFS TEST] retained directory namespace ...");
+
+    let log_dir = expect_ok(
+        with_vfs(|vfs| vfs.resolve_dir_with_budget(
+            "/var/log", None,
+            crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH,
+        )),
+        "retain /var/log for namespace checks",
+    );
+    expect_ok(
+        with_vfs(|vfs| vfs.stat("kernel.log", Some(Arc::clone(&log_dir)), false)),
+        "load retained /var/log child list",
+    );
+
+    let created = expect_ok(
+        with_vfs(|vfs| vfs.create_file(
+            "/var/log/wrapper-new.tmp", Permissions::all_permissive(), None,
+        )),
+        "create file through a fresh path",
+    );
+    let relative = expect_ok(
+        with_vfs(|vfs| vfs.stat("wrapper-new.tmp", Some(Arc::clone(&log_dir)), false)),
+        "find created file through retained wrapper",
+    );
+    let absolute = expect_ok(
+        with_vfs(|vfs| vfs.stat("/var/log/wrapper-new.tmp", None, false)),
+        "find created file through fresh path",
+    );
+    assert!(relative.inode_number == created.inode_number
+        && absolute.inode_number == created.inode_number,
+        "[VFS TEST] FAIL - created file differs across wrappers");
+
+    expect_ok(
+        with_vfs(|vfs| vfs.rename(
+            "/var/log/wrapper-new.tmp", "/var/log/wrapper-renamed.tmp", None,
+        )),
+        "rename file through fresh paths",
+    );
+    expect_err(
+        with_vfs(|vfs| vfs.stat("wrapper-new.tmp", Some(Arc::clone(&log_dir)), false)),
+        FileSystemError::NotFound,
+        "old name through retained wrapper after rename",
+    );
+    let renamed = expect_ok(
+        with_vfs(|vfs| vfs.stat("wrapper-renamed.tmp", Some(Arc::clone(&log_dir)), false)),
+        "new name through retained wrapper after rename",
+    );
+    let fresh_renamed = expect_ok(
+        with_vfs(|vfs| vfs.stat("/var/log/wrapper-renamed.tmp", None, false)),
+        "new name through fresh path after rename",
+    );
+    assert!(renamed.inode_number == created.inode_number
+        && fresh_renamed.inode_number == created.inode_number,
+        "[VFS TEST] FAIL - renamed file differs across wrappers");
+
+    expect_ok(
+        with_vfs(|vfs| vfs.delete("/var/log/wrapper-renamed.tmp", None)),
+        "delete file through fresh path",
+    );
+    expect_err(
+        with_vfs(|vfs| vfs.stat("wrapper-renamed.tmp", Some(log_dir), false)),
+        FileSystemError::NotFound,
+        "deleted name through retained wrapper",
+    );
+    expect_err(
+        with_vfs(|vfs| vfs.stat("/var/log/wrapper-renamed.tmp", None, false)),
+        FileSystemError::NotFound,
+        "deleted name through fresh path",
+    );
+
+    sprintln!("[VFS TEST] retained directory namespace ... PASS");
+}
+
+/// Checks mount visibility and unmount through fresh and retained wrappers.
+///
+/// # Arguments
+///
+/// None.
+///
+/// # Returns
+///
+/// Returns no value; panics when a mount boundary is missed or unmount fails.
+fn test_mount_wrapper_consistency() {
+    sprintln!("[VFS TEST] mount wrapper consistency ...");
+
+    let etc_dir = expect_ok(
+        with_vfs(|vfs| vfs.resolve_dir_with_budget(
+            "/etc", None,
+            crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH,
+        )),
+        "retain /etc before mount",
+    );
+    expect_ok(
+        with_vfs(|vfs| vfs.stat("hosts.cfg", Some(Arc::clone(&etc_dir)), false)),
+        "load covered /etc child list",
+    );
+
+    let device = Arc::new(StubBlockDevice);
+    expect_ok(
+        with_vfs(|vfs| vfs.mount("stubfs", device.clone(), "/etc", None)),
+        "mount second stub instance on /etc",
+    );
+    // The second stub's own root appears at /etc. Its etc/ and bin/
+    // directories therefore appear under /etc/etc and /etc/bin.
+    let visible_root = expect_ok(
+        with_vfs(|vfs| vfs.resolve("/etc", None, false)),
+        "resolve mounted /etc root",
+    );
+    assert!(visible_root.filesystem.instance_id()
+        != etc_dir.inode.filesystem.instance_id(),
+        "[VFS TEST] FAIL - mount boundary missed: host instance {}, visible instance {}",
+        etc_dir.inode.filesystem.instance_id(),
+        visible_root.filesystem.instance_id());
+    let visible_entries = expect_ok(
+        visible_root.filesystem.read_dir(&visible_root),
+        "read mounted /etc root",
+    );
+    assert!(visible_entries.iter().any(|entry| entry.name == "etc")
+        && visible_entries.iter().any(|entry| entry.name == "bin"),
+        "[VFS TEST] FAIL - mounted /etc root lacks stub root entries (instance {})",
+        visible_root.filesystem.instance_id());
+    let fresh = expect_ok(
+        with_vfs(|vfs| vfs.resolve("/etc/bin/shell", None, false)),
+        "fresh path enters mounted /etc",
+    );
+    let retained = expect_ok(
+        with_vfs(|vfs| vfs.resolve("bin/shell", Some(Arc::clone(&etc_dir)), false)),
+        "retained host enters mounted /etc",
+    );
+    assert!(fresh.filesystem.instance_id() == retained.filesystem.instance_id()
+        && fresh.filesystem.instance_id() != etc_dir.inode.filesystem.instance_id(),
+        "[VFS TEST] FAIL - wrappers see different mounted instances");
+    expect_err(
+        with_vfs(|vfs| vfs.stat("hosts.cfg", Some(Arc::clone(&etc_dir)), false)),
+        FileSystemError::NotFound,
+        "retained host hides covered children while mounted",
+    );
+    let nested = expect_ok(
+        with_vfs(|vfs| vfs.resolve("/etc/etc/config.txt", None, false)),
+        "same inode number inside mounted instance is not the host mount",
+    );
+    assert!(nested.filesystem.instance_id() == fresh.filesystem.instance_id(),
+        "[VFS TEST] FAIL - inode number collision crossed the mount again");
+    expect_err(
+        with_vfs(|vfs| vfs.mount("stubfs", device.clone(), "/etc", None)),
+        FileSystemError::AlreadyMounted,
+        "second mount on /etc",
+    );
+    expect_err(
+        with_vfs(|vfs| vfs.delete("/etc", None)),
+        FileSystemError::AlreadyMounted,
+        "delete covered /etc mount host",
+    );
+    let busy_handle = open_file("/etc/bin/shell", AccessMode::ReadOnly);
+    expect_err(
+        with_vfs(|vfs| vfs.unmount("/etc", None)),
+        FileSystemError::FileLocked,
+        "unmount with an open file on mounted volume",
+    );
+    close_file(&busy_handle);
+    expect_ok(
+        with_vfs(|vfs| vfs.unmount("/etc", None)),
+        "unmount /etc through fresh path",
+    );
+    expect_err(
+        with_vfs(|vfs| vfs.stat("/etc/bin/shell", None, false)),
+        FileSystemError::NotFound,
+        "covered /etc restored after unmount",
+    );
+
+    expect_ok(
+        with_vfs(|vfs| vfs.mount(
+            "stubfs", device, ".", Some(Arc::clone(&etc_dir)),
+        )),
+        "mount through retained host",
+    );
+    expect_ok(
+        with_vfs(|vfs| vfs.stat("bin/shell", Some(Arc::clone(&etc_dir)), false)),
+        "retained host sees remount",
+    );
+    expect_ok(
+        with_vfs(|vfs| vfs.unmount(".", Some(Arc::clone(&etc_dir)))),
+        "unmount through retained host",
+    );
+    expect_ok(
+        with_vfs(|vfs| vfs.stat("hosts.cfg", Some(etc_dir), false)),
+        "retained host sees uncovered /etc again",
+    );
+
+    sprintln!("[VFS TEST] mount wrapper consistency ... PASS");
+}
+
+/// Tears down the stub filesystem cleanly.
+///
+/// # Arguments
+///
+/// None.
+///
+/// # Returns
+///
+/// Returns no value; panics if the global VFS remains initialized.
 fn test_unmount() {
     sprintln!("[VFS TEST] unmount ...");
 

@@ -225,14 +225,15 @@ pub trait FileSystemInstance: Send + Sync {
 
     /// Gets a unique identifier for this mounted instance.
     ///
-    /// The VFS assigns this ID at mount time and uses it as the
+    /// The driver assigns this ID when creating the instance. It must differ
+    /// from every other live filesystem instance's ID. The VFS uses it as the
     /// `filesystem_id` component of [`super::types::OpenFileKey`] to
     /// distinguish inodes on this volume from identically numbered inodes on
     /// other mounted volumes.
     ///
     /// # Returns
     ///
-    /// Returns the unique instance identifier assigned by the VFS.
+    /// Returns the unique instance identifier assigned by the driver.
     fn instance_id(&self) -> u64;
 
     /// Gets the size in bytes of one logical block on this filesystem.

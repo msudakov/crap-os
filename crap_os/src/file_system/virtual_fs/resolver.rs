@@ -19,8 +19,7 @@
 //!    * `.`  - stay in the current directory and continue.
 //!    * `..` - move to the parent directory, crossing mount boundaries upward
 //!             if necessary.
-//!    * Any other name - look it up in the current directory's child list,
-//!      loading the list lazily from the driver if needed, then act on the
+//!    * Any other name - look it up in a fresh driver child list, then act on the
 //!      result type (file, directory, or symlink).
 //! 4. After processing the final component, return the resolved inode (or
 //!    directory wrapper, depending on the entry point).
@@ -47,16 +46,14 @@
 //!
 //! ## Mount Boundary Crossing
 //!
-//! The downward crossing (when the resolver moves into a directory that has a
-//! filesystem mounted on it) is handled by checking
-//! [`super::inode::Inode::mount_flag`] and following the
-//! [`super::directory::Directory::mount_root`] pointer. This is a single
-//! pointer follow with no table lookup.
+//! Downward crossing consults the VFS mount table by host filesystem and inode.
+//! Relative paths also check their starting directory, because a retained
+//! working-directory wrapper may have become a mount host.
 //!
 //! The Upward crossing (when the resolver handles `..` at the root of a mounted
 //! filesystem) is handled by consulting the `mounted_root_index` in
-//! [`super::vfs::VirtualFileSystem`], which maps mounted-root inode numbers
-//! to host directory inode numbers in O(1).
+//! [`super::vfs::VirtualFileSystem`], which maps mounted-root identities
+//! to host directory identities in O(1).
 
 #![allow(dead_code)]
 
@@ -65,7 +62,7 @@ use alloc::sync::Arc;
 use alloc::vec::Vec;
 use super::directory::Directory;
 use super::inode::Inode;
-use super::types::{DirectoryEntryType, FileSystemError};
+use super::types::{DirectoryEntryType, FileSystemError, OpenFileKey};
 use super::vfs::VirtualFileSystem;
 
 /// The maximum number of symlink hops the resolver will follow before
@@ -169,9 +166,7 @@ impl VirtualFileSystem {
         }
 
         // Walk the path again to obtain the Directory wrapper for the terminal
-        // component.
-        // TODO: Implement an inode cache that will make Directory wrappers
-        // directly addressable by inode number.
+        // component. A separate wrapper may represent the same inode.
         self.walk_to_directory(path, working_directory, symlink_budget)
     }
 
@@ -220,6 +215,17 @@ impl VirtualFileSystem {
             working_directory.unwrap_or_else(|| Arc::clone(&self.root))
         };
 
+        // A retained working directory can become a mount host after it was
+        // acquired. Resolve relative paths in the visible mounted tree.
+        if !path.starts_with('/') {
+            let key = OpenFileKey::new(
+                current.inode.filesystem.instance_id(), current.inode.inode_number,
+            );
+            if let Some(mount_point) = self.mounts.get(&key) {
+                current = Arc::clone(&mount_point.mounted_root);
+            }
+        }
+
         // Split the path into components, discarding empty strings produced
         // by leading `/`, trailing `/`, or consecutive `//` separators.
         let components: Vec<&str> = path
@@ -260,16 +266,19 @@ impl VirtualFileSystem {
 
                 // We are at the root of a mounted filesystem;  check whether
                 // the current directory is a mounted root by looking up its
-                // inode number in the secondary index.
-                if let Some(&host_inode_number) = self
+                // filesystem and inode identity in the secondary index.
+                let current_key = OpenFileKey::new(
+                    current.inode.filesystem.instance_id(), current.inode.inode_number,
+                );
+                if let Some(&host_key) = self
                     .mounted_root_index
-                    .get(&current.inode.inode_number)
+                    .get(&current_key)
                 {
                     // This directory is a mounted root. Cross upward to the
                     // host directory by retrieving it from the primary mount
                     // table.
                     let mount_point = self.mounts
-                        .get(&host_inode_number)
+                        .get(&host_key)
                         .ok_or(FileSystemError::InternalError)?;
 
                     current = Arc::clone(&mount_point.host_directory);
@@ -291,12 +300,12 @@ impl VirtualFileSystem {
             }
 
             // General component: look it up in the current directory's
-            // child list. This may trigger lazy loading of the child list
-            // from the filesystem driver if it has not been loaded yet.
+            // child list. Each lookup refreshes it from the driver so other
+            // wrappers' namespace changes are visible.
             //
             // We need a mutable reference to the Directory to call
-            // lookup_child (which may mutate the children field during lazy
-            // loading). We obtain it through a raw pointer because Arc does
+            // lookup_child (which refreshes the children field). We obtain it
+            // through a raw pointer because Arc does
             // not hand out mutable references. This is safe because the VFS
             // lock serializes all access; no other thread can concurrently
             // mutate the Directory's children.
@@ -347,17 +356,12 @@ impl VirtualFileSystem {
                         Arc::clone(&current),
                     ));
 
-                    // Check for a downward mount boundary. If mount_flag is
-                    // set on the child inode, the path resolver must cross
-                    // into the mounted filesystem's root rather than
-                    // descending into the child directory's own children.
-                    if child_dir.inode.mount_flag {
-                        // Retrieve the mounted root from the primary mount
-                        // table via the child directory's inode number.
-                        let mount_point = self.mounts
-                            .get(&child_dir.inode.inode_number)
-                            .ok_or(FileSystemError::InternalError)?;
-
+                    // The mount table is shared by all wrappers of this host.
+                    let child_key = OpenFileKey::new(
+                        child_dir.inode.filesystem.instance_id(),
+                        child_dir.inode.inode_number,
+                    );
+                    if let Some(mount_point) = self.mounts.get(&child_key) {
                         current = Arc::clone(&mount_point.mounted_root);
                     } else {
                         current = child_dir;
@@ -443,10 +447,6 @@ impl VirtualFileSystem {
     /// part of the resolver's walking logic but returns the wrapper instead
     /// of the inode.
     ///
-    /// TODO: Implement an inode cache that indexes [`Directory`] wrappers by
-    /// inode number, so that the wrapper will be retrievable directly after
-    /// resolving the inode.
-    ///
     /// # Arguments
     ///
     /// * `path`              - The path string to walk. Must resolve to a
@@ -475,6 +475,16 @@ impl VirtualFileSystem {
         } else {
             working_directory.clone().unwrap_or_else(|| Arc::clone(&self.root))
         };
+
+        // Apply a mount added after the caller retained its working directory.
+        if !path.starts_with('/') {
+            let key = OpenFileKey::new(
+                current.inode.filesystem.instance_id(), current.inode.inode_number,
+            );
+            if let Some(mount_point) = self.mounts.get(&key) {
+                current = Arc::clone(&mount_point.mounted_root);
+            }
+        }
 
         let components: Vec<&str> = path
             .split('/')
@@ -505,12 +515,15 @@ impl VirtualFileSystem {
                     continue;
                 }
 
-                if let Some(&host_inode_number) = self
+                let current_key = OpenFileKey::new(
+                    current.inode.filesystem.instance_id(), current.inode.inode_number,
+                );
+                if let Some(&host_key) = self
                     .mounted_root_index
-                    .get(&current.inode.inode_number)
+                    .get(&current_key)
                 {
                     let mount_point = self.mounts
-                        .get(&host_inode_number)
+                        .get(&host_key)
                         .ok_or(FileSystemError::InternalError)?;
                     current = Arc::clone(&mount_point.host_directory);
 
@@ -561,10 +574,11 @@ impl VirtualFileSystem {
                         Arc::clone(&current),
                     ));
 
-                    if child_dir.inode.mount_flag {
-                        let mount_point = self.mounts
-                            .get(&child_dir.inode.inode_number)
-                            .ok_or(FileSystemError::InternalError)?;
+                    let child_key = OpenFileKey::new(
+                        child_dir.inode.filesystem.instance_id(),
+                        child_dir.inode.inode_number,
+                    );
+                    if let Some(mount_point) = self.mounts.get(&child_key) {
                         current = Arc::clone(&mount_point.mounted_root);
                     } else {
                         current = child_dir;

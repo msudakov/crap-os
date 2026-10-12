@@ -10,7 +10,7 @@
 //! inode via the resolver, performs any necessary checks (type, permissions,
 //! lock state, access mode), dispatches to the appropriate
 //! [`super::driver::FileSystemInstance`] method, and updates the in-memory
-//! state (open-file table, directory child lists, inode metadata) to reflect
+//! state (open-file table, directory snapshots, inode metadata) to reflect
 //! the result.
 //!
 //! ## Caller Responsibilities
@@ -41,9 +41,8 @@ use alloc::sync::Arc;
 
 use super::directory::Directory;
 use super::file::{File, FileHandle};
-use super::inode::DirectoryEntry;
 use super::types::{
-    AccessMode, DirectoryEntryType, FileSystemError, InodeStat, OpenFileKey,
+    AccessMode, FileSystemError, InodeStat, OpenFileKey,
     Permissions, Timestamps,
 };
 use super::vfs::VirtualFileSystem;
@@ -381,9 +380,8 @@ impl VirtualFileSystem {
     /// Resolves the parent directory of `path`, verifies that no entry with
     /// the terminal name already exists, then calls
     /// [`super::driver::FileSystemInstance::create_file`] on the parent
-    /// directory's filesystem driver. On success, a new
-    /// [`super::inode::DirectoryEntry`] is added to the parent directory's
-    /// in-memory child list.
+    /// directory's filesystem driver. On success, the parent snapshot is
+    /// discarded so the next lookup reads the driver's state.
     ///
     /// # Arguments
     ///
@@ -436,19 +434,13 @@ impl VirtualFileSystem {
             timestamps,
         )?;
 
-        // Add the new entry to the parent's in-memory child list.
-        let entry = DirectoryEntry::with_inode(
-            alloc::string::ToString::to_string(file_name),
-            new_inode.inode_number,
-            DirectoryEntryType::File,
-            Arc::clone(&new_inode),
-        );
-
+        // The driver owns the updated namespace. Discard this wrapper's
+        // pre-create snapshot; the next lookup will read the new list.
         {
             let dir_ptr = Arc::as_ptr(&parent_dir) as *mut
                 super::directory::Directory;
             let dir = unsafe { &mut *dir_ptr };
-            dir.add_child(entry)?;
+            dir.children = None;
         }
 
         Ok(new_inode)
@@ -459,9 +451,8 @@ impl VirtualFileSystem {
     /// Resolves the parent directory of `path`, verifies that no entry with
     /// the terminal name already exists, then calls
     /// [`super::driver::FileSystemInstance::create_directory`] on the parent
-    /// directory's filesystem driver. On success, a new
-    /// [`super::inode::DirectoryEntry`] is added to the parent directory's
-    /// in-memory child list.
+    /// directory's filesystem driver. On success, the parent snapshot is
+    /// discarded so the next lookup reads the driver's state.
     ///
     /// # Arguments
     ///
@@ -513,18 +504,11 @@ impl VirtualFileSystem {
             timestamps,
         )?;
 
-        let entry = DirectoryEntry::with_inode(
-            alloc::string::ToString::to_string(dir_name),
-            new_inode.inode_number,
-            DirectoryEntryType::Directory,
-            Arc::clone(&new_inode),
-        );
-
         {
             let dir_ptr = Arc::as_ptr(&parent_dir) as *mut
                 super::directory::Directory;
             let dir = unsafe { &mut *dir_ptr };
-            dir.add_child(entry)?;
+            dir.children = None;
         }
 
         Ok(new_inode)
@@ -535,9 +519,8 @@ impl VirtualFileSystem {
     /// Resolves the parent directory of `path`, verifies that no entry with
     /// the terminal name already exists, then calls
     /// [`super::driver::FileSystemInstance::create_symlink`] on the parent
-    /// directory's filesystem driver. On success, a new
-    /// [`super::inode::DirectoryEntry`] is added to the parent directory's
-    /// in-memory child list.
+    /// directory's filesystem driver. On success, the parent snapshot is
+    /// discarded so the next lookup reads the driver's state.
     ///
     /// The `target` string is stored verbatim as the symlink's data. It may
     /// be an absolute or relative path; the resolver interprets it at
@@ -598,18 +581,11 @@ impl VirtualFileSystem {
             timestamps,
         )?;
 
-        let entry = DirectoryEntry::with_inode(
-            alloc::string::ToString::to_string(link_name),
-            new_inode.inode_number,
-            DirectoryEntryType::Symlink,
-            Arc::clone(&new_inode),
-        );
-
         {
             let dir_ptr = Arc::as_ptr(&parent_dir) as *mut
                 super::directory::Directory;
             let dir = unsafe { &mut *dir_ptr };
-            dir.add_child(entry)?;
+            dir.children = None;
         }
 
         Ok(new_inode)
@@ -620,7 +596,7 @@ impl VirtualFileSystem {
     /// Resolves `path` to its parent directory and terminal name, then calls
     /// [`super::driver::FileSystemInstance::unlink`] to remove the on-disk
     /// directory entry and decrement the inode's link count. The in-memory
-    /// child list of the parent directory is updated to reflect the removal.
+    /// child snapshot of the parent directory is discarded after removal.
     ///
     /// If the inode's link count reaches zero, and no open handles exist for
     /// it, [`super::driver::FileSystemInstance::free_inode`] is called
@@ -660,8 +636,7 @@ impl VirtualFileSystem {
 
         // Use the resolved parent for the final component. This preserves
         // relative-path semantics and does not follow a final symlink.
-        // The child index stays valid while the global VFS lock is held.
-        let (entry_index, target_inode) = {
+        let target_inode = {
             let dir_ptr = Arc::as_ptr(&parent_dir) as *mut Directory;
             let dir = unsafe { &mut *dir_ptr };
             dir.ensure_children_loaded()?;
@@ -670,11 +645,14 @@ impl VirtualFileSystem {
                 .position(|entry| entry.name == entry_name)
                 .ok_or(FileSystemError::NotFound)?;
             let inode = children[index].load_inode(&parent_dir.inode.filesystem)?;
-            (index, inode)
+            inode
         };
 
         // Reject deletion of a mount point directory.
-        if target_inode.mount_flag {
+        let target_key = OpenFileKey::new(
+            target_inode.filesystem.instance_id(), target_inode.inode_number,
+        );
+        if self.mounts.get(&target_key).is_some() {
             return Err(FileSystemError::AlreadyMounted);
         }
 
@@ -709,11 +687,11 @@ impl VirtualFileSystem {
         // Remove the on-disk directory entry and decrement the link count.
         target_inode.filesystem.unlink(&parent_dir.inode, entry_name)?;
 
-        // Update the preloaded parent list without another fallible lookup.
+        // A later lookup reloads the driver's post-unlink directory state.
         {
             let dir_ptr = Arc::as_ptr(&parent_dir) as *mut Directory;
             let dir = unsafe { &mut *dir_ptr };
-            dir.children.as_mut().unwrap().swap_remove(entry_index);
+            dir.children = None;
         }
 
         // Decrement the in-memory link count.
@@ -744,12 +722,10 @@ impl VirtualFileSystem {
     /// Moves the directory entry at `old_path` to `new_path`, optionally
     /// changing its name.
     ///
-    /// Resolves both parents, loads the source entry, and prepares the
-    /// destination entry and child list before calling
-    /// [`super::driver::FileSystemInstance::rename`]. After the driver succeeds,
-    /// the already loaded child lists are updated without another driver call.
-    /// The caller must hold the global VFS lock across this operation so the
-    /// validated child-list positions remain stable until the updates finish.
+    /// Resolves both parents and validates source and destination names before
+    /// calling [`super::driver::FileSystemInstance::rename`]. After the driver
+    /// succeeds, both parent snapshots are discarded. The caller must hold
+    /// the global VFS lock throughout the operation.
     ///
     /// `old_path` and `new_path` may share the same parent directory, in
     /// which case both sides use the same directory wrapper for this operation.
@@ -814,9 +790,8 @@ impl VirtualFileSystem {
             resolved_new_parent
         };
 
-        // Load the source entry and its inode before asking the driver to
-        // rename it. The source index remains stable under the global VFS lock.
-        let (source_index, moved_inode, entry_type) = {
+        // Check the source before asking the driver to rename it.
+        {
             let dir_ptr = Arc::as_ptr(&old_parent) as *mut Directory;
             let dir = unsafe { &mut *dir_ptr };
 
@@ -826,32 +801,15 @@ impl VirtualFileSystem {
                 .position(|entry| entry.name == old_name)
                 .ok_or(FileSystemError::NotFound)?;
 
-            let entry_type = children[index].entry_type;
-            let inode = children[index].load_inode(&old_parent.inode.filesystem)?;
-            (index, inode, entry_type)
+            children[index].load_inode(&old_parent.inode.filesystem)?;
         };
 
-        // Construct the replacement entry before changing the driver state.
-        let new_entry = DirectoryEntry::with_inode(
-            alloc::string::ToString::to_string(new_name),
-            moved_inode.inode_number,
-            entry_type,
-            moved_inode,
-        );
-
-        // Load and validate the destination list before the driver call. A
-        // cross-directory move needs one additional slot after the rename.
+        // Check the destination before changing driver state.
         {
             let dir_ptr = Arc::as_ptr(&new_parent) as *mut Directory;
             let dir = unsafe { &mut *dir_ptr };
             if dir.lookup_child(new_name)?.is_some() {
                 return Err(FileSystemError::AlreadyExists);
-            }
-
-            if !same_parent {
-                dir.children.as_mut().unwrap()
-                    .try_reserve(1)
-                    .map_err(|_| FileSystemError::InternalError)?;
             }
         }
 
@@ -863,18 +821,18 @@ impl VirtualFileSystem {
             new_name,
         )?;
 
-        // The global VFS lock prevents another VFS operation from changing
-        // these preloaded lists between validation and the following updates.
+        // Both wrappers discard their pre-rename snapshots. A later lookup
+        // refreshes from the driver, including through retained wrappers.
         {
             let old_dir_ptr = Arc::as_ptr(&old_parent) as *mut Directory;
             let old_dir = unsafe { &mut *old_dir_ptr };
-            old_dir.children.as_mut().unwrap().swap_remove(source_index);
+            old_dir.children = None;
         }
 
         {
             let new_dir_ptr = Arc::as_ptr(&new_parent) as *mut Directory;
             let new_dir = unsafe { &mut *new_dir_ptr };
-            new_dir.children.as_mut().unwrap().push(new_entry);
+            new_dir.children = None;
         }
 
         Ok(())

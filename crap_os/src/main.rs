@@ -436,18 +436,8 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // re-enable maskable hardware interrupts.
     unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
 
-
-    //globals::PROCESS_MANAGER.print_processes();
-
     // Enter halt loop on the idle task
-    let mut count = 0;
     loop {
-        //crate::hardware_manager::sprint("+");
-        count += 1;
-        if count == 10 {
-            count = 0;
-            //globals::PROCESS_MANAGER.print_processes();
-        }
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
     } 
 }

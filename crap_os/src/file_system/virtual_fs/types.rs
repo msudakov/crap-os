@@ -421,8 +421,8 @@ pub struct InodeStat {
 /// combines a per-instance `filesystem_id` with the `inode_number` to
 /// guarantee global uniqueness across all mounted volumes.
 ///
-/// The `filesystem_id` is assigned by the `VirtualFileSystem` when a filesystem
-/// is mounted and remains stable for the lifetime of that mount.
+/// The `filesystem_id` is assigned by the filesystem driver when it creates
+/// a mounted instance and remains stable for that instance's lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OpenFileKey {
     /// The unique identifier assigned to the mounted filesystem instance that

@@ -226,7 +226,7 @@ impl StubInode {
 /// inodes created at runtime via `create_file`, `create_directory`, and
 /// `create_symlink`.
 pub struct StubFsInstance {
-    /// The unique filesystem ID assigned by the VFS at mount time.
+    /// The unique filesystem ID assigned by this driver at mount time.
     id: u64,
 
     /// All inode metadata records for this instance.
@@ -245,7 +245,7 @@ impl StubFsInstance {
     ///
     /// # Arguments
     ///
-    /// * `id` - The unique filesystem ID assigned by the VFS at mount time.
+    /// * `id` - The unique filesystem ID assigned by this driver at mount time.
     fn new(id: u64) -> Self {
         // Build the flat inode table.
         let mut inodes: Vec<StubInode> = Vec::new();
@@ -807,14 +807,8 @@ impl FileSystemDriver for StubFileSystemDriver {
         &self,
         _device: Arc<dyn BlockDevice>,
     ) -> Result<Arc<dyn FileSystemInstance>, FileSystemError> {
-        // The filesystem ID will be assigned by the VFS after mount() returns.
-        // We use 0 as a placeholder; the real ID is stored in the MountPoint
-        // and accessed via instance_id(). The stub uses a separate field set
-        // at construction time, so we pass 0 here and note that the VFS's
-        // assigned ID is what callers should rely on via instance_id().
-        //
-        // For the stub, we use the address of the allocation as a unique ID
-        // proxy, but since we don't have it yet, we defer to a static counter.
+        // Assign a distinct ID to each stub instance. The VFS uses this ID
+        // together with an inode number for mount and open-file keys.
         static NEXT_ID: crate::spinlock::SpinLock<u64> =
             crate::spinlock::SpinLock::new(1);
 

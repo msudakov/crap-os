@@ -112,18 +112,6 @@ pub struct Inode {
     /// release the inode slot.
     pub link_count: u32,
 
-    /// Indicates whether a filesystem has been mounted on this inode.
-    ///
-    /// Only meaningful when `inode_type` is [`InodeType::Directory`]. When
-    /// `true`, the path resolver checks the owning
-    /// [`super::directory::Directory`] wrapper's
-    /// `mount_root` field and crosses the mount boundary rather than
-    /// descending into this inode's own children.
-    ///
-    /// This flag is owned and mutated exclusively by the VFS during mount and
-    /// unmount operations. Filesystem drivers never read or write it.
-    pub mount_flag: bool,
-
     /// Indicates that this inode has been modified in memory but not yet
     /// synced to disk.
     ///
@@ -141,7 +129,7 @@ impl Inode {
     /// Constructs a new `Inode` with the supplied identity, type, and
     /// metadata.
     ///
-    /// `mount_flag` and `dirty` are initialized to `false`. The caller is
+    /// `dirty` is initialized to `false`. The caller is
     /// responsible for supplying an accurate `size`
     /// for files and symlinks; for directories, `0` is an acceptable initial
     /// value.
@@ -173,7 +161,6 @@ impl Inode {
             permissions,
             timestamps,
             link_count,
-            mount_flag: false,
             dirty: false,
         }
     }
@@ -206,19 +193,6 @@ impl Inode {
     /// and `false` otherwise.
     pub fn is_symlink(&self) -> bool {
         matches!(self.inode_type, InodeType::Symlink)
-    }
-
-    /// Checks if a filesystem is mounted on this inode.
-    ///
-    /// Only meaningful for directory inodes. When `true`, the path resolver
-    /// crosses the mount boundary rather than descending into this directory's
-    /// own children.
-    ///
-    /// # Returns
-    ///
-    /// Returns `true` when `mount_flag` is set, and `false` otherwise.
-    pub fn is_mount_point(&self) -> bool {
-        self.mount_flag
     }
 
     /// Checks if this inode has in-memory changes that have not yet been

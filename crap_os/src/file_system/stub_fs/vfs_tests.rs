@@ -29,7 +29,8 @@
 //!     directory.
 //! 13. **Wrapper consistency** - compares retained and fresh namespace views.
 //! 14. **Mounted wrappers** - checks mount visibility and real unmount lookup.
-//! 15. **Teardown** - drops the root volume cleanly.
+//! 15. **Moved working directory** - checks `..` from a retained wrapper.
+//! 16. **Teardown** - drops the root volume cleanly.
 
 extern crate alloc;
 
@@ -76,6 +77,7 @@ pub fn run_vfs_tests() {
     test_posix_deferred_delete();
     test_retained_directory_namespace();
     test_mount_wrapper_consistency();
+    test_moved_working_directory_parent();
     test_unmount();
 
     sprintln!("[VFS TEST] ----------------------------------------");
@@ -1229,6 +1231,84 @@ fn test_mount_wrapper_consistency() {
     );
 
     sprintln!("[VFS TEST] mount wrapper consistency ... PASS");
+}
+
+/// Checks `..` from a retained working directory after moving that directory.
+///
+/// The driver updates the moved directory's parent on rename. Fresh and
+/// retained wrappers must agree after moving it to `/bin` and back to `/var`.
+///
+/// # Arguments
+///
+/// None.
+///
+/// # Returns
+///
+/// Returns no value; panics if either parent lookup fails or they disagree.
+fn test_moved_working_directory_parent() {
+    sprintln!("[VFS TEST] moved working directory parent ...");
+
+    let retained_log = expect_ok(
+        with_vfs(|vfs| vfs.resolve_dir_with_budget(
+            "/var/log", None,
+            crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH,
+        )),
+        "retain /var/log before moving it",
+    );
+    expect_ok(
+        with_vfs(|vfs| vfs.rename("/var/log", "/bin/log", None)),
+        "move /var/log to /bin/log",
+    );
+
+    let moved = expect_ok(
+        with_vfs(|vfs| vfs.stat("/bin/log", None, false)),
+        "find moved directory through fresh path",
+    );
+    assert!(moved.inode_number == retained_log.inode.inode_number,
+        "[VFS TEST] FAIL - moving /var/log changed its inode");
+
+    let bin = expect_ok(
+        with_vfs(|vfs| vfs.stat("/bin", None, false)),
+        "stat expected new parent /bin",
+    );
+    let fresh_log = expect_ok(
+        with_vfs(|vfs| vfs.resolve_dir_with_budget(
+            "/bin/log", None,
+            crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH,
+        )),
+        "resolve moved directory through fresh path",
+    );
+    let fresh_parent = expect_ok(
+        with_vfs(|vfs| vfs.stat("..", Some(fresh_log), false)),
+        "resolve .. from fresh /bin/log wrapper",
+    );
+    assert!(fresh_parent.inode_number == bin.inode_number,
+        "[VFS TEST] FAIL - fresh moved-directory parent is not /bin");
+
+    let retained_parent = expect_ok(
+        with_vfs(|vfs| vfs.stat("..", Some(Arc::clone(&retained_log)), false)),
+        "resolve .. from retained moved-directory wrapper",
+    );
+    assert!(retained_parent.inode_number == bin.inode_number,
+        "[VFS TEST] FAIL - retained moved-directory parent is inode {}, expected /bin inode {}",
+        retained_parent.inode_number, bin.inode_number);
+
+    expect_ok(
+        with_vfs(|vfs| vfs.rename("/bin/log", "/var/log", None)),
+        "restore /var/log after parent check",
+    );
+    let var = expect_ok(
+        with_vfs(|vfs| vfs.stat("/var", None, false)),
+        "stat restored parent /var",
+    );
+    let restored_parent = expect_ok(
+        with_vfs(|vfs| vfs.stat("..", Some(retained_log), false)),
+        "resolve .. from retained wrapper after restoring /var/log",
+    );
+    assert!(restored_parent.inode_number == var.inode_number,
+        "[VFS TEST] FAIL - retained directory still has old parent after restoring /var/log");
+
+    sprintln!("[VFS TEST] moved working directory parent ... PASS");
 }
 
 /// Tears down the stub filesystem cleanly.

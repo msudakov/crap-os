@@ -10,7 +10,7 @@
 //! during kernel boot after the first filesystem driver is registered and the
 //! boot volume is mounted.
 //!
-//! The [`VirtualFileSystem`] structure owns four collections:
+//! The [`VirtualFileSystem`] structure owns the namespace and open-file state:
 //!
 //! * `root` - the global root [`super::directory::Directory`], the `/` of the
 //!   unified namespace.
@@ -21,6 +21,8 @@
 //! * `mounted_root_index` - a secondary index keyed by mounted-root identity,
 //!   used by the path resolver to cross mount boundaries upward during
 //!   `..` traversal in O(1).
+//! * `relocated_parents` - the current parents of directories moved across
+//!   parent directories, keyed by filesystem and inode identity.
 //! * `open_files` - the system-wide open-file table, mapping
 //!   [`super::types::OpenFileKey`] to the [`super::file::File`] master record
 //!   for every inode that currently has at least one open handle.
@@ -84,6 +86,12 @@ pub struct VirtualFileSystem {
     /// from [`VirtualFileSystem::mounts`].
     pub(super) mounted_root_index: KernelHashMap<OpenFileKey, OpenFileKey>,
 
+    /// Current parents of directories moved across parent directories.
+    ///
+    /// A retained [`Directory`] wrapper keeps the parent it had when created.
+    /// The resolver checks this table before using that stored parent.
+    pub(super) relocated_parents: KernelHashMap<OpenFileKey, Arc<Directory>>,
+
     /// The system-wide open-file table.
     ///
     /// Keyed by [`OpenFileKey`] (a combination of filesystem ID and inode
@@ -126,6 +134,7 @@ impl VirtualFileSystem {
             drivers:             KernelHashMap::new(),
             mounts:              KernelHashMap::new(),
             mounted_root_index:  KernelHashMap::new(),
+            relocated_parents:   KernelHashMap::new(),
             open_files:          KernelHashMap::new(),
             next_handle_id:      1,
         }
@@ -268,8 +277,9 @@ impl VirtualFileSystem {
     /// 1. Resolve `mount_path` to a directory inode.
     /// 2. Verify a filesystem is currently mounted there.
     /// 3. Verify no open file handles exist on the mounted volume.
-    /// 4. Remove the [`MountPoint`] from the primary mount table and the
-    ///    mounted-root identity from the secondary index.
+    /// 4. Remove the [`MountPoint`] from the primary mount table, the
+    ///    mounted-root identity from the secondary index, and relocated
+    ///    parent entries for this filesystem instance.
     /// 5. Call [`super::driver::FileSystemInstance::unmount`] on the instance,
     ///    which flushes pending writes and releases driver resources.
     ///
@@ -332,13 +342,16 @@ impl VirtualFileSystem {
             return Err(FileSystemError::FileLocked);
         }
 
-        // The global VFS lock prevents another path walk from observing the
-        // two table removals separately.
+        // The global VFS lock prevents another path walk from observing these
+        // namespace table updates separately.
         let mount_point = self.mounts
             .remove(&host_key)
             .ok_or(FileSystemError::InternalError)?;
 
         self.mounted_root_index.remove(&mounted_root_key);
+        // No relocated parent from the unmounted volume may outlive it.
+        self.relocated_parents
+            .retain(|key, _| key.filesystem_id != filesystem_id);
 
         // Call the driver's unmount to flush pending writes and release
         // resources. The MountPoint is dropped at the end of this scope,

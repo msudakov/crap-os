@@ -597,6 +597,7 @@ impl VirtualFileSystem {
     /// [`super::driver::FileSystemInstance::unlink`] to remove the on-disk
     /// directory entry and decrement the inode's link count. The in-memory
     /// child snapshot of the parent directory is discarded after removal.
+    /// Deleting a moved directory also removes its relocated parent entry.
     ///
     /// If the inode's link count reaches zero, and no open handles exist for
     /// it, [`super::driver::FileSystemInstance::free_inode`] is called
@@ -687,6 +688,11 @@ impl VirtualFileSystem {
         // Remove the on-disk directory entry and decrement the link count.
         target_inode.filesystem.unlink(&parent_dir.inode, entry_name)?;
 
+        // A deleted directory's inode number may later be reused.
+        if target_inode.is_directory() && remaining_links == 0 {
+            self.relocated_parents.remove(&target_key);
+        }
+
         // A later lookup reloads the driver's post-unlink directory state.
         {
             let dir_ptr = Arc::as_ptr(&parent_dir) as *mut Directory;
@@ -724,8 +730,9 @@ impl VirtualFileSystem {
     ///
     /// Resolves both parents and validates source and destination names before
     /// calling [`super::driver::FileSystemInstance::rename`]. After the driver
-    /// succeeds, both parent snapshots are discarded. The caller must hold
-    /// the global VFS lock throughout the operation.
+    /// succeeds, both parent snapshots are discarded. A cross-directory move
+    /// also records the directory's new parent for retained wrappers. The
+    /// caller must hold the global VFS lock throughout the operation.
     ///
     /// `old_path` and `new_path` may share the same parent directory, in
     /// which case both sides use the same directory wrapper for this operation.
@@ -790,8 +797,9 @@ impl VirtualFileSystem {
             resolved_new_parent
         };
 
-        // Check the source before asking the driver to rename it.
-        {
+        // Check the source before asking the driver to rename it. Retain its
+        // identity so a successful directory move can update `..` traversal.
+        let moved_inode = {
             let dir_ptr = Arc::as_ptr(&old_parent) as *mut Directory;
             let dir = unsafe { &mut *dir_ptr };
 
@@ -801,7 +809,7 @@ impl VirtualFileSystem {
                 .position(|entry| entry.name == old_name)
                 .ok_or(FileSystemError::NotFound)?;
 
-            children[index].load_inode(&old_parent.inode.filesystem)?;
+            children[index].load_inode(&old_parent.inode.filesystem)?
         };
 
         // Check the destination before changing driver state.
@@ -820,6 +828,16 @@ impl VirtualFileSystem {
             &new_parent.inode,
             new_name,
         )?;
+
+        // Resolve the current parent by inode identity so retained and fresh
+        // wrappers agree after a cross-directory move.
+        if moved_inode.is_directory() && !same_parent {
+            let key = OpenFileKey::new(
+                moved_inode.filesystem.instance_id(),
+                moved_inode.inode_number,
+            );
+            self.relocated_parents.insert(key, Arc::clone(&new_parent));
+        }
 
         // Both wrappers discard their pre-rename snapshots. A later lookup
         // refreshes from the driver, including through retained wrappers.

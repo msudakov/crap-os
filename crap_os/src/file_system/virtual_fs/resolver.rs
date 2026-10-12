@@ -289,9 +289,13 @@ impl VirtualFileSystem {
                     continue;
                 }
 
-                // Normal upward move through the parent reference. Ordinary
-                // parents remain live through their child's strong reference.
-                current = current.parent()?;
+                // A moved directory may have a retained wrapper with its old
+                // parent. Prefer the current parent recorded by the VFS.
+                current = if let Some(parent) = self.relocated_parents.get(&current_key) {
+                    Arc::clone(parent)
+                } else {
+                    current.parent()?
+                };
 
                 if is_last {
                     return Ok(Arc::clone(&current.inode));
@@ -533,7 +537,13 @@ impl VirtualFileSystem {
                     continue;
                 }
 
-                current = current.parent()?;
+                // Use the moved directory's current parent for retained
+                // wrappers, falling back to the wrapper's original parent.
+                current = if let Some(parent) = self.relocated_parents.get(&current_key) {
+                    Arc::clone(parent)
+                } else {
+                    current.parent()?
+                };
 
                 if is_last {
                     return Ok(current);

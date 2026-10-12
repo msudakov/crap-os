@@ -10,7 +10,7 @@
 //! inode via the resolver, performs any necessary checks (type, permissions,
 //! lock state, access mode), dispatches to the appropriate
 //! [`super::driver::FileSystemInstance`] method, and updates the in-memory
-//! state (open-file table, directory snapshots, inode metadata) to reflect
+//! state (open-file table and inode metadata) to reflect
 //! the result.
 //!
 //! ## Caller Responsibilities
@@ -380,8 +380,8 @@ impl VirtualFileSystem {
     /// Resolves the parent directory of `path`, verifies that no entry with
     /// the terminal name already exists, then calls
     /// [`super::driver::FileSystemInstance::create_file`] on the parent
-    /// directory's filesystem driver. On success, the parent snapshot is
-    /// discarded so the next lookup reads the driver's state.
+    /// directory's filesystem driver. Each later lookup reads the driver's
+    /// current directory state.
     ///
     /// # Arguments
     ///
@@ -419,13 +419,8 @@ impl VirtualFileSystem {
         )?;
 
         // Reject if the name already exists in the parent directory.
-        {
-            let dir_ptr = Arc::as_ptr(&parent_dir) as *mut
-                super::directory::Directory;
-            let dir = unsafe { &mut *dir_ptr };
-            if dir.lookup_child(file_name)?.is_some() {
-                return Err(FileSystemError::AlreadyExists);
-            }
+        if parent_dir.lookup_child(file_name)?.is_some() {
+            return Err(FileSystemError::AlreadyExists);
         }
 
         let now = current_timestamp();
@@ -438,15 +433,6 @@ impl VirtualFileSystem {
             timestamps,
         )?;
 
-        // The driver owns the updated namespace. Discard this wrapper's
-        // pre-create snapshot; the next lookup will read the new list.
-        {
-            let dir_ptr = Arc::as_ptr(&parent_dir) as *mut
-                super::directory::Directory;
-            let dir = unsafe { &mut *dir_ptr };
-            dir.children = None;
-        }
-
         Ok(new_inode)
     }
 
@@ -455,8 +441,8 @@ impl VirtualFileSystem {
     /// Resolves the parent directory of `path`, verifies that no entry with
     /// the terminal name already exists, then calls
     /// [`super::driver::FileSystemInstance::create_directory`] on the parent
-    /// directory's filesystem driver. On success, the parent snapshot is
-    /// discarded so the next lookup reads the driver's state.
+    /// directory's filesystem driver. Each later lookup reads the driver's
+    /// current directory state.
     ///
     /// # Arguments
     ///
@@ -489,13 +475,8 @@ impl VirtualFileSystem {
             super::resolver::MAX_SYMLINK_DEPTH,
         )?;
 
-        {
-            let dir_ptr = Arc::as_ptr(&parent_dir) as *mut
-                super::directory::Directory;
-            let dir = unsafe { &mut *dir_ptr };
-            if dir.lookup_child(dir_name)?.is_some() {
-                return Err(FileSystemError::AlreadyExists);
-            }
+        if parent_dir.lookup_child(dir_name)?.is_some() {
+            return Err(FileSystemError::AlreadyExists);
         }
 
         let now = current_timestamp();
@@ -508,13 +489,6 @@ impl VirtualFileSystem {
             timestamps,
         )?;
 
-        {
-            let dir_ptr = Arc::as_ptr(&parent_dir) as *mut
-                super::directory::Directory;
-            let dir = unsafe { &mut *dir_ptr };
-            dir.children = None;
-        }
-
         Ok(new_inode)
     }
 
@@ -523,8 +497,8 @@ impl VirtualFileSystem {
     /// Resolves the parent directory of `path`, verifies that no entry with
     /// the terminal name already exists, then calls
     /// [`super::driver::FileSystemInstance::create_symlink`] on the parent
-    /// directory's filesystem driver. On success, the parent snapshot is
-    /// discarded so the next lookup reads the driver's state.
+    /// directory's filesystem driver. Each later lookup reads the driver's
+    /// current directory state.
     ///
     /// The `target` string is stored verbatim as the symlink's data. It may
     /// be an absolute or relative path; the resolver interprets it at
@@ -570,13 +544,8 @@ impl VirtualFileSystem {
             super::resolver::MAX_SYMLINK_DEPTH,
         )?;
 
-        {
-            let dir_ptr = Arc::as_ptr(&parent_dir) as *mut
-                super::directory::Directory;
-            let dir = unsafe { &mut *dir_ptr };
-            if dir.lookup_child(link_name)?.is_some() {
-                return Err(FileSystemError::AlreadyExists);
-            }
+        if parent_dir.lookup_child(link_name)?.is_some() {
+            return Err(FileSystemError::AlreadyExists);
         }
 
         let now = current_timestamp();
@@ -589,13 +558,6 @@ impl VirtualFileSystem {
             timestamps,
         )?;
 
-        {
-            let dir_ptr = Arc::as_ptr(&parent_dir) as *mut
-                super::directory::Directory;
-            let dir = unsafe { &mut *dir_ptr };
-            dir.children = None;
-        }
-
         Ok(new_inode)
     }
 
@@ -603,9 +565,9 @@ impl VirtualFileSystem {
     ///
     /// Resolves `path` to its parent directory and terminal name, then calls
     /// [`super::driver::FileSystemInstance::unlink`] to remove the on-disk
-    /// directory entry and decrement the inode's link count. The in-memory
-    /// child snapshot of the parent directory is discarded after removal.
-    /// Deleting a moved directory also removes its relocated parent entry.
+    /// directory entry and decrement the inode's link count. The next lookup
+    /// reads the driver's updated directory state. Deleting a moved directory
+    /// also removes its relocated parent entry.
     ///
     /// If the inode's link count reaches zero, and no open handles exist for
     /// it, [`super::driver::FileSystemInstance::free_inode`] is called
@@ -645,17 +607,10 @@ impl VirtualFileSystem {
 
         // Use the resolved parent for the final component. This preserves
         // relative-path semantics and does not follow a final symlink.
-        let target_inode = {
-            let dir_ptr = Arc::as_ptr(&parent_dir) as *mut Directory;
-            let dir = unsafe { &mut *dir_ptr };
-            dir.ensure_children_loaded()?;
-            let children = dir.children.as_mut().unwrap();
-            let index = children.iter()
-                .position(|entry| entry.name == entry_name)
-                .ok_or(FileSystemError::NotFound)?;
-            let inode = children[index].load_inode(&parent_dir.inode.filesystem)?;
-            inode
-        };
+        let target_entry = parent_dir.lookup_child(entry_name)?
+            .ok_or(FileSystemError::NotFound)?;
+        let target_inode = parent_dir.inode.filesystem
+            .load_inode(target_entry.inode_number)?;
 
         // A trailing slash names a directory, never a file or symlink.
         if path.ends_with('/') && !target_inode.is_directory() {
@@ -672,9 +627,7 @@ impl VirtualFileSystem {
 
         // Reject deletion of a non-empty directory.
         if target_inode.is_directory() {
-            // Load the directory's children to check emptiness.
-            // Look up the target as a child of parent to get its wrapper.
-            // We only need the child count so a read_dir call suffices.
+            // Read the target directory to check whether it is empty.
             let child_inode_count = target_inode.filesystem
                 .read_dir(&target_inode)?
                 .len();
@@ -685,9 +638,11 @@ impl VirtualFileSystem {
         }
 
         // Prepare the post-unlink decision before changing driver state.
-        let remaining_links = target_inode.link_count
-            .checked_sub(1)
-            .ok_or(FileSystemError::InternalError)?;
+        let remaining_links = {
+            let metadata = target_inode.metadata.lock();
+            metadata.link_count.checked_sub(1)
+                .ok_or(FileSystemError::InternalError)?
+        };
         let open_master = if remaining_links == 0 {
             let key = OpenFileKey::new(
                 target_inode.filesystem.instance_id(),
@@ -706,21 +661,10 @@ impl VirtualFileSystem {
             self.relocated_parents.remove(&target_key);
         }
 
-        // A later lookup reloads the driver's post-unlink directory state.
+        // Decrement this in-memory inode's link count after the driver commits.
         {
-            let dir_ptr = Arc::as_ptr(&parent_dir) as *mut Directory;
-            let dir = unsafe { &mut *dir_ptr };
-            dir.children = None;
-        }
-
-        // Decrement the in-memory link count.
-        {
-            let inode_ptr =
-                Arc::as_ptr(&target_inode) as *mut
-                super::inode::Inode;
-            unsafe {
-                (*inode_ptr).link_count = remaining_links;
-            }
+            let mut metadata = target_inode.metadata.lock();
+            metadata.link_count = remaining_links;
         }
 
         // If the link count has reached zero, decide whether to free
@@ -743,9 +687,10 @@ impl VirtualFileSystem {
     ///
     /// Resolves both parents and validates source and destination names before
     /// calling [`super::driver::FileSystemInstance::rename`]. After the driver
-    /// succeeds, both parent snapshots are discarded. A cross-directory move
-    /// also records the directory's new parent for retained wrappers. The
-    /// caller must hold the global VFS lock throughout the operation.
+    /// succeeds, later lookups read the driver's new directory state. A
+    /// cross-directory move also records the directory's new parent for
+    /// retained wrappers. The caller must hold the global VFS lock throughout
+    /// the operation.
     ///
     /// `old_path` and `new_path` may share the same parent directory, in
     /// which case both sides use the same directory wrapper for this operation.
@@ -812,18 +757,10 @@ impl VirtualFileSystem {
 
         // Check the source before asking the driver to rename it. Retain its
         // identity so a successful directory move can update `..` traversal.
-        let moved_inode = {
-            let dir_ptr = Arc::as_ptr(&old_parent) as *mut Directory;
-            let dir = unsafe { &mut *dir_ptr };
-
-            dir.ensure_children_loaded()?;
-            let children = dir.children.as_mut().unwrap();
-            let index = children.iter()
-                .position(|entry| entry.name == old_name)
-                .ok_or(FileSystemError::NotFound)?;
-
-            children[index].load_inode(&old_parent.inode.filesystem)?
-        };
+        let moved_entry = old_parent.lookup_child(old_name)?
+            .ok_or(FileSystemError::NotFound)?;
+        let moved_inode = old_parent.inode.filesystem
+            .load_inode(moved_entry.inode_number)?;
 
         // Either path may end in `/` only when moving a directory.
         if (old_path.ends_with('/') || new_path.ends_with('/'))
@@ -833,12 +770,8 @@ impl VirtualFileSystem {
         }
 
         // Check the destination before changing driver state.
-        {
-            let dir_ptr = Arc::as_ptr(&new_parent) as *mut Directory;
-            let dir = unsafe { &mut *dir_ptr };
-            if dir.lookup_child(new_name)?.is_some() {
-                return Err(FileSystemError::AlreadyExists);
-            }
+        if new_parent.lookup_child(new_name)?.is_some() {
+            return Err(FileSystemError::AlreadyExists);
         }
 
         // Only the driver operation can now return a filesystem error.
@@ -859,29 +792,14 @@ impl VirtualFileSystem {
             self.relocated_parents.insert(key, Arc::clone(&new_parent));
         }
 
-        // Both wrappers discard their pre-rename snapshots. A later lookup
-        // refreshes from the driver, including through retained wrappers.
-        {
-            let old_dir_ptr = Arc::as_ptr(&old_parent) as *mut Directory;
-            let old_dir = unsafe { &mut *old_dir_ptr };
-            old_dir.children = None;
-        }
-
-        {
-            let new_dir_ptr = Arc::as_ptr(&new_parent) as *mut Directory;
-            let new_dir = unsafe { &mut *new_dir_ptr };
-            new_dir.children = None;
-        }
-
         Ok(())
     }
 
     /// Updates the `accessed` timestamp on `inode` and marks it dirty.
     ///
     /// Called internally after a successful read operation. The `accessed`
-    /// field is updated to the current wall-clock time. If the update causes
-    /// `accessed` to change, `dirty` is set so the change will be persisted
-    /// by a future sync.
+    /// field is updated to the current wall-clock time. The inode is marked
+    /// dirty on every successful call for a future sync.
     ///
     /// # Arguments
     ///
@@ -896,13 +814,10 @@ impl VirtualFileSystem {
         inode: &Arc<super::inode::Inode>,
     ) -> Result<(), FileSystemError> {
         let now = current_timestamp();
-        let inode_ptr = Arc::as_ptr(inode) as *mut super::inode::Inode;
-    
-        unsafe {
-            (*inode_ptr).timestamps.accessed = now;
-            (*inode_ptr).dirty = true;
-        }
-    
+        let mut metadata = inode.metadata.lock();
+        metadata.timestamps.accessed = now;
+        metadata.dirty = true;
+
         Ok(())
     }
 
@@ -929,18 +844,11 @@ impl VirtualFileSystem {
         new_end: u64,
     ) -> Result<(), FileSystemError> {
         let now = current_timestamp();
-        let inode_ptr = Arc::as_ptr(inode) as *mut super::inode::Inode;
-
-        unsafe {
-            (*inode_ptr).timestamps.modified = now;
-            (*inode_ptr).timestamps.accessed = now;
-
-            if new_end > (*inode_ptr).size {
-                (*inode_ptr).size = new_end;
-            }
-
-            (*inode_ptr).dirty = true;
-        }
+        let mut metadata = inode.metadata.lock();
+        metadata.timestamps.modified = now;
+        metadata.timestamps.accessed = now;
+        metadata.size = metadata.size.max(new_end);
+        metadata.dirty = true;
 
         Ok(())
     }

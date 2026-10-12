@@ -28,6 +28,7 @@
 
 use alloc::sync::Arc;
 use alloc::string::String;
+use crate::spinlock::SpinLock;
 
 use super::types::{
     FileSystemError, InodeType, DirectoryEntryType, Permissions, Timestamps,
@@ -36,12 +37,13 @@ use super::driver::FileSystemInstance;
 
 /// The VFS-layer in-memory representation of a filesystem object.
 ///
-/// An [`Inode`] is the authoritative in-memory record for a single filesystem
-/// object - a file, a directory, or a symlink. It is created by the VFS when
-/// a filesystem driver returns inode data in response to a
+/// An [`Inode`] is an in-memory record for a filesystem object: a file, a
+/// directory, or a symlink. Drivers can load more than one record for the same
+/// on-disk inode. It is created by the VFS when a filesystem driver returns
+/// inode data in response to a
 /// [`super::driver::FileSystemInstance::load_inode`] call, and it remains alive
-///  in memory for as long as any [`super::directory::Directory`] wrapper,
-/// [`super::file::FileHandle`], or [`super::inode::DirectoryEntry`] holds an
+/// in memory for as long as any [`super::directory::Directory`] wrapper,
+/// [`super::file::FileHandle`], or [`DirectoryEntry`] holds an
 /// `Arc<Inode>` reference to it.
 ///
 /// The `filesystem` field is a back-reference to the
@@ -53,6 +55,8 @@ use super::driver::FileSystemInstance;
 /// Filesystem drivers may store additional, format-specific state in their
 /// own internal tables keyed by `inode_number`, but that data never appears
 /// on this struct. The `Inode` contains only what the VFS layer itself needs.
+/// Its mutable metadata is protected by a short-held lock because the record
+/// can be shared through `Arc<Inode>`.
 pub struct Inode {
     /// The inode's unique numeric identifier within its owning filesystem
     /// instance.
@@ -78,13 +82,22 @@ pub struct Inode {
     /// above it.
     pub inode_type: InodeType,
 
+    /// Mutable metadata shared by references to this in-memory inode.
+    ///
+    /// Hold the guard only while reading or changing fields, and release it
+    /// before calling a filesystem driver.
+    pub(crate) metadata: SpinLock<InodeMetadata>,
+}
+
+/// Metadata fields that can change while an [`Inode`] is shared.
+pub(crate) struct InodeMetadata {
     /// The size of this inode's data in bytes.
     ///
     /// For regular files, this is the file's current byte length. For symlinks,
     /// this is the byte length of the target path string. For directories, this
     /// field is filesystem-defined, and callers should not rely on it for
     /// anything other than passing it through to a stat snapshot.
-    pub size: u64,
+    pub(crate) size: u64,
 
     /// The access-control permissions associated with this inode.
     ///
@@ -92,7 +105,7 @@ pub struct Inode {
     /// permission checks in the VFS treat any `Permissions` value as
     /// universally permissive until the real model is in place. See
     /// [`super::types::Permissions`].
-    pub permissions: Permissions,
+    pub(crate) permissions: Permissions,
 
     /// Creation, last-modification, and last-access timestamps in Unix epoch
     /// milliseconds.
@@ -100,7 +113,7 @@ pub struct Inode {
     /// Set at creation time via [`super::types::Timestamps::new`] and updated
     /// by the VFS on each relevant operation before the inode is synced back
     /// to disk.
-    pub timestamps: Timestamps,
+    pub(crate) timestamps: Timestamps,
 
     /// The number of directory entries that currently reference this inode.
     ///
@@ -110,19 +123,15 @@ pub struct Inode {
     /// `link_count` reaches `0` and no open file handles remain, the VFS
     /// instructs the filesystem driver to free the inode's data blocks and
     /// release the inode slot.
-    pub link_count: u32,
+    pub(crate) link_count: u32,
 
     /// Indicates that this inode has been modified in memory but not yet
     /// synced to disk.
     ///
-    /// Set to `true` by any VFS operation that updates `size`, `permissions`,
-    /// or `timestamps`. Cleared when the VFS calls
-    /// [`super::driver::FileSystemInstance::sync_inode`]
-    /// and the driver confirms the write succeeded. The future cache manager
-    /// will use this flag to identify inodes that must be flushed during
-    /// writeback.
-    pub dirty: bool,
-
+    /// Set to `true` by the current VFS read and write operations. The current
+    /// VFS does not clear it. A future sync path should clear it only after
+    /// [`super::driver::FileSystemInstance::sync_inode`] succeeds.
+    pub(crate) dirty: bool,
 }
 
 impl Inode {
@@ -157,11 +166,13 @@ impl Inode {
             inode_number,
             filesystem,
             inode_type,
-            size,
-            permissions,
-            timestamps,
-            link_count,
-            dirty: false,
+            metadata: SpinLock::new(InodeMetadata {
+                size,
+                permissions,
+                timestamps,
+                link_count,
+                dirty: false,
+            }),
         }
     }
 
@@ -202,7 +213,7 @@ impl Inode {
     ///
     /// Returns `true` when `dirty` is set, and `false` otherwise.
     pub fn is_dirty(&self) -> bool {
-        self.dirty
+        self.metadata.lock().dirty
     }
 
     /// Constructs an [`super::types::InodeStat`] snapshot from this inode's
@@ -217,13 +228,14 @@ impl Inode {
     ///
     /// Returns this inode's metadata [`super::types::InodeStat`] snapshot.
     pub fn stat(&self) -> super::types::InodeStat {
+        let metadata = self.metadata.lock();
         super::types::InodeStat {
             inode_number: self.inode_number,
             inode_type:   self.inode_type,
-            size:         self.size,
-            permissions:  self.permissions.clone(),
-            timestamps:   self.timestamps,
-            link_count:   self.link_count,
+            size:         metadata.size,
+            permissions:  metadata.permissions.clone(),
+            timestamps:   metadata.timestamps,
+            link_count:   metadata.link_count,
         }
     }
 }
@@ -231,21 +243,16 @@ impl Inode {
 /// A named reference from a parent directory to a child inode.
 ///
 /// A `DirectoryEntry` is the VFS-layer representation of a single slot in a
-/// directory's child list. It records the child's name, its inode number, its
-/// type (so the path resolver can branch without loading the full inode), and
-/// an optional cached `Arc<Inode>` that is populated the first time the entry
-/// is resolved.
+/// driver-provided directory listing. It records the child's name, its inode
+/// number, its type (so the path resolver can branch without loading the full
+/// inode), and an optional inode reference for callers that retain an entry.
 ///
 /// Filesystem drivers return `DirectoryEntry` values from
 /// [`super::driver::FileSystemInstance::lookup`] and
 /// [`super::driver::FileSystemInstance::read_dir`].
-/// At that point, the `inode` field is `None`; the VFS populates it lazily via
-/// [`super::driver::FileSystemInstance::load_inode`]
-/// the first time the entry is actually traversed or opened.
-///
-/// Storing the loaded `Arc<Inode>` on the entry avoids redundant driver calls
-/// for frequently accessed children, and it forms the in-memory inode cache
-/// for the directory tree.
+/// At that point, the `inode` field is `None`. Ordinary path resolution uses
+/// a fresh listing and does not retain entries between lookups. A caller that
+/// retains an entry may use [`DirectoryEntry::load_inode`] to populate it.
 pub struct DirectoryEntry {
     /// The name of this entry within its parent directory.
     ///
@@ -272,12 +279,9 @@ pub struct DirectoryEntry {
 
     /// The loaded in-memory inode for this entry, if it has been resolved.
     ///
-    /// `None` when the entry was freshly returned by a filesystem driver and
-    /// has not yet been traversed. Set to `Some` by the VFS the first time
-    /// this entry is descended into or opened, by calling
-    /// [`super::driver::FileSystemInstance::load_inode`] with `inode_number`.
-    /// Once set, subsequent traversals reuse the cached `Arc<Inode>` without
-    /// further driver calls.
+    /// `None` when the entry was freshly returned by a filesystem driver.
+    /// A caller retaining the entry can set this to `Some` with `load_inode`
+    /// and reuse that inode through the same entry.
     pub inode: Option<Arc<Inode>>,
 }
 

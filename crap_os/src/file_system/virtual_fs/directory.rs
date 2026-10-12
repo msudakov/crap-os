@@ -2,8 +2,7 @@
 //!
 //! This module defines the [`Directory`] struct, which is the VFS-layer
 //! in-memory representation of a mounted directory. It wraps an [`Inode`] and
-//! adds the state that the VFS needs to traverse the directory tree: a child
-//! list for the current operation and a reference to the parent directory.
+//! adds the parent reference that the VFS needs for `..` traversal.
 //!
 //! [`Directory`] is distinct from the [`Inode`] it wraps. The [`Inode`]
 //! represents the on-disk object and its metadata. The `Directory` represents
@@ -11,15 +10,13 @@
 //! in the namespace, its relationship to adjacent directories, and any mount
 //! point overlaid on top of it.
 //!
-//! A [`Directory`]'s `children` field holds the most recent driver snapshot.
-//! Each lookup refreshes it because several wrappers can refer to the same
-//! directory inode. The VFS mount table determines whether path resolution
-//! crosses into another filesystem.
+//! Each child lookup reads a fresh driver snapshot because several wrappers
+//! can refer to the same directory inode. The VFS mount table determines
+//! whether path resolution crosses into another filesystem.
 
 #![allow(dead_code)]
 
 use alloc::sync::{Arc, Weak};
-use alloc::vec::Vec;
 
 use super::inode::{Inode, DirectoryEntry};
 use super::types::FileSystemError;
@@ -41,9 +38,6 @@ pub enum DirectoryParent {
 /// [`Arc<Directory>`] reference exists, held by the `VirtualFileSystem` root
 /// pointer, a child wrapper, a working directory, or an active path resolution.
 ///
-/// The `children` field holds the last driver snapshot of immediate children.
-/// Every lookup refreshes it so another wrapper's namespace mutation is seen.
-///
 /// Ordinary directories hold a strong reference to their parent so `..` can
 /// traverse from a retained wrapper after the path walk that created it ends.
 /// The global root has no parent. A mounted root holds a weak host reference
@@ -56,16 +50,6 @@ pub struct Directory {
     /// this directory's on-disk state are dispatched through `inode.filesystem`.
     pub inode: Arc<Inode>,
 
-    /// The most recent driver snapshot of this directory's immediate children.
-    ///
-    /// `None` means no snapshot is retained. Every call to
-    /// `ensure_children_loaded` replaces the snapshot from the driver.
-    ///
-    /// Each [`DirectoryEntry`] in the list starts with `inode` set to `None`
-    /// and is promoted to `Some(Arc<Inode>)` lazily when the entry is
-    /// individually resolved.
-    pub children: Option<Vec<DirectoryEntry>>,
-
     /// The parent wrapper used for `..` traversal.
     ///
     /// `None` only for the global root. Ordinary children retain their parent;
@@ -76,7 +60,7 @@ pub struct Directory {
 
 impl Directory {
     /// Constructs a new [`Directory`] wrapper around the given inode with no
-    /// children loaded and no parent.
+    /// parent.
     ///
     /// Used when creating the global root directory during VFS initialization,
     /// before any parent or mount information is available.
@@ -87,20 +71,19 @@ impl Directory {
     ///
     /// # Returns
     ///
-    /// Returns a root wrapper with no parent or loaded children.
+    /// Returns a root wrapper with no parent.
     pub fn new_root(inode: Arc<Inode>) -> Self {
         Self {
             inode,
-            children:   None,
             parent:     None,
         }
     }
 
     /// Constructs a new [`Directory`] wrapper around the given inode with a
-    /// strong parent reference and no children loaded.
+    /// strong parent reference.
     ///
     /// Used by the VFS when materializing a directory during path traversal
-    /// or child-list loading. Retaining the parent keeps `..` valid after the
+    /// path resolution. Retaining the parent keeps `..` valid after the
     /// path walk releases its own reference to that parent.
     ///
     /// # Arguments
@@ -114,7 +97,6 @@ impl Directory {
     pub fn new(inode: Arc<Inode>, parent: Arc<Directory>) -> Self {
         Self {
             inode,
-            children:   None,
             parent:     Some(DirectoryParent::Ordinary(parent)),
         }
     }
@@ -135,40 +117,17 @@ impl Directory {
     pub fn new_mounted_root(inode: Arc<Inode>, host: &Arc<Directory>) -> Self {
         Self {
             inode,
-            children:   None,
             parent:     Some(DirectoryParent::MountedRoot(Arc::downgrade(host))),
         }
     }
 
-    /// Refreshes this directory's child list from the filesystem driver.
-    ///
-    /// Each call replaces `children` with a current driver snapshot. Separate
-    /// wrappers can represent one inode, so a wrapper must not trust its old
-    /// list after a namespace change through another path.
-    ///
-    /// This is the child-list loading seam for the directory tree. All path
-    /// resolver code that needs to inspect a directory's children must call
-    /// this method rather than accessing `children` directly.
-    ///
-    /// # Returns
-    ///
-    /// Returns a shared reference to the loaded `Vec<DirectoryEntry>`, or
-    /// `Err(FileSystemError)` if the driver call fails.
-    pub fn ensure_children_loaded(
-        &mut self,
-    ) -> Result<&Vec<DirectoryEntry>, FileSystemError> {
-        let entries = self.inode.filesystem.read_dir(&self.inode)?;
-        self.children = Some(entries);
-
-        // Safe to unwrap: the successful read assigned Some above.
-        Ok(self.children.as_ref().unwrap())
-    }
-
     /// Looks up a child entry by name in a fresh directory snapshot.
     ///
-    /// The lookup is a linear scan of the child list. This is acceptable at
-    /// this stage; a future optimization could introduce a name-keyed hash map
-    /// as a secondary index on the child list. (TODO: improve the lookup alg.)
+    /// The lookup is a linear scan of the driver's child list. This is
+    /// acceptable at this stage. A name index could be added if directory
+    /// lookup cost becomes a problem.
+    /// The snapshot is dropped after the lookup, so retained wrappers cannot
+    /// hold stale child lists.
     ///
     /// The special names `.` and `..` are not stored as real entries and
     /// will not be found by this method. The path resolver handles those
@@ -181,20 +140,15 @@ impl Directory {
     ///
     /// # Returns
     ///
-    /// Returns a mutable reference to the matching [`DirectoryEntry`] if found,
-    /// `None` if no entry with that name exists, or `Err(FileSystemError)` if
-    /// the child list could not be loaded from the driver.
+    /// Returns the matching owned [`DirectoryEntry`] if found, `None` if no
+    /// entry has that name, or `Err(FileSystemError)` if the driver read fails.
     pub fn lookup_child(
-        &mut self,
+        &self,
         name: &str,
-    ) -> Result<Option<&mut DirectoryEntry>, FileSystemError> {
-        self.ensure_children_loaded()?;
-
-        // Safe to unwrap: ensure_children_loaded guarantees Some on success.
-        Ok(self.children
-            .as_mut()
-            .unwrap()
-            .iter_mut()
+    ) -> Result<Option<DirectoryEntry>, FileSystemError> {
+        Ok(self.inode.filesystem
+            .read_dir(&self.inode)?
+            .into_iter()
             .find(|entry| entry.name == name))
     }
 

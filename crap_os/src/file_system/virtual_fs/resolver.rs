@@ -310,35 +310,12 @@ impl VirtualFileSystem {
                 continue;
             }
 
-            // General component: look it up in the current directory's
-            // child list. Each lookup refreshes it from the driver so other
-            // wrappers' namespace changes are visible.
-            //
-            // We need a mutable reference to the Directory to call
-            // lookup_child (which refreshes the children field). We obtain it
-            // through a raw pointer because Arc does
-            // not hand out mutable references. This is safe because the VFS
-            // lock serializes all access; no other thread can concurrently
-            // mutate the Directory's children.
-            let entry_type;
-            let inode_number;
-            {
-                let dir_ptr = Arc::as_ptr(&current) as *mut Directory;
-                let dir = unsafe { &mut *dir_ptr };
-
-                match dir.lookup_child(component)? {
-                    None => return Err(FileSystemError::NotFound),
-                    Some(entry) => {
-                        entry_type   = entry.entry_type;
-                        inode_number = entry.inode_number;
-
-                        // Eagerly load the inode into the entry's cache if it
-                        // is not already loaded, so the Arc<Inode> is
-                        // available for the match arms below.
-                        entry.load_inode(&current.inode.filesystem)?;
-                    }
-                }
-            }
+            // The driver supplies a fresh entry for each lookup. No mutable
+            // access to the shared directory wrapper is needed.
+            let entry = current.lookup_child(component)?
+                .ok_or(FileSystemError::NotFound)?;
+            let entry_type = entry.entry_type;
+            let inode_number = entry.inode_number;
 
             match entry_type {
                 DirectoryEntryType::File => {
@@ -454,7 +431,7 @@ impl VirtualFileSystem {
     /// This internal helper is used by
     /// [`VirtualFileSystem::resolve_dir_with_budget`] to obtain the
     /// [`Directory`] wrapper when the caller needs it (e.g., for mount
-    /// and unmount operations that must mutate wrapper fields). It duplicates
+    /// and unmount operations that need the host's identity). It duplicates
     /// part of the resolver's walking logic but returns the wrapper instead
     /// of the inode.
     ///
@@ -558,22 +535,11 @@ impl VirtualFileSystem {
                 continue;
             }
 
-            // Look up the child entry and resolve it to a Directory.
-            let entry_type;
-            let inode_number;
-            {
-                let dir_ptr = Arc::as_ptr(&current) as *mut Directory;
-                let dir = unsafe { &mut *dir_ptr };
-
-                match dir.lookup_child(component)? {
-                    None => return Err(FileSystemError::NotFound),
-                    Some(entry) => {
-                        entry_type   = entry.entry_type;
-                        inode_number = entry.inode_number;
-                        entry.load_inode(&current.inode.filesystem)?;
-                    }
-                }
-            }
+            // Look up the child in a fresh driver snapshot.
+            let entry = current.lookup_child(component)?
+                .ok_or(FileSystemError::NotFound)?;
+            let entry_type = entry.entry_type;
+            let inode_number = entry.inode_number;
 
             match entry_type {
                 DirectoryEntryType::File => {

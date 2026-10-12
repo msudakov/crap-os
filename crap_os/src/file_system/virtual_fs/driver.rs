@@ -292,10 +292,11 @@ pub trait FileSystemInstance: Send + Sync {
 
     /// Writes the current in-memory state of `inode` back to disk.
     ///
-    /// The driver reads the generic metadata fields from `inode` (size,
-    /// permissions, timestamps, link count) and persists them to the inode's
-    /// on-disk record. The VFS calls this method whenever it clears the
-    /// `dirty` flag on an inode after modifying its metadata.
+    /// The driver can obtain a consistent snapshot of the generic metadata
+    /// (size, permissions, timestamps, and link count) with `inode.stat()` and
+    /// persist it to the on-disk record. The VFS does not hold the inode's
+    /// metadata lock across driver calls. A future sync path must clear the
+    /// dirty flag only after this method succeeds.
     ///
     /// # Arguments
     ///
@@ -437,8 +438,8 @@ pub trait FileSystemInstance: Send + Sync {
     /// the write extends beyond the file's current size. The driver updates
     /// the inode's on-disk size field if the write extends the file.
     ///
-    /// The VFS updates `inode.size` and sets `inode.dirty` after a successful
-    /// write; the driver need not modify the in-memory `Inode` fields directly.
+    /// The VFS updates the inode's protected in-memory size and dirty flag
+    /// after a successful write; the driver need not modify them directly.
     ///
     /// # Arguments
     ///
@@ -654,11 +655,9 @@ pub trait FileSystemInstance: Send + Sync {
     /// Replaces the permissions on the inode identified by `inode`.
     ///
     /// The driver updates the inode's on-disk permission record with the
-    /// supplied `permissions` value. The VFS sets `inode.dirty` after calling
-    /// this method; a subsequent [`sync_inode`] call will persist the change
-    /// to disk.
-    ///
-    /// [`sync_inode`]: FileSystemInstance::sync_inode
+    /// supplied `permissions` value. A VFS caller must update the protected
+    /// in-memory metadata after this method succeeds. The current VFS has no
+    /// public permission-change operation.
     ///
     /// # Arguments
     ///
@@ -679,11 +678,9 @@ pub trait FileSystemInstance: Send + Sync {
     /// Replaces the timestamps on the inode identified by `inode`.
     ///
     /// The driver updates the inode's on-disk timestamp fields with the
-    /// supplied `timestamps` value. The VFS sets `inode.dirty` after calling
-    /// this method; a subsequent [`sync_inode`] call will persist the change
-    /// to disk.
-    ///
-    /// [`sync_inode`]: FileSystemInstance::sync_inode
+    /// supplied `timestamps` value. A VFS caller must update the protected
+    /// in-memory metadata after this method succeeds. The current VFS has no
+    /// public timestamp-change operation.
     ///
     /// # Arguments
     ///

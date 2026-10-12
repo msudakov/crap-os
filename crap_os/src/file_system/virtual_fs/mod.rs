@@ -23,9 +23,9 @@
 //!   representations onto them.
 //!
 //! - [`directory`] - the [`directory::Directory`] wrapper, which sits above
-//!   an [`inode::Inode`] of type [`types::InodeType::Directory`] and adds
-//!   the VFS-layer state needed for tree traversal: a lazily loaded child
-//!   list, a weak parent reference, and an optional mount-root pointer.
+//!   an [`inode::Inode`] of type [`types::InodeType::Directory`] and retains
+//!   the parent reference needed for `..` traversal. Child lookups read fresh
+//!   driver listings; mount state lives in the VFS mount table.
 //!
 //! - [`file`] - the two-tier open-file model: [`file::File`] is the master
 //!   record (one per inode with at least one open handle, owned by the object

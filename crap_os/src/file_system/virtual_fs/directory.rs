@@ -218,10 +218,6 @@ impl Directory {
     /// through their child's strong reference. A mounted root's host remains
     /// alive through the mount table until unmount.
     ///
-    /// # Arguments
-    ///
-    /// None.
-    ///
     /// # Returns
     ///
     /// Returns the parent, or `InternalError` if there is no parent or a

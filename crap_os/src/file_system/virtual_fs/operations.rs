@@ -396,8 +396,9 @@ impl VirtualFileSystem {
     ///
     /// Returns `Ok(Arc<Inode>)` for the newly created file inode on success,
     /// `Err(FileSystemError::AlreadyExists)` if an entry with that name
-    /// already exists in the parent directory, or other `Err(FileSystemError)`
-    /// variants for resolution and I/O failures.
+    /// already exists in the parent directory,
+    /// `Err(FileSystemError::NotADirectory)` if `path` ends in `/`, or other
+    /// `Err(FileSystemError)` variants for resolution and I/O failures.
     pub fn create_file(
         &mut self,
         path: &str,
@@ -407,6 +408,9 @@ impl VirtualFileSystem {
         FileSystemError>
     {
         let (parent_path, file_name) = split_parent_and_name(path)?;
+        if path.ends_with('/') {
+            return Err(FileSystemError::NotADirectory);
+        }
 
         let parent_dir = self.resolve_dir_with_budget(
             parent_path,
@@ -540,8 +544,9 @@ impl VirtualFileSystem {
     /// Returns `Ok(Arc<Inode>)` for the newly created symlink inode on
     /// success, `Err(FileSystemError::AlreadyExists)` if an entry with that
     /// name already exists, `Err(FileSystemError::InvalidPath)` if `target`
-    /// is empty, or other `Err(FileSystemError)` variants for resolution and
-    /// I/O failures.
+    /// is empty, `Err(FileSystemError::NotADirectory)` if `path` ends in `/`,
+    /// or other `Err(FileSystemError)` variants for resolution and I/O
+    /// failures.
     pub fn create_symlink(
         &mut self,
         path: &str,
@@ -555,6 +560,9 @@ impl VirtualFileSystem {
         }
 
         let (parent_path, link_name) = split_parent_and_name(path)?;
+        if path.ends_with('/') {
+            return Err(FileSystemError::NotADirectory);
+        }
 
         let parent_dir = self.resolve_dir_with_budget(
             parent_path,
@@ -648,6 +656,11 @@ impl VirtualFileSystem {
             let inode = children[index].load_inode(&parent_dir.inode.filesystem)?;
             inode
         };
+
+        // A trailing slash names a directory, never a file or symlink.
+        if path.ends_with('/') && !target_inode.is_directory() {
+            return Err(FileSystemError::NotADirectory);
+        }
 
         // Reject deletion of a mount point directory.
         let target_key = OpenFileKey::new(
@@ -812,6 +825,13 @@ impl VirtualFileSystem {
             children[index].load_inode(&old_parent.inode.filesystem)?
         };
 
+        // Either path may end in `/` only when moving a directory.
+        if (old_path.ends_with('/') || new_path.ends_with('/'))
+            && !moved_inode.is_directory()
+        {
+            return Err(FileSystemError::NotADirectory);
+        }
+
         // Check the destination before changing driver state.
         {
             let dir_ptr = Arc::as_ptr(&new_parent) as *mut Directory;
@@ -932,9 +952,10 @@ impl VirtualFileSystem {
 /// Given `/foo/bar/baz`, returns `("/foo/bar", "baz")`. Given `/baz`, returns
 /// `("/", "baz")`. Given a relative path `foo/bar`, returns `("foo", "bar")`.
 ///
-/// Returns [`FileSystemError::InvalidPath`] if `path` is empty, consists
-/// entirely of `/` separators with no terminal name, or ends with a trailing
-/// `/` (which would produce an empty terminal name).
+/// Trailing slashes are removed to find the terminal name. Callers enforce
+/// whether their operation permits a directory path ending in `/`. Returns
+/// [`FileSystemError::InvalidPath`] if `path` is empty or consists entirely
+/// of `/` separators with no terminal name.
 ///
 /// # Arguments
 ///
@@ -950,8 +971,8 @@ fn split_parent_and_name(path: &str) -> Result<(&str, &str), FileSystemError> {
         return Err(FileSystemError::InvalidPath);
     }
 
-    // Strip a single trailing slash if present to normalize paths like
-    // "/foo/bar/". A path that is nothing but slashes has no terminal name.
+    // Trim trailing slashes to locate the name. The caller checks whether
+    // the operation permits this path form before changing driver state.
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
         return Err(FileSystemError::InvalidPath);

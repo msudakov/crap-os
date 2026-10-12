@@ -120,10 +120,6 @@ impl File {
     /// # Arguments
     ///
     /// * `handle` - The newly created [`FileHandle`] to register.
-    ///
-    /// # Returns
-    ///
-    /// Returns no value.
     pub(super) fn register_handle(&self, handle: &Arc<FileHandle>) {
         self.state.lock().handles.push(Arc::downgrade(handle));
     }
@@ -144,10 +140,6 @@ impl File {
 
     /// Counts the handles registered with this master record.
     ///
-    /// # Arguments
-    ///
-    /// None.
-    ///
     /// # Returns
     ///
     /// Returns the number of registrations that have not been closed.
@@ -160,22 +152,11 @@ impl File {
     /// Called after the filesystem driver removes the inode's last directory
     /// entry. The VFS serializes this operation with open and close.
     ///
-    /// # Arguments
-    ///
-    /// None.
-    ///
-    /// # Returns
-    ///
-    /// Returns no value.
     pub(super) fn mark_pending_deletion(&self) {
         self.state.lock().pending_deletion = true;
     }
 
     /// Checks whether this master must free its inode on the last close.
-    ///
-    /// # Arguments
-    ///
-    /// None.
     ///
     /// # Returns
     ///

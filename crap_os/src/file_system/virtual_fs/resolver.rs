@@ -97,7 +97,9 @@ impl VirtualFileSystem {
     ///   read symlink target).
     ///
     /// Symlinks encountered at non-final components are always followed,
-    /// regardless of this flag.
+    /// regardless of this flag. A trailing slash also makes the preceding
+    /// component non-final, so it must resolve to a directory even when
+    /// `follow_symlinks` is `false`.
     ///
     /// # Arguments
     ///
@@ -226,12 +228,17 @@ impl VirtualFileSystem {
             }
         }
 
-        // Split the path into components, discarding empty strings produced
-        // by leading `/`, trailing `/`, or consecutive `//` separators.
-        let components: Vec<&str> = path
+        // Empty components between separators do not affect traversal. A
+        // trailing slash still requires the final named component to be a
+        // directory, so walk through a final `.` after that component.
+        let mut components: Vec<&str> = path
             .split('/')
             .filter(|c| !c.is_empty())
             .collect();
+
+        if path.ends_with('/') && !components.is_empty() {
+            components.push(".");
+        }
 
         // If after filtering there are no components (e.g., path was "/" or
         // "///"), the path refers to the current directory itself.

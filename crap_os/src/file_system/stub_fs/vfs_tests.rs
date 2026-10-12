@@ -30,7 +30,8 @@
 //! 13. **Wrapper consistency** - compares retained and fresh namespace views.
 //! 14. **Mounted wrappers** - checks mount visibility and real unmount lookup.
 //! 15. **Moved working directory** - checks `..` from a retained wrapper.
-//! 16. **Teardown** - drops the root volume cleanly.
+//! 16. **Trailing slashes** - requires a directory at the end of a path.
+//! 17. **Teardown** - drops the root volume cleanly.
 
 extern crate alloc;
 
@@ -54,11 +55,14 @@ use crate::sprintln;
 /// Initializes the global [`VirtualFileSystem`], registers the stub driver,
 /// mounts the stub volume, runs all operation tests in order, then tears down
 /// the root VFS instance.
-/// Panics on the first assertion failure with a message identifying the
-/// failing test. All pass/fail output is written to the serial port.
+/// All pass/fail output is written to the serial port.
 ///
 /// Must be called after the serial port and wall clock are initialized, and
 /// before any other filesystem use.
+///
+/// # Panics
+///
+/// Panics on the first failed test assertion, identifying the failing case.
 pub fn run_vfs_tests() {
     sprintln!("[VFS TEST] Starting VFS test suite");
     sprintln!("[VFS TEST] ----------------------------------------");
@@ -78,6 +82,7 @@ pub fn run_vfs_tests() {
     test_retained_directory_namespace();
     test_mount_wrapper_consistency();
     test_moved_working_directory_parent();
+    test_trailing_slash_paths();
     test_unmount();
 
     sprintln!("[VFS TEST] ----------------------------------------");
@@ -90,8 +95,6 @@ pub fn run_vfs_tests() {
 
 /// Locks the global VFS and calls `f` with a mutable reference to it.
 ///
-/// Panics if the VFS has not been initialized.
-///
 /// # Arguments
 ///
 /// * `f` - A closure that receives `&mut VirtualFileSystem` and returns `T`.
@@ -99,6 +102,10 @@ pub fn run_vfs_tests() {
 /// # Returns
 ///
 /// Returns the value produced by `f`.
+///
+/// # Panics
+///
+/// Panics if the VFS has not been initialized.
 fn with_vfs<T, F: FnOnce(&mut VirtualFileSystem) -> T>(f: F) -> T {
     let mut guard = globals::VIRTUAL_FILE_SYSTEM.lock();
     let vfs = guard.as_mut().expect("[VFS TEST] VirtualFileSystem not initialized");
@@ -115,6 +122,10 @@ fn with_vfs<T, F: FnOnce(&mut VirtualFileSystem) -> T>(f: F) -> T {
 /// # Returns
 ///
 /// Returns the inner `Ok` value.
+///
+/// # Panics
+///
+/// Panics with `msg` if `result` is `Err`.
 fn expect_ok<T>(result: Result<T, FileSystemError>, msg: &str) -> T {
     match result {
         Ok(v)  => v,
@@ -130,6 +141,10 @@ fn expect_ok<T>(result: Result<T, FileSystemError>, msg: &str) -> T {
 /// * `result`   - The result to check.
 /// * `expected` - The expected error variant.
 /// * `msg`      - The panic message prefix if the assertion fails.
+///
+/// # Panics
+///
+/// Panics if `result` is `Ok` or contains a different error variant.
 fn expect_err<T>(
     result: Result<T, FileSystemError>,
     expected: FileSystemError,
@@ -158,6 +173,10 @@ fn expect_err<T>(
 /// # Returns
 ///
 /// Returns `Arc<FileHandle>` on success.
+///
+/// # Panics
+///
+/// Panics if the VFS cannot open `path`.
 fn open_file(path: &str, access_mode: AccessMode) -> Arc<FileHandle> {
     expect_ok(
         with_vfs(|vfs| vfs.open(path, access_mode, None)),
@@ -171,9 +190,9 @@ fn open_file(path: &str, access_mode: AccessMode) -> Arc<FileHandle> {
 ///
 /// * `handle` - The handle to close. The caller retains it on failure.
 ///
-/// # Returns
+/// # Panics
 ///
-/// Returns no value after a successful close; panics on an error.
+/// Panics if the VFS cannot close `handle`.
 fn close_file(handle: &Arc<FileHandle>) {
     let result = with_vfs(|vfs| vfs.close(handle));
     expect_ok(result, "close");
@@ -184,6 +203,10 @@ fn close_file(handle: &Arc<FileHandle>) {
 // ----------------------------------------------------------------------------
 
 /// Registers the stub driver and mounts the stub volume as the VFS root.
+///
+/// # Panics
+///
+/// Panics if mounting the stub volume or loading its root inode fails.
 fn test_mount_and_register() {
     sprintln!("[VFS TEST] mount and register ...");
 
@@ -219,6 +242,10 @@ fn test_mount_and_register() {
 }
 
 /// Verifies that known paths resolve to inodes with the expected types.
+///
+/// # Panics
+///
+/// Panics if a lookup fails or an inode has the wrong type or metadata.
 fn test_stat() {
     sprintln!("[VFS TEST] stat ...");
 
@@ -281,13 +308,9 @@ fn test_stat() {
 
 /// Verifies registered reads, independent opens, shared clones, and close.
 ///
-/// # Arguments
+/// # Panics
 ///
-/// None.
-///
-/// # Returns
-///
-/// Returns no value; panics when a read or handle-lifecycle check fails.
+/// Panics when a read or handle-lifecycle check fails.
 fn test_read() {
     sprintln!("[VFS TEST] read ...");
 
@@ -391,13 +414,9 @@ fn test_read() {
 
 /// Writes to `/var/log/kernel.log`, then reads back and verifies the content.
 ///
-/// # Arguments
+/// # Panics
 ///
-/// None.
-///
-/// # Returns
-///
-/// Returns no value; panics if writing, reading, or closing fails.
+/// Panics if writing, reading, or closing fails.
 fn test_write() {
     sprintln!("[VFS TEST] write ...");
 
@@ -448,13 +467,9 @@ fn test_write() {
 
 /// Verifies that paths through the `lib -> /etc` symlink resolve correctly.
 ///
-/// # Arguments
+/// # Panics
 ///
-/// None.
-///
-/// # Returns
-///
-/// Returns no value; panics if resolution or reading fails.
+/// Panics if resolution or reading fails.
 fn test_symlink_traversal() {
     sprintln!("[VFS TEST] symlink traversal ...");
 
@@ -495,13 +510,9 @@ fn test_symlink_traversal() {
 
 /// Verifies that `..` resolves both during a walk and from a retained directory.
 ///
-/// # Arguments
+/// # Panics
 ///
-/// None.
-///
-/// # Returns
-///
-/// Returns no value; panics if a path crosses to the wrong parent.
+/// Panics if a path crosses to the wrong parent.
 fn test_dotdot_traversal() {
     sprintln!("[VFS TEST] dot-dot traversal ...");
 
@@ -565,8 +576,12 @@ fn test_dotdot_traversal() {
     sprintln!("[VFS TEST] dot-dot traversal ... PASS");
 }
 
-/// Creates a new file under `/var/log/` and verifies it can be opened and
-/// written to.
+/// Creates a new file under `/var/log/` and verifies its type, size, and
+/// duplicate-name rejection.
+///
+/// # Panics
+///
+/// Panics if file creation or a follow-up lookup fails.
 fn test_create_file() {
     sprintln!("[VFS TEST] create_file ...");
 
@@ -608,6 +623,10 @@ fn test_create_file() {
 }
 
 /// Creates a new directory under `/bin/` and verifies it exists.
+///
+/// # Panics
+///
+/// Panics if directory creation or a follow-up lookup fails.
 fn test_create_directory() {
     sprintln!("[VFS TEST] create_directory ...");
 
@@ -645,13 +664,9 @@ fn test_create_directory() {
 
 /// Creates a new symlink and verifies that traversal through it works.
 ///
-/// # Arguments
+/// # Panics
 ///
-/// None.
-///
-/// # Returns
-///
-/// Returns no value; panics if creation, resolution, or reading fails.
+/// Panics if creation, resolution, or reading fails.
 fn test_create_symlink() {
     sprintln!("[VFS TEST] create_symlink ...");
 
@@ -711,13 +726,9 @@ fn test_create_symlink() {
 /// The relative and cross-directory cases restore their source paths so later
 /// tests can continue to use the original stub filesystem fixtures.
 ///
-/// # Arguments
+/// # Panics
 ///
-/// None.
-///
-/// # Returns
-///
-/// Returns no value; panics if renaming, lookup, or reading fails.
+/// Panics if renaming, lookup, or reading fails.
 fn test_rename() {
     sprintln!("[VFS TEST] rename ...");
 
@@ -848,6 +859,10 @@ fn test_rename() {
 }
 
 /// Deletes `/bin/tools/debug` and verifies it is gone.
+///
+/// # Panics
+///
+/// Panics if deletion fails or the old path remains reachable.
 fn test_delete() {
     sprintln!("[VFS TEST] delete ...");
 
@@ -877,13 +892,9 @@ fn test_delete() {
 /// an open through a retained directory wrapper, and frees on the last close.
 /// Also verifies deletion relative to a working directory.
 ///
-/// # Arguments
+/// # Panics
 ///
-/// None.
-///
-/// # Returns
-///
-/// Returns no value; panics if any deferred-deletion check fails.
+/// Panics if any deferred-deletion check fails.
 fn test_posix_deferred_delete() {
     sprintln!("[VFS TEST] POSIX deferred delete ...");
 
@@ -1033,13 +1044,9 @@ fn test_posix_deferred_delete() {
 
 /// Checks namespace changes through an already loaded working directory.
 ///
-/// # Arguments
+/// # Panics
 ///
-/// None.
-///
-/// # Returns
-///
-/// Returns no value; panics when retained and fresh lookups disagree.
+/// Panics when retained and fresh lookups disagree.
 fn test_retained_directory_namespace() {
     sprintln!("[VFS TEST] retained directory namespace ...");
 
@@ -1116,13 +1123,9 @@ fn test_retained_directory_namespace() {
 
 /// Checks mount visibility and unmount through fresh and retained wrappers.
 ///
-/// # Arguments
+/// # Panics
 ///
-/// None.
-///
-/// # Returns
-///
-/// Returns no value; panics when a mount boundary is missed or unmount fails.
+/// Panics when a mount boundary is missed or unmount fails.
 fn test_mount_wrapper_consistency() {
     sprintln!("[VFS TEST] mount wrapper consistency ...");
 
@@ -1238,13 +1241,9 @@ fn test_mount_wrapper_consistency() {
 /// The driver updates the moved directory's parent on rename. Fresh and
 /// retained wrappers must agree after moving it to `/bin` and back to `/var`.
 ///
-/// # Arguments
+/// # Panics
 ///
-/// None.
-///
-/// # Returns
-///
-/// Returns no value; panics if either parent lookup fails or they disagree.
+/// Panics if either parent lookup fails or they disagree.
 fn test_moved_working_directory_parent() {
     sprintln!("[VFS TEST] moved working directory parent ...");
 
@@ -1311,15 +1310,160 @@ fn test_moved_working_directory_parent() {
     sprintln!("[VFS TEST] moved working directory parent ... PASS");
 }
 
+/// Checks that a trailing slash requires the final component to be a directory.
+///
+/// File creation and lookup must reject a trailing slash without creating or
+/// removing a file. Directory creation, lookup, and removal may use one. A
+/// trailing slash follows a final symlink only when its target is a directory.
+///
+/// # Panics
+///
+/// Panics if an operation returns the wrong result or a rejected operation
+/// changes the namespace.
+fn test_trailing_slash_paths() {
+    sprintln!("[VFS TEST] trailing slash paths ...");
+
+    expect_err(
+        with_vfs(|vfs| vfs.create_file(
+            "/var/log/trailing-file.tmp/",
+            Permissions::all_permissive(),
+            None,
+        )),
+        FileSystemError::NotADirectory,
+        "create_file with trailing slash",
+    );
+    expect_err(
+        with_vfs(|vfs| vfs.stat("/var/log/trailing-file.tmp", None, false)),
+        FileSystemError::NotFound,
+        "file was not created after trailing-slash rejection",
+    );
+
+    let log_dir = expect_ok(
+        with_vfs(|vfs| vfs.resolve_dir_with_budget(
+            "/var/log", None,
+            crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH,
+        )),
+        "resolve /var/log for relative trailing-slash creation",
+    );
+    expect_err(
+        with_vfs(|vfs| vfs.create_file(
+            "trailing-file.tmp/",
+            Permissions::all_permissive(),
+            Some(log_dir),
+        )),
+        FileSystemError::NotADirectory,
+        "relative create_file with trailing slash",
+    );
+
+    expect_err(
+        with_vfs(|vfs| vfs.create_symlink(
+            "/etc/trailing-link/", "/etc/hosts.cfg", None,
+        )),
+        FileSystemError::NotADirectory,
+        "create_symlink with trailing slash",
+    );
+    expect_err(
+        with_vfs(|vfs| vfs.stat("/etc/trailing-link", None, false)),
+        FileSystemError::NotFound,
+        "symlink was not created after trailing-slash rejection",
+    );
+
+    // The deferred-delete test removed config.txt. The rename test restored
+    // hosts.cfg, so it remains a live regular-file fixture here.
+    let regular_file = expect_ok(
+        with_vfs(|vfs| vfs.stat("/etc/hosts.cfg", None, false)),
+        "verify live regular-file fixture for trailing-slash checks",
+    );
+    assert!(regular_file.inode_type == InodeType::File,
+        "[VFS TEST] FAIL - trailing-slash regular-file fixture is not a file");
+    expect_err(
+        with_vfs(|vfs| vfs.stat("/etc/hosts.cfg/", None, false)),
+        FileSystemError::NotADirectory,
+        "stat regular file with trailing slash",
+    );
+    expect_err(
+        with_vfs(|vfs| vfs.open(
+            "/etc/hosts.cfg/", AccessMode::ReadOnly, None,
+        )),
+        FileSystemError::NotADirectory,
+        "open regular file with trailing slash",
+    );
+    expect_err(
+        with_vfs(|vfs| vfs.delete("/etc/hosts.cfg/", None)),
+        FileSystemError::NotADirectory,
+        "delete regular file with trailing slash",
+    );
+    expect_err(
+        with_vfs(|vfs| vfs.rename(
+            "/etc/hosts.cfg/", "/etc/trailing-renamed.txt", None,
+        )),
+        FileSystemError::NotADirectory,
+        "rename regular file from trailing-slash path",
+    );
+    expect_err(
+        with_vfs(|vfs| vfs.rename(
+            "/etc/hosts.cfg", "/etc/trailing-renamed.txt/", None,
+        )),
+        FileSystemError::NotADirectory,
+        "rename regular file to trailing-slash path",
+    );
+    expect_ok(
+        with_vfs(|vfs| vfs.stat("/etc/hosts.cfg", None, false)),
+        "regular file remains after rejected trailing-slash mutations",
+    );
+    expect_err(
+        with_vfs(|vfs| vfs.stat("/etc/trailing-renamed.txt", None, false)),
+        FileSystemError::NotFound,
+        "rename destination was not created after trailing-slash rejection",
+    );
+
+    let linked_directory = expect_ok(
+        with_vfs(|vfs| vfs.stat("/lib/", None, false)),
+        "stat symlink to directory with trailing slash",
+    );
+    assert!(linked_directory.inode_type == InodeType::Directory,
+        "[VFS TEST] FAIL - trailing slash did not follow symlink to directory");
+    expect_ok(
+        with_vfs(|vfs| vfs.create_symlink(
+            "/etc/trailing-file-link", "/etc/hosts.cfg", None,
+        )),
+        "create symlink to live file for trailing-slash lookup",
+    );
+    expect_err(
+        with_vfs(|vfs| vfs.stat("/etc/trailing-file-link/", None, false)),
+        FileSystemError::NotADirectory,
+        "stat symlink to file with trailing slash",
+    );
+    expect_ok(
+        with_vfs(|vfs| vfs.delete("/etc/trailing-file-link", None)),
+        "delete symlink used by trailing-slash lookup",
+    );
+
+    expect_ok(
+        with_vfs(|vfs| vfs.create_directory(
+            "/bin/trailing-dir/", Permissions::all_permissive(), None,
+        )),
+        "create_directory with trailing slash",
+    );
+    let directory = expect_ok(
+        with_vfs(|vfs| vfs.stat("/bin/trailing-dir/", None, false)),
+        "stat directory with trailing slash",
+    );
+    assert!(directory.inode_type == InodeType::Directory,
+        "[VFS TEST] FAIL - trailing-slash directory lookup returned another inode type");
+    expect_ok(
+        with_vfs(|vfs| vfs.delete("/bin/trailing-dir/", None)),
+        "delete directory with trailing slash",
+    );
+
+    sprintln!("[VFS TEST] trailing slash paths ... PASS");
+}
+
 /// Tears down the stub filesystem cleanly.
 ///
-/// # Arguments
+/// # Panics
 ///
-/// None.
-///
-/// # Returns
-///
-/// Returns no value; panics if the global VFS remains initialized.
+/// Panics if the global VFS remains initialized.
 fn test_unmount() {
     sprintln!("[VFS TEST] unmount ...");
 

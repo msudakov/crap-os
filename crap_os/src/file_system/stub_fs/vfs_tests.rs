@@ -17,22 +17,23 @@
 //! 2. **Stat** - resolves known paths and checks inode types and sizes.
 //! 3. **Read** - opens known files and verifies their content byte-for-byte.
 //! 4. **Write** - writes to `kernel.log`, reads back, and verifies.
-//! 5. **Symlink traversal** - resolves paths through the `lib -> /etc` symlink.
-//! 6. **Dot-dot traversal** - resolves `bin/tools/../shell` and verifies.
-//! 7. **Create file** - creates a new file and verifies it can be opened.
-//! 8. **Create directory** - creates a new directory and verifies it exists.
-//! 9. **Create symlink** - creates a new symlink and verifies traversal.
-//! 10. **Rename** - verifies in-place, relative, and cross-directory renames.
-//! 11. **Delete** - deletes a file and verifies it is gone.
-//! 12. **POSIX deferred delete** - checks two independent opens, cached-name
-//!     rejection, final-close reclamation, and deletion relative to a working
-//!     directory.
-//! 13. **Wrapper consistency** - compares retained and fresh namespace views.
-//! 14. **Mounted wrappers** - checks mount visibility, failed unmount recovery,
+//! 5. **Inode coherence** - checks identity and metadata across references.
+//! 6. **Symlink traversal** - resolves paths through the `lib -> /etc` symlink.
+//! 7. **Dot-dot traversal** - resolves `bin/tools/../shell` and verifies.
+//! 8. **Create file** - creates a new file and verifies it can be opened.
+//! 9. **Create directory** - creates a new directory and verifies it exists.
+//! 10. **Create symlink** - creates a new symlink and verifies traversal.
+//! 11. **Rename** - verifies in-place, relative, and cross-directory renames.
+//! 12. **Delete** - deletes a file and verifies it is gone.
+//! 13. **POSIX deferred delete** - checks two independent opens, lookup through
+//!     a retained wrapper after unlink, final-close reclamation, and deletion
+//!     relative to a working directory.
+//! 14. **Wrapper consistency** - compares retained and fresh namespace views.
+//! 15. **Mounted wrappers** - checks mount visibility, failed unmount recovery,
 //!     and real unmount lookup.
-//! 15. **Moved working directory** - checks `..` from a retained wrapper.
-//! 16. **Trailing slashes** - requires a directory at the end of a path.
-//! 17. **Teardown** - drops the root volume cleanly.
+//! 16. **Moved working directory** - checks `..` from a retained wrapper.
+//! 17. **Trailing slashes** - requires a directory at the end of a path.
+//! 18. **Teardown** - drops the root volume cleanly.
 
 extern crate alloc;
 
@@ -72,6 +73,7 @@ pub fn run_vfs_tests() {
     test_stat();
     test_read();
     test_write();
+    test_inode_coherence();
     test_symlink_traversal();
     test_dotdot_traversal();
     test_create_file();
@@ -464,6 +466,73 @@ fn test_write() {
     }
 
     sprintln!("[VFS TEST] write ... PASS");
+}
+
+/// Checks that create, lookup, open, write, and unlink share one live inode.
+///
+/// # Panics
+///
+/// Panics if references disagree about identity, size, or link count, or if
+/// the deleted inode remains allocated after its final close.
+fn test_inode_coherence() {
+    sprintln!("[VFS TEST] inode coherence ...");
+
+    let path = "/var/log/inode-coherence.tmp";
+    let created = expect_ok(
+        with_vfs(|vfs| vfs.create_file(
+            path, Permissions::all_permissive(), None,
+        )),
+        "create file for inode coherence",
+    );
+    let initial = expect_ok(
+        with_vfs(|vfs| vfs.resolve(path, None, false)),
+        "resolve created inode",
+    );
+    assert!(Arc::ptr_eq(&created, &initial),
+        "[VFS TEST] FAIL - create and lookup returned different inodes");
+
+    let handle = open_file(path, AccessMode::ReadWrite);
+    assert!(Arc::ptr_eq(&created, &handle.file.inode),
+        "[VFS TEST] FAIL - open returned a different inode");
+    let data = b"shared inode";
+    let written = expect_ok(
+        with_vfs(|vfs| vfs.write(handle.as_ref(), data)),
+        "write file through canonical inode",
+    );
+    assert!(written == data.len(),
+        "[VFS TEST] FAIL - inode coherence write was short");
+
+    let fresh = expect_ok(
+        with_vfs(|vfs| vfs.resolve(path, None, false)),
+        "resolve inode after write",
+    );
+    assert!(Arc::ptr_eq(&created, &fresh),
+        "[VFS TEST] FAIL - fresh lookup returned a different inode");
+    assert!(created.stat().size == data.len() as u64
+        && fresh.stat().size == data.len() as u64,
+        "[VFS TEST] FAIL - retained and fresh inode sizes disagree");
+
+    expect_ok(
+        with_vfs(|vfs| vfs.delete(path, None)),
+        "unlink file while handle remains open",
+    );
+    assert!(created.stat().link_count == 0
+        && handle.file.inode.stat().link_count == 0,
+        "[VFS TEST] FAIL - retained inode kept its old link count");
+    expect_err(
+        with_vfs(|vfs| vfs.resolve(path, None, false)),
+        FileSystemError::NotFound,
+        "unlinked inode remains reachable by path",
+    );
+
+    close_file(&handle);
+    expect_err(
+        created.filesystem.load_inode(created.inode_number),
+        FileSystemError::NotFound,
+        "unlinked inode was not freed after final close",
+    );
+
+    sprintln!("[VFS TEST] inode coherence ... PASS");
 }
 
 /// Verifies that paths through the `lib -> /etc` symlink resolve correctly.
@@ -899,7 +968,7 @@ fn test_delete() {
 fn test_posix_deferred_delete() {
     sprintln!("[VFS TEST] POSIX deferred delete ...");
 
-    // Retain a wrapper with a loaded entry, then open the file twice.
+    // Retain a directory wrapper, look up its entry, then open the file twice.
     let etc_dir = expect_ok(
         with_vfs(|vfs| vfs.resolve_dir_with_budget(
             "/etc",

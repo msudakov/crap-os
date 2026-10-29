@@ -101,7 +101,7 @@ impl VirtualFileSystem {
         );
 
         // A retained directory wrapper may still name an unlinked inode.
-        // Its open-file master records the deletion across inode reloads.
+        // Its open-file master records the deletion while handles remain.
         if self.open_files.get(&key)
             .is_some_and(|master| master.is_pending_deletion())
         {
@@ -134,7 +134,7 @@ impl VirtualFileSystem {
     /// driver via [`super::driver::FileSystemInstance::read`].
     ///
     /// After a successful read, `accessed` on the underlying inode's timestamps
-    /// is updated, and the inode is marked dirty for a future sync.
+    /// is updated, and the inode is marked dirty for a later sync.
     ///
     /// A read of zero bytes (e.g., because the handle is at the end of the
     /// file) is not an error; the driver returns `0` and the handle position
@@ -194,7 +194,7 @@ impl VirtualFileSystem {
     ///
     /// After a successful write, `modified` and `accessed` on the underlying
     /// inode's timestamps are updated, `size` is updated if the write extended
-    /// the file, and the inode is marked dirty for a future sync.
+    /// the file, and the inode is marked dirty for a later sync.
     /// The handle state is locked through the driver write and offset update so
     /// operations sharing this handle cannot write from the same offset. A
     /// closed handle returns `InvalidHandle` before calling the driver.
@@ -305,6 +305,8 @@ impl VirtualFileSystem {
             && master.is_pending_deletion()
         {
             master.inode.filesystem.free_inode(&master.inode)?;
+            // Only a successful free removes the canonical VFS inode.
+            self.forget_inode(&key);
         }
 
         let remaining = master.unregister_handle(handle)?;
@@ -433,7 +435,7 @@ impl VirtualFileSystem {
             timestamps,
         )?;
 
-        Ok(new_inode)
+        Ok(self.retain_inode(new_inode))
     }
 
     /// Creates a new directory at `path`.
@@ -489,7 +491,7 @@ impl VirtualFileSystem {
             timestamps,
         )?;
 
-        Ok(new_inode)
+        Ok(self.retain_inode(new_inode))
     }
 
     /// Creates a new symbolic link at `path` pointing to `target`.
@@ -558,7 +560,7 @@ impl VirtualFileSystem {
             timestamps,
         )?;
 
-        Ok(new_inode)
+        Ok(self.retain_inode(new_inode))
     }
 
     /// Removes the directory entry for the filesystem object at `path`.
@@ -609,8 +611,9 @@ impl VirtualFileSystem {
         // relative-path semantics and does not follow a final symlink.
         let target_entry = parent_dir.lookup_child(entry_name)?
             .ok_or(FileSystemError::NotFound)?;
-        let target_inode = parent_dir.inode.filesystem
-            .load_inode(target_entry.inode_number)?;
+        let target_inode = self.get_or_load_inode(
+            &parent_dir.inode.filesystem, target_entry.inode_number,
+        )?;
 
         // A trailing slash names a directory, never a file or symlink.
         if path.ends_with('/') && !target_inode.is_directory() {
@@ -671,11 +674,12 @@ impl VirtualFileSystem {
         // immediately or defer until the last handle closes.
         if remaining_links == 0 {
             if let Some(master) = open_master {
-                // The master survives inode reloads until the last close.
+                // The master retains the unlinked inode until the last close.
                 master.mark_pending_deletion();
             } else {
                 // No open handles - free immediately.
                 target_inode.filesystem.free_inode(&target_inode)?;
+                self.forget_inode(&target_key);
             }
         }
 
@@ -759,8 +763,9 @@ impl VirtualFileSystem {
         // identity so a successful directory move can update `..` traversal.
         let moved_entry = old_parent.lookup_child(old_name)?
             .ok_or(FileSystemError::NotFound)?;
-        let moved_inode = old_parent.inode.filesystem
-            .load_inode(moved_entry.inode_number)?;
+        let moved_inode = self.get_or_load_inode(
+            &old_parent.inode.filesystem, moved_entry.inode_number,
+        )?;
 
         // Either path may end in `/` only when moving a directory.
         if (old_path.ends_with('/') || new_path.ends_with('/'))
@@ -799,7 +804,7 @@ impl VirtualFileSystem {
     ///
     /// Called internally after a successful read operation. The `accessed`
     /// field is updated to the current wall-clock time. The inode is marked
-    /// dirty on every successful call for a future sync.
+    /// dirty on every successful call for a later sync.
     ///
     /// # Arguments
     ///

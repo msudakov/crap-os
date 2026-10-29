@@ -28,9 +28,9 @@
 //!   driver listings; mount state lives in the VFS mount table.
 //!
 //! - [`file`] - the two-tier open-file model: [`file::File`] is the master
-//!   record (one per inode with at least one open handle, owned by the object
-//!   manager), and [`file::FileHandle`] is the per-open-call instance (one
-//!   per `open()` call, owned by the calling process's handle table entry).
+//!   record (one per inode with at least one open handle, held in the VFS
+//!   open-file table), and [`file::FileHandle`] is the per-open-call instance
+//!   returned to the caller as an `Arc`.
 //!
 //! - [`driver`] - the [`driver::FileSystemDriver`] and
 //!   [`driver::FileSystemInstance`] traits that every filesystem driver must
@@ -47,7 +47,7 @@
 //!
 //! - [`resolver`] - the path resolution algorithm, implemented as methods on
 //!   [`vfs::VirtualFileSystem`]. Walks a path string component by component
-//!   through the in-memory directory tree, handling `.`, `..`, symlink
+//!   through fresh driver directory listings, handling `.`, `..`, symlink
 //!   following (with a configurable depth limit), and mount boundary crossing
 //!   in both directions.
 //!

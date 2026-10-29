@@ -6,9 +6,9 @@
 //! volume mounting and unmounting, path resolution, file I/O, and namespace
 //! mutation all flow through it.
 //!
-//! The global instance is declared in `globals.rs`, and it is initialized
-//! during kernel boot after the first filesystem driver is registered and the
-//! boot volume is mounted.
+//! The global instance is declared in `globals.rs`. Construction receives an
+//! existing root directory and starts with empty driver and mount tables.
+//! Drivers and additional volumes can then be registered and mounted.
 //!
 //! The [`VirtualFileSystem`] structure owns the namespace and open-file state:
 //!
@@ -23,32 +23,36 @@
 //!   `..` traversal in O(1).
 //! * `relocated_parents` - the current parents of directories moved across
 //!   parent directories, keyed by filesystem and inode identity.
+//! * `inodes` - the VFS-owned in-memory inode for each loaded filesystem and
+//!   inode number. Entries remain until successful free or volume unmount.
 //! * `open_files` - the system-wide open-file table, mapping
 //!   [`super::types::OpenFileKey`] to the [`super::file::File`] master record
 //!   for every inode that currently has at least one open handle.
 //!
-//! The [`VirtualFileSystem`] struct has no interior locking of its own. It is
-//! wrapped in a [`crate::spinlock::StaticIrqSpinLock`] at the global level,
-//! which serializes all access. This is sufficient for the current
-//! single-threaded kernel context. TODO: finer-grained locking can be
-//! introduced later without changing the public interface.
+//! Access through the global instance is serialized by a
+//! [`crate::spinlock::StaticIrqSpinLock`]. The inode table also has a short
+//! inner lock so resolver methods can register inodes through `&self`.
+//! Global VFS calls currently hold their lock across synchronous driver I/O.
 
 #![allow(dead_code)]
 
 use alloc::sync::Arc;
+use alloc::vec::Vec;
 use crate::kernel_hashmap::KernelHashMap;
+use crate::spinlock::SpinLock;
 use super::directory::{Directory, DirectoryParent};
-use super::driver::{BlockDevice, FileSystemDriver};
+use super::driver::{BlockDevice, FileSystemDriver, FileSystemInstance};
 use super::file::File;
+use super::inode::Inode;
 use super::mount::MountPoint;
 use super::types::{FileSystemError, OpenFileKey};
 
 /// The top-level virtual file system structure.
 ///
-/// Owns the global namespace root, the filesystem driver registry, the mount
-/// table, and the system-wide open-file table. All kernel code that interacts
-/// with files, directories, or symlinks does so through this struct, accessed
-/// via the `VIRTUAL_FILE_SYSTEM` global in `globals.rs`.
+/// Owns the global namespace root, the filesystem driver registry, the inode
+/// table, the mount table, and the system-wide open-file table. Kernel code
+/// that interacts with files, directories, or symlinks uses this struct via
+/// the `VIRTUAL_FILE_SYSTEM` global in `globals.rs`.
 ///
 /// See the module-level documentation for a description of each field and the
 /// locking model.
@@ -60,6 +64,15 @@ pub struct VirtualFileSystem {
     /// afterwards. Relative path resolutions start from a per-process working
     /// directory, but that working directory is itself ultimately rooted here.
     pub(super) root: Arc<Directory>,
+
+    /// Canonical VFS inodes keyed by filesystem instance and inode number.
+    ///
+    /// The root inode is registered at construction. Loaded and created
+    /// inodes remain here until successful free or volume unmount. This
+    /// retains modified metadata without a separate eviction policy. The
+    /// outer global VFS lock disables interrupts; this inner lock permits
+    /// resolver methods to update the table through `&self`.
+    inodes: SpinLock<KernelHashMap<OpenFileKey, Arc<Inode>>>,
 
     /// The registry of named filesystem drivers.
     ///
@@ -116,9 +129,9 @@ impl VirtualFileSystem {
     ///
     /// Called once during kernel boot after the boot filesystem driver has
     /// mounted the root volume and produced the root [`Directory`]. The
-    /// driver registry, mount table, mounted-root index, and open-file table
-    /// all start empty. Handle identifiers start at `1`, reserving `0` as an
-    /// invalid sentinel.
+    /// root inode is registered immediately. The driver registry, mount
+    /// table, mounted-root index, and open-file table start empty. Handle
+    /// identifiers start at `1`, reserving `0` as an invalid sentinel.
     ///
     /// # Arguments
     ///
@@ -127,10 +140,19 @@ impl VirtualFileSystem {
     ///
     /// # Returns
     ///
-    /// Returns a VFS with empty tables and a fresh handle ID counter.
+    /// Returns a VFS with its root inode registered and a fresh handle ID
+    /// counter.
     pub fn new(root: Arc<Directory>) -> Self {
+        let mut inodes = KernelHashMap::new();
+        let root_inode = Arc::clone(&root.inode);
+        let root_key = OpenFileKey::new(
+            root_inode.filesystem.instance_id(), root_inode.inode_number,
+        );
+        inodes.insert(root_key, root_inode);
+
         Self {
             root,
+            inodes:             SpinLock::new(inodes),
             drivers:             KernelHashMap::new(),
             mounts:              KernelHashMap::new(),
             mounted_root_index:  KernelHashMap::new(),
@@ -138,6 +160,106 @@ impl VirtualFileSystem {
             open_files:          KernelHashMap::new(),
             next_handle_id:      1,
         }
+    }
+
+    /// Returns the VFS-owned inode for an identity, loading it when absent.
+    ///
+    /// The caller holds the global VFS lock. Do not call the driver while
+    /// holding the inode-table lock; a second lookup after loading preserves
+    /// an inode another caller might have registered in the meantime.
+    ///
+    /// # Arguments
+    ///
+    /// * `filesystem` - Instance that owns the requested inode.
+    /// * `inode_number` - Inode number within that instance.
+    ///
+    /// # Returns
+    ///
+    /// Returns the shared inode, or the driver's loading error.
+    pub(super) fn get_or_load_inode(
+        &self,
+        filesystem: &Arc<dyn FileSystemInstance>,
+        inode_number: u64,
+    ) -> Result<Arc<Inode>, FileSystemError> {
+        let key = OpenFileKey::new(filesystem.instance_id(), inode_number);
+        if let Some(inode) = self.inodes.lock().get(&key).cloned() {
+            return Ok(inode);
+        }
+
+        let loaded = filesystem.load_inode(inode_number)?;
+        Ok(self.retain_inode(loaded))
+    }
+
+    /// Registers a driver-provided inode and returns the VFS-owned reference.
+    ///
+    /// The caller holds the global VFS lock. If the identity is already
+    /// present, its existing metadata remains authoritative.
+    ///
+    /// # Arguments
+    ///
+    /// * `inode` - Inode returned by a driver load or create operation.
+    ///
+    /// # Returns
+    ///
+    /// Returns the existing inode for this identity, or `inode` if new.
+    pub(super) fn retain_inode(&self, inode: Arc<Inode>) -> Arc<Inode> {
+        let key = OpenFileKey::new(
+            inode.filesystem.instance_id(), inode.inode_number,
+        );
+        let mut inodes = self.inodes.lock();
+        if let Some(existing) = inodes.get(&key) {
+            return Arc::clone(existing);
+        }
+
+        inodes.insert(key, Arc::clone(&inode));
+        inode
+    }
+
+    /// Stops returning an inode through the VFS after its storage is freed.
+    ///
+    /// The caller holds the global VFS lock and has received success from
+    /// [`FileSystemInstance::free_inode`]. Other retained `Arc` references
+    /// may still exist but cannot be acquired again through a VFS lookup.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - Identity of the inode whose storage was freed.
+    pub(super) fn forget_inode(&self, key: &OpenFileKey) {
+        self.inodes.lock().remove(key);
+    }
+
+    /// Persists dirty inodes for one mounted filesystem before unmount.
+    ///
+    /// The global VFS lock prevents another VFS operation from changing an
+    /// inode after its successful sync. Clone the references under the table
+    /// lock, then release it before calling the driver.
+    ///
+    /// # Arguments
+    ///
+    /// * `filesystem_id` - Mounted filesystem instance to sync.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` after all dirty inodes sync, or the first driver
+    /// error. Already synced inodes stay clean so a retry only repeats work
+    /// that remains dirty.
+    fn sync_volume_inodes(&self, filesystem_id: u64) -> Result<(), FileSystemError> {
+        let volume_inodes: Vec<Arc<Inode>> = {
+            let inodes = self.inodes.lock();
+            inodes.iter()
+                .filter(|(key, _)| key.filesystem_id == filesystem_id)
+                .map(|(_, inode)| Arc::clone(inode))
+                .collect()
+        };
+
+        for inode in volume_inodes {
+            if inode.is_dirty() {
+                inode.filesystem.sync_inode(&inode)?;
+                inode.metadata.lock().dirty = false;
+            }
+        }
+
+        Ok(())
     }
 
     /// Registers a filesystem driver with the VFS under its declared name.
@@ -169,7 +291,7 @@ impl VirtualFileSystem {
     /// 4. Call [`super::driver::FileSystemDriver::mount`] to produce a live
     ///    [`super::driver::FileSystemInstance`].
     /// 5. Read the driver's unique filesystem instance ID.
-    /// 6. Load the mounted filesystem's root inode via the new instance.
+    /// 6. Load and register the mounted filesystem's root inode.
     /// 7. Wrap the root inode in a [`super::directory::Directory`] with a
     ///    weak parent reference to the host directory.
     /// 8. Insert a [`MountPoint`] into the primary mount table and the
@@ -240,8 +362,12 @@ impl VirtualFileSystem {
             return Err(FileSystemError::NotADirectory);
         }
 
-        // The mount table retains the host. Keep the reverse parent reference
-        // weak to avoid a reference cycle across the mount.
+        // A failed mount must not retain an inode from an unregistered
+        // instance. Register the new root only after validating its type.
+        let root_inode = self.retain_inode(root_inode);
+
+        // The mount table retains both wrappers while mounted. A weak parent
+        // does not keep the host alive after the mount record is removed.
         let mounted_root = Arc::new(Directory::new_mounted_root(
             root_inode,
             &host_dir,
@@ -277,12 +403,11 @@ impl VirtualFileSystem {
     /// 1. Resolve `mount_path` to a directory inode.
     /// 2. Verify a filesystem is currently mounted there.
     /// 3. Verify no open file handles exist on the mounted volume.
-    /// 4. Call [`super::driver::FileSystemInstance::unmount`] to flush pending
-    ///    writes and release driver resources. If it fails, leave the mount
-    ///    records intact so the caller can retry.
-    /// 5. Remove the [`MountPoint`] from the primary mount table, the
-    ///    mounted-root identity from the secondary index, and relocated
-    ///    parent entries for this filesystem instance.
+    /// 4. Sync dirty VFS inodes, then call
+    ///    [`super::driver::FileSystemInstance::unmount`] to flush driver state.
+    ///    If either step fails, leave the mount records intact for retry.
+    /// 5. Remove the [`MountPoint`], mounted-root identity, relocated parents,
+    ///    and VFS inode entries for this filesystem instance.
     ///
     /// The `mount_path` must refer to a directory that currently has a
     /// filesystem mounted on it. Attempting to unmount a path that is not a
@@ -300,7 +425,7 @@ impl VirtualFileSystem {
     ///
     /// Returns `Ok(())` on success, or `Err(FileSystemError)` if the path
     /// cannot be resolved, the directory is not a mount point, open handles
-    /// remain on the volume, or the driver's flush fails.
+    /// remain on the volume, or an inode or driver flush fails.
     pub fn unmount(
         &mut self,
         mount_path: &str,
@@ -343,8 +468,11 @@ impl VirtualFileSystem {
             return Err(FileSystemError::FileLocked);
         }
 
-        // Flush before changing the namespace. A driver error leaves this
-        // mount and its indexes intact so unmount can be retried.
+        // Persist VFS metadata before the driver tears down its own state.
+        // An error leaves the mount and inode table intact for a retry.
+        self.sync_volume_inodes(filesystem_id)?;
+
+        // Flush driver-owned state before changing the namespace.
         mount_point.instance.unmount()?;
 
         // The global VFS lock prevents another path walk from observing these
@@ -356,6 +484,11 @@ impl VirtualFileSystem {
         self.mounted_root_index.remove(&mounted_root_key);
         // No relocated parent from the unmounted volume may outlive it.
         self.relocated_parents
+            .retain(|key, _| key.filesystem_id != filesystem_id);
+
+        // The volume is no longer reachable through the VFS. Release its
+        // retained inodes only after both sync and driver unmount succeeded.
+        self.inodes.lock()
             .retain(|key, _| key.filesystem_id != filesystem_id);
 
         Ok(())
@@ -393,11 +526,8 @@ impl VirtualFileSystem {
         }
 
         // The inode is a directory. To return an Arc<Directory>, we need the
-        // Directory wrapper that owns this inode. We locate it by walking
-        // the path again and returning the final Directory rather than its
-        // inode.
-        // TODO: This is a temporary approach; a future inode cache will make
-        // Directory wrappers directly addressable by inode number.
+        // Directory wrapper for this path. Walk again to return that wrapper
+        // rather than the inode; the inode table does not own wrappers.
         self.resolve_to_dir_wrapper(path, working_directory)
     }
 

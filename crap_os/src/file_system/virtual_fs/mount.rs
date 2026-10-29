@@ -5,11 +5,10 @@
 //!
 //! Every call to [`super::vfs::VirtualFileSystem::mount`] produces one
 //! `MountPoint` and registers it in the VFS mount table, keyed by the inode
-//! identity of the host directory (filesystem instance and inode). Every call to
-//! [`super::vfs::VirtualFileSystem::unmount`] removes the entry and drops the
-//! [`MountPoint`], which in turn drops the [`Arc<dyn FileSystemInstance>`] and
-//! triggers the driver's [`super::driver::FileSystemInstance::unmount`]
-//! cleanup path.
+//! identity of the host directory (filesystem instance and inode). Once an
+//! unmount passes its open-handle check, the VFS syncs dirty inodes and calls
+//! the driver's [`super::driver::FileSystemInstance::unmount`] method. Only
+//! after those steps succeed does it remove and drop the mount record.
 //!
 //! The VFS mount table is the shared source of mount state. Each directory
 //! wrapper can consult it by host identity during downward traversal.
@@ -55,7 +54,8 @@ pub struct MountPoint {
     ///
     /// Used as the `filesystem_id` component of
     /// [`super::types::OpenFileKey`] for all inodes belonging to this volume,
-    /// and as the key for the secondary mounted-root index in the VFS.
+    /// The secondary mounted-root index instead uses the root directory's
+    /// filesystem and inode identity as its key.
     pub filesystem_id: u64,
 
     /// The directory in the parent filesystem on which this volume is mounted.
@@ -75,9 +75,9 @@ pub struct MountPoint {
     /// The live filesystem instance servicing all I/O on this mounted volume.
     ///
     /// All VFS operations on inodes belonging to this volume dispatch through
-    /// this reference. Dropped during unmount, which triggers the driver's
-    /// [`super::driver::FileSystemInstance::unmount`] cleanup path once the
-    /// [`Arc`] reference count reaches zero.
+    /// this reference. The VFS calls
+    /// [`super::driver::FileSystemInstance::unmount`] before removing the
+    /// mount record. Dropping this reference does not call that method.
     pub instance: Arc<dyn FileSystemInstance>,
 }
 

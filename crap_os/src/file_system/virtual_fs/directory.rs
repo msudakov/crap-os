@@ -26,7 +26,7 @@ pub enum DirectoryParent {
     /// Keeps an ordinary parent alive for `..` traversal.
     Ordinary(Arc<Directory>),
 
-    /// Avoids a cycle between a mount host and its mounted root.
+    /// Does not keep the host alive after its mount record is removed.
     MountedRoot(Weak<Directory>),
 }
 
@@ -53,7 +53,8 @@ pub struct Directory {
     /// The parent wrapper used for `..` traversal.
     ///
     /// `None` only for the global root. Ordinary children retain their parent;
-    /// mounted roots use a weak host reference to avoid a reference cycle.
+    /// mounted roots use a weak host reference because the mount table retains
+    /// the host while mounted.
     pub parent: Option<DirectoryParent>,
 
 }
@@ -101,10 +102,10 @@ impl Directory {
         }
     }
 
-    /// Constructs a mounted root whose host retains the mounted root.
+    /// Constructs a mounted root whose host is retained by the mount table.
     ///
-    /// The mount table retains the host while the filesystem is mounted. The
-    /// reverse parent reference is weak to avoid a reference cycle.
+    /// The mount table retains both the host and mounted root while mounted.
+    /// A weak parent does not keep the host alive after that record is removed.
     ///
     /// # Arguments
     ///

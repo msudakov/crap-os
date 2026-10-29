@@ -4,23 +4,24 @@
 //!
 //! - [`File`] is the master record for an open file. There is exactly one
 //!   `File` per unique inode that has at least one open handle anywhere in
-//!   the system. It is owned by the VFS open-file table and persists from the
-//!   moment the first handle to a given inode is opened until the last handle
-//!   is closed. It tracks registered handles and enforces the write-lock
-//!   state and whether its last directory entry has been removed.
+//!   the system. Its table entry persists from the first open until the last
+//!   close. Retained handle references can keep the record allocated after
+//!   removal from the table. It tracks registered handles, write-lock state,
+//!   and whether the inode's last directory entry has been removed.
 //!
 //! - [`FileHandle`] is the per-handle instance created for each individual
-//!   `open()` call. It is owned by the calling process's handle table entry.
+//!   `open()` call. Its caller owns the returned `Arc`; a future process
+//!   handle table can hold that reference.
 //!   It carries the per-handle state that is independent between handles to
 //!   the same file: the current read/write position, and the access mode
 //!   granted at open time. It holds a strong [`Arc<File>`] reference back to
 //!   the master record, keeping the master record alive for at least as long
 //!   as the handle exists.
 //!
-//! The VFS open-file table holds an [`Arc<File>`] for each master
-//! record. Process handle tables hold [`Arc<FileHandle>`] values. The [`File`]
-//! master record holds [`Weak<FileHandle>`] references to track active handles
-//! without preventing their cleanup.
+//! The VFS open-file table holds an [`Arc<File>`] for each master record.
+//! Callers hold [`Arc<FileHandle>`] values. The [`File`] master record holds
+//! [`Weak<FileHandle>`] references to track active handles without preventing
+//! their cleanup.
 //!
 //! The VFS registers each handle before returning from `open`. A successful
 //! `close` removes that exact registration and invalidates all `Arc` clones of
@@ -52,7 +53,8 @@ use super::types::{AccessMode, FileLockState, FileSystemError};
 ///
 /// There is exactly one [`File`] per unique inode that is currently open
 /// anywhere in the system. It is created the first time any process opens the
-/// inode and destroyed when the last handle to it is closed.
+/// inode and removed from the VFS table when the last handle closes. Retained
+/// handle references may keep the record allocated after table removal.
 ///
 /// The [`File`] does not directly track per-handle state such as read position
 /// or access mode. It holds the inode and protects the write-lock state and
@@ -307,9 +309,9 @@ impl File {
 
 /// A per-handle instance representing a single `open()` call on a file.
 ///
-/// Each time a process opens a file, the VFS creates a [`FileHandle`], and the
-/// object manager registers it in the process's handle table. Multiple
-/// processes, or the same process multiple times, may have independent
+/// Each VFS open creates a [`FileHandle`] and returns its registered `Arc`
+/// to the caller. Future process handle tables can own these references.
+/// Multiple processes, or the same process multiple times, may have independent
 /// [`FileHandle`] instances for the same underlying inode; each carries its own
 /// position and access mode.
 ///
@@ -318,9 +320,8 @@ impl File {
 /// VFS close unregisters this open handle. Clones of its `Arc` refer to the
 /// same open handle and become invalid together when it is closed.
 ///
-/// Owned by the process's handle table entry. Dropped when the process closes
-/// the handle explicitly or when the process manager tears down the process's
-/// handle table on exit.
+/// Owned by the caller's `Arc` references. The caller must explicitly close
+/// the handle through the VFS before dropping its last reference.
 pub struct FileHandle {
     /// The master record for the file this handle is open on.
     ///

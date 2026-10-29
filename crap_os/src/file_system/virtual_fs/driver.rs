@@ -33,8 +33,8 @@
 //! offsets and byte lengths. The driver is responsible for all internal block
 //! arithmetic - translating a byte range into the block numbers that must be
 //! read or written, handling partial first and last blocks, and managing block
-//! allocation. The VFS never reasons about block boundaries or block size
-//! except to query `block_size()` once at mount time for cache manager use.
+//! allocation. The VFS does not currently use `block_size()`; a future cache
+//! manager may need the driver's logical block size.
 
 #![allow(dead_code)]
 
@@ -238,10 +238,9 @@ pub trait FileSystemInstance: Send + Sync {
 
     /// Gets the size in bytes of one logical block on this filesystem.
     ///
-    /// Must equal the block size of the underlying [`BlockDevice`]. The VFS
-    /// queries this value once at mount time and stores it in the
-    /// [`super::mount::MountPoint`] for future cache manager use. It must
-    /// remain constant for the lifetime of the instance.
+    /// Must equal the block size of the underlying [`BlockDevice`] and
+    /// remain constant for the lifetime of the instance. The VFS does not
+    /// currently query this value; a future cache manager may use it.
     ///
     /// # Returns
     ///
@@ -274,6 +273,9 @@ pub trait FileSystemInstance: Send + Sync {
     /// [`Arc<dyn FileSystemInstance>`] pointing back to this instance, so that
     /// subsequent VFS operations on the inode can dispatch through it without
     /// an external lookup.
+    /// The driver need not return the same allocation on repeated calls. The
+    /// VFS keeps one in-memory [`Inode`] per filesystem instance and inode
+    /// number while that inode remains registered.
     ///
     /// # Arguments
     ///
@@ -295,8 +297,8 @@ pub trait FileSystemInstance: Send + Sync {
     /// The driver can obtain a consistent snapshot of the generic metadata
     /// (size, permissions, timestamps, and link count) with `inode.stat()` and
     /// persist it to the on-disk record. The VFS does not hold the inode's
-    /// metadata lock across driver calls. A future sync path must clear the
-    /// dirty flag only after this method succeeds.
+    /// metadata lock across driver calls. The VFS clears the dirty flag only
+    /// after this method succeeds during volume unmount.
     ///
     /// # Arguments
     ///

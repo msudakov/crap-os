@@ -1,7 +1,7 @@
 //! # Virtual File System - Path Resolver
 //!
 //! This module implements the VFS path resolver: the algorithm that walks a
-//! path string component by component through the in-memory directory tree
+//! path string component by component through driver directory listings
 //! and produces the [`super::inode::Inode`] or
 //! [`super::directory::Directory`] that the path refers to.
 //!
@@ -328,16 +328,18 @@ impl VirtualFileSystem {
 
                     // Load the inode for the final file component and return
                     // it.
-                    let inode = current.inode.filesystem
-                        .load_inode(inode_number)?;
+                    let inode = self.get_or_load_inode(
+                        &current.inode.filesystem, inode_number,
+                    )?;
                     return Ok(inode);
                 }
 
                 DirectoryEntryType::Directory => {
                     // Load the child directory inode and wrap it in a
                     // Directory so we can descend into it.
-                    let child_inode = current.inode.filesystem
-                        .load_inode(inode_number)?;
+                    let child_inode = self.get_or_load_inode(
+                        &current.inode.filesystem, inode_number,
+                    )?;
 
                     let child_dir = Arc::new(Directory::new(
                         child_inode,
@@ -364,8 +366,9 @@ impl VirtualFileSystem {
                     if is_last && !follow_symlinks {
                         // The caller wants the symlink inode itself, not its
                         // target. Load and return it directly.
-                        let inode = current.inode.filesystem
-                            .load_inode(inode_number)?;
+                        let inode = self.get_or_load_inode(
+                            &current.inode.filesystem, inode_number,
+                        )?;
                         return Ok(inode);
                     }
 
@@ -377,8 +380,9 @@ impl VirtualFileSystem {
                     let remaining_budget = symlink_budget - 1;
 
                     // Read the symlink's target path from the driver.
-                    let symlink_inode = current.inode.filesystem
-                        .load_inode(inode_number)?;
+                    let symlink_inode = self.get_or_load_inode(
+                        &current.inode.filesystem, inode_number,
+                    )?;
                     let target = current.inode.filesystem
                         .read_symlink(&symlink_inode)?;
 
@@ -549,8 +553,9 @@ impl VirtualFileSystem {
                 }
 
                 DirectoryEntryType::Directory => {
-                    let child_inode = current.inode.filesystem
-                        .load_inode(inode_number)?;
+                    let child_inode = self.get_or_load_inode(
+                        &current.inode.filesystem, inode_number,
+                    )?;
 
                     let child_dir = Arc::new(Directory::new(
                         child_inode,
@@ -578,8 +583,9 @@ impl VirtualFileSystem {
                     }
                     let remaining_budget = symlink_budget - 1;
 
-                    let symlink_inode = current.inode.filesystem
-                        .load_inode(inode_number)?;
+                    let symlink_inode = self.get_or_load_inode(
+                        &current.inode.filesystem, inode_number,
+                    )?;
                     let target = current.inode.filesystem
                         .read_symlink(&symlink_inode)?;
 

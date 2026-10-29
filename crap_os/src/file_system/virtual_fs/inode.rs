@@ -31,20 +31,18 @@ use alloc::string::String;
 use crate::spinlock::SpinLock;
 
 use super::types::{
-    FileSystemError, InodeType, DirectoryEntryType, Permissions, Timestamps,
+    InodeType, DirectoryEntryType, Permissions, Timestamps,
 };
 use super::driver::FileSystemInstance;
 
 /// The VFS-layer in-memory representation of a filesystem object.
 ///
 /// An [`Inode`] is an in-memory record for a filesystem object: a file, a
-/// directory, or a symlink. Drivers can load more than one record for the same
-/// on-disk inode. It is created by the VFS when a filesystem driver returns
-/// inode data in response to a
-/// [`super::driver::FileSystemInstance::load_inode`] call, and it remains alive
-/// in memory for as long as any [`super::directory::Directory`] wrapper,
-/// [`super::file::FileHandle`], or [`DirectoryEntry`] holds an
-/// `Arc<Inode>` reference to it.
+/// directory, or a symlink. A driver may construct multiple records for the
+/// same on-disk inode, but the VFS retains one shared record per filesystem
+/// instance and inode number. Its table keeps that record alive until a
+/// successful free or volume unmount; directory wrappers and file handles
+/// may retain references longer.
 ///
 /// The `filesystem` field is a back-reference to the
 /// [`super::driver::FileSystemInstance`] that owns this inode. All driver
@@ -128,9 +126,10 @@ pub(crate) struct InodeMetadata {
     /// Indicates that this inode has been modified in memory but not yet
     /// synced to disk.
     ///
-    /// Set to `true` by the current VFS read and write operations. The current
-    /// VFS does not clear it. A future sync path should clear it only after
-    /// [`super::driver::FileSystemInstance::sync_inode`] succeeds.
+    /// Set to `true` by VFS reads and writes. The VFS clears it after
+    /// [`super::driver::FileSystemInstance::sync_inode`] succeeds during
+    /// volume unmount. A separate sync path for the boot volume is not yet
+    /// implemented.
     pub(crate) dirty: bool,
 }
 
@@ -244,15 +243,14 @@ impl Inode {
 ///
 /// A `DirectoryEntry` is the VFS-layer representation of a single slot in a
 /// driver-provided directory listing. It records the child's name, its inode
-/// number, its type (so the path resolver can branch without loading the full
-/// inode), and an optional inode reference for callers that retain an entry.
+/// number, and its type so the path resolver can branch without loading the
+/// full inode. Inode references are retained by the VFS, not by entries.
 ///
 /// Filesystem drivers return `DirectoryEntry` values from
 /// [`super::driver::FileSystemInstance::lookup`] and
 /// [`super::driver::FileSystemInstance::read_dir`].
-/// At that point, the `inode` field is `None`. Ordinary path resolution uses
-/// a fresh listing and does not retain entries between lookups. A caller that
-/// retains an entry may use [`DirectoryEntry::load_inode`] to populate it.
+/// Path resolution uses a fresh entry and asks the VFS for its shared inode
+/// when the full inode is needed.
 pub struct DirectoryEntry {
     /// The name of this entry within its parent directory.
     ///
@@ -265,9 +263,7 @@ pub struct DirectoryEntry {
     /// The inode number of the filesystem object this entry references,
     /// within the owning filesystem instance.
     ///
-    /// Used to load the full inode on demand via
-    /// [`super::driver::FileSystemInstance::load_inode`] when `inode` is
-    /// `None`.
+    /// Used by the VFS to acquire the full inode on demand.
     pub inode_number: u64,
 
     /// The kind of object the referenced inode represents.
@@ -276,19 +272,10 @@ pub struct DirectoryEntry {
     /// the path resolver to make branching decisions without paying the cost of
     /// loading the full inode first.
     pub entry_type: DirectoryEntryType,
-
-    /// The loaded in-memory inode for this entry, if it has been resolved.
-    ///
-    /// `None` when the entry was freshly returned by a filesystem driver.
-    /// A caller retaining the entry can set this to `Some` with `load_inode`
-    /// and reuse that inode through the same entry.
-    pub inode: Option<Arc<Inode>>,
 }
 
 impl DirectoryEntry {
-    /// Constructs a new `DirectoryEntry` as returned by a filesystem driver:
-    /// name, inode number, and type are known, but the inode has not yet been
-    /// loaded.
+    /// Constructs a `DirectoryEntry` from a name, inode number, and type.
     ///
     /// # Arguments
     ///
@@ -305,77 +292,6 @@ impl DirectoryEntry {
             name,
             inode_number,
             entry_type,
-            inode: None,
         }
-    }
-
-    /// Constructs a new `DirectoryEntry` with a pre-loaded inode.
-    ///
-    /// Used by VFS-internal code when both the directory entry metadata and
-    /// the inode are already available. E.g., when populating the in-memory
-    /// directory tree during an eager boot load of well-known system
-    /// directories.
-    ///
-    /// # Arguments
-    ///
-    /// * `name`         - The entry's name within its parent directory.
-    /// * `inode_number` - The inode number of the referenced filesystem object
-    ///   within the owning filesystem instance.
-    /// * `entry_type`   - The kind of object the referenced inode represents.
-    /// * `inode`        - The already-loaded inode for this entry.
-    pub fn with_inode(
-        name: String,
-        inode_number: u64,
-        entry_type: DirectoryEntryType,
-        inode: Arc<Inode>,
-    ) -> Self {
-        Self {
-            name,
-            inode_number,
-            entry_type,
-            inode: Some(inode),
-        }
-    }
-
-    /// Checks if the inode for this entry has already been loaded into memory.
-    ///
-    /// # Returns
-    ///
-    /// Returns `true` when `inode` is `Some`, and `false` when it is `None`.
-    pub fn is_loaded(&self) -> bool {
-        self.inode.is_some()
-    }
-
-    /// Attempts to load and cache this entry's inode by calling into the
-    /// filesystem driver.
-    ///
-    /// If the inode is already cached in `self.inode`, this method returns
-    /// immediately without calling the driver. Otherwise, it calls
-    /// [`super::driver::FileSystemInstance::load_inode`] on the provided
-    /// `filesystem` reference, caches the result in `self.inode`, and returns
-    /// a clone of the `Arc<Inode>`.
-    ///
-    /// # Arguments
-    ///
-    /// * `filesystem` - The filesystem instance that owns this entry's inode.
-    ///   Must be the same instance from which this `DirectoryEntry` was
-    ///   originally obtained.
-    ///
-    /// # Returns
-    ///
-    /// Returns an `Arc<Inode>` for this entry, either from the cache or freshly
-    /// loaded from the driver. Returns `Err(FileSystemError)` if the driver
-    /// call fails.
-    pub fn load_inode(
-        &mut self,
-        filesystem: &Arc<dyn FileSystemInstance>,
-    ) -> Result<Arc<Inode>, FileSystemError> {
-        if let Some(ref cached) = self.inode {
-            return Ok(Arc::clone(cached));
-        }
-
-        let loaded = filesystem.load_inode(self.inode_number)?;
-        self.inode = Some(Arc::clone(&loaded));
-        Ok(loaded)
     }
 }

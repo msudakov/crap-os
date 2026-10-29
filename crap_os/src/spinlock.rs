@@ -349,10 +349,6 @@ impl<T> IrqSpinLock<T> {
     /// Disables hardware interrupts, then acquires the inner spinlock,
     /// spinning until it is available.
     /// 
-    /// # Arguments
-    ///
-    /// None.
-    ///
     /// # Returns
     /// 
     /// Returns an IrqSpinLockGuard that, when dropped, releases the
@@ -382,10 +378,6 @@ impl<T> IrqSpinLock<T> {
     /// `None` so callers are not left in an interrupt-disabled state
     /// unexpectedly.
     /// 
-    /// # Arguments
-    ///
-    /// None.
-    ///
     /// # Returns
     ///
     /// Returns `Some(guard)` if successful, or `None` if the lock was already
@@ -439,10 +431,6 @@ impl<T> Deref for IrqSpinLockGuard<'_, T> {
 
     /// Borrows the protected value while the inner guard remains present.
     ///
-    /// # Arguments
-    ///
-    /// None.
-    ///
     /// # Returns
     ///
     /// Returns a shared reference to the protected value.
@@ -456,10 +444,6 @@ impl<T> Deref for IrqSpinLockGuard<'_, T> {
 /// Provides transparent write access to the protected `T` through the guard.
 impl<T> DerefMut for IrqSpinLockGuard<'_, T> {
     /// Mutably borrows the protected value while the inner guard is held.
-    ///
-    /// # Arguments
-    ///
-    /// None.
     ///
     /// # Returns
     ///
@@ -481,14 +465,6 @@ impl<T> DerefMut for IrqSpinLockGuard<'_, T> {
 ///
 impl<T> Drop for IrqSpinLockGuard<'_, T> {
     /// Takes and drops the inner guard, then restores interrupt state.
-    ///
-    /// # Arguments
-    ///
-    /// None.
-    ///
-    /// # Returns
-    ///
-    /// Returns no value.
     fn drop(&mut self) {
         // Take the guard to prevent Rust's later field drop from releasing
         // this lock again, then release it before enabling interrupts.

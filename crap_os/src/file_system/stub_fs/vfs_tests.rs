@@ -28,7 +28,8 @@
 //!     rejection, final-close reclamation, and deletion relative to a working
 //!     directory.
 //! 13. **Wrapper consistency** - compares retained and fresh namespace views.
-//! 14. **Mounted wrappers** - checks mount visibility and real unmount lookup.
+//! 14. **Mounted wrappers** - checks mount visibility, failed unmount recovery,
+//!     and real unmount lookup.
 //! 15. **Moved working directory** - checks `..` from a retained wrapper.
 //! 16. **Trailing slashes** - requires a directory at the end of a path.
 //! 17. **Teardown** - drops the root volume cleanly.
@@ -1121,11 +1122,13 @@ fn test_retained_directory_namespace() {
     sprintln!("[VFS TEST] retained directory namespace ... PASS");
 }
 
-/// Checks mount visibility and unmount through fresh and retained wrappers.
+/// Checks mount visibility, failed unmount recovery, and unmount through
+/// fresh and retained wrappers.
 ///
 /// # Panics
 ///
-/// Panics when a mount boundary is missed or unmount fails.
+/// Panics when a mount boundary is missed, a failed unmount removes the mount,
+/// or a later unmount fails.
 fn test_mount_wrapper_consistency() {
     sprintln!("[VFS TEST] mount wrapper consistency ...");
 
@@ -1204,9 +1207,41 @@ fn test_mount_wrapper_consistency() {
         "unmount with an open file on mounted volume",
     );
     close_file(&busy_handle);
+
+    // A failed driver flush must leave both mount indexes intact. The stub
+    // injects one failure for this mounted instance, then permits a retry.
+    super::fail_next_unmount_for(visible_root.filesystem.instance_id());
+    expect_err(
+        with_vfs(|vfs| vfs.unmount("/etc", None)),
+        FileSystemError::DiskWriteError,
+        "unmount with a simulated flush failure",
+    );
+    expect_ok(
+        with_vfs(|vfs| vfs.stat("/etc/bin/shell", None, false)),
+        "fresh path still enters mount after failed unmount",
+    );
+    expect_ok(
+        with_vfs(|vfs| vfs.stat("bin/shell", Some(Arc::clone(&etc_dir)), false)),
+        "retained host still enters mount after failed unmount",
+    );
+    let parent_after_failure = expect_ok(
+        with_vfs(|vfs| vfs.resolve("/etc/..", None, false)),
+        "mounted root still crosses to host after failed unmount",
+    );
+    assert!(
+        parent_after_failure.inode_number == etc_dir.inode.inode_number
+            && parent_after_failure.filesystem.instance_id()
+                == etc_dir.inode.filesystem.instance_id(),
+        "[VFS TEST] FAIL - mounted-root parent index lost after failed unmount",
+    );
+    expect_err(
+        with_vfs(|vfs| vfs.mount("stubfs", device.clone(), "/etc", None)),
+        FileSystemError::AlreadyMounted,
+        "mount remains registered after failed unmount",
+    );
     expect_ok(
         with_vfs(|vfs| vfs.unmount("/etc", None)),
-        "unmount /etc through fresh path",
+        "retry unmount /etc through fresh path",
     );
     expect_err(
         with_vfs(|vfs| vfs.stat("/etc/bin/shell", None, false)),

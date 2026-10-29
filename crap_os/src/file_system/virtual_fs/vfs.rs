@@ -277,11 +277,12 @@ impl VirtualFileSystem {
     /// 1. Resolve `mount_path` to a directory inode.
     /// 2. Verify a filesystem is currently mounted there.
     /// 3. Verify no open file handles exist on the mounted volume.
-    /// 4. Remove the [`MountPoint`] from the primary mount table, the
+    /// 4. Call [`super::driver::FileSystemInstance::unmount`] to flush pending
+    ///    writes and release driver resources. If it fails, leave the mount
+    ///    records intact so the caller can retry.
+    /// 5. Remove the [`MountPoint`] from the primary mount table, the
     ///    mounted-root identity from the secondary index, and relocated
     ///    parent entries for this filesystem instance.
-    /// 5. Call [`super::driver::FileSystemInstance::unmount`] on the instance,
-    ///    which flushes pending writes and releases driver resources.
     ///
     /// The `mount_path` must refer to a directory that currently has a
     /// filesystem mounted on it. Attempting to unmount a path that is not a
@@ -342,9 +343,13 @@ impl VirtualFileSystem {
             return Err(FileSystemError::FileLocked);
         }
 
+        // Flush before changing the namespace. A driver error leaves this
+        // mount and its indexes intact so unmount can be retried.
+        mount_point.instance.unmount()?;
+
         // The global VFS lock prevents another path walk from observing these
         // namespace table updates separately.
-        let mount_point = self.mounts
+        self.mounts
             .remove(&host_key)
             .ok_or(FileSystemError::InternalError)?;
 
@@ -352,12 +357,6 @@ impl VirtualFileSystem {
         // No relocated parent from the unmounted volume may outlive it.
         self.relocated_parents
             .retain(|key, _| key.filesystem_id != filesystem_id);
-
-        // Call the driver's unmount to flush pending writes and release
-        // resources. The MountPoint is dropped at the end of this scope,
-        // which drops the Arc<dyn FileSystemInstance> and, if this was the
-        // last strong reference, invokes the driver's cleanup.
-        mount_point.instance.unmount()?;
 
         Ok(())
     }

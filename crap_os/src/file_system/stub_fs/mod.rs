@@ -4,6 +4,7 @@
 //! development to exercise the VFS layer before a real on-disk filesystem is
 //! available. It implements [`FileSystemDriver`] and [`FileSystemInstance`]
 //! with a hardcoded directory tree and no disk interaction.
+//! The VFS test harness can inject one unmount error to check retry behavior.
 //!
 //! ## Hardcoded Tree
 //!
@@ -96,6 +97,18 @@ const INO_LIB:            u64 = 12;
 /// The next inode number to assign when a new inode is created at runtime
 /// (e.g., via `create_file`). Starts above the last hardcoded number.
 const INO_DYNAMIC_START:  u64 = 13;
+
+/// One-shot unmount failure for the instance selected by the VFS test harness.
+static FAIL_UNMOUNT_ONCE_FOR: SpinLock<Option<u64>> = SpinLock::new(None);
+
+/// Makes the selected stub instance fail its next unmount without changing its state.
+///
+/// # Arguments
+///
+/// * `instance_id` - Identifier of the mounted stub instance to target.
+fn fail_next_unmount_for(instance_id: u64) {
+    *FAIL_UNMOUNT_ONCE_FOR.lock() = Some(instance_id);
+}
 
 // ----------------------------------------------------------------------------
 // StubInode - per-inode metadata record
@@ -757,9 +770,23 @@ impl FileSystemInstance for StubFsInstance {
         Ok(())
     }
 
+    /// Completes unmount, unless the test harness armed a one-shot failure.
+    ///
+    /// A simulated failure leaves this instance usable for a later retry.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Err(DiskWriteError)` once for an armed instance, or `Ok(())`.
     fn unmount(&self) -> Result<(), FileSystemError> {
-        // Nothing to flush; all state is in memory and will be dropped when
-        // the Arc<StubFsInstance> reference count reaches zero.
+        // Exercise the VFS retry path without releasing any instance state.
+        let mut fail_for = FAIL_UNMOUNT_ONCE_FOR.lock();
+        if *fail_for == Some(self.id) {
+            *fail_for = None;
+            return Err(FileSystemError::DiskWriteError);
+        }
+
+        // Nothing to flush; the stub retains its in-memory state until the
+        // last reference to this instance is dropped.
         Ok(())
     }
 }

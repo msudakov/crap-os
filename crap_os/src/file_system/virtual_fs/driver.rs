@@ -703,21 +703,21 @@ pub trait FileSystemInstance: Send + Sync {
     // Mount Lifecycle
     // =========================================================================
 
-    /// Flushes all pending writes and releases all resources held by this
+    /// Flushes all pending writes and releases resources held by this
     /// filesystem instance.
     ///
     /// Called by the VFS during unmount, after verifying that no open file
-    /// handles remain on this volume. The driver must flush any dirty inodes
-    /// or metadata to disk, release any heap allocations it owns, and drop its
-    /// reference to the underlying [`BlockDevice`]. After this call returns,
-    /// the VFS drops the [`Arc<dyn FileSystemInstance>`], which should be the
-    /// last strong reference.
+    /// handles remain on this volume. The driver must flush pending writes
+    /// and filesystem metadata it owns before releasing resources needed for
+    /// filesystem operations. On an error, the instance remains mounted and
+    /// usable so the VFS can retry unmount. On success, the VFS removes the
+    /// mount and drops its reference to the instance; other inode references
+    /// may remain.
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` if all pending state was successfully flushed, or
-    /// `Err(FileSystemError)` if a disk write failed during flush. Even on
-    /// error the instance is considered unmounted and will not receive further
-    /// calls.
+    /// Returns `Ok(())` after a successful flush and teardown, or
+    /// `Err(FileSystemError)` if flushing fails. On error, the driver must
+    /// retain the state needed for normal operations and another unmount call.
     fn unmount(&self) -> Result<(), FileSystemError>;
 }

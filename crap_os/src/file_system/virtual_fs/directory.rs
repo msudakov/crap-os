@@ -34,11 +34,11 @@ pub enum DirectoryParent {
 ///
 /// A [`Directory`] is created when the VFS resolves a directory inode during
 /// path traversal. More than one wrapper can currently represent the same
-/// inode. A wrapper remains alive as long as any
-/// [`Arc<Directory>`] reference exists, held by the `VirtualFileSystem` root
-/// pointer, a child wrapper, a working directory, or an active path resolution.
+/// inode. A wrapper remains alive as long as any [`Arc<Directory>`] reference
+/// exists, held by the `VirtualFileSystem` root pointer, a child wrapper,
+/// a working directory, or an active path resolution.
 ///
-/// Ordinary directories hold a strong reference to their parent so `..` can
+/// Ordinary directories hold a strong reference to their parent, so `..` can
 /// traverse from a retained wrapper after the path walk that created it ends.
 /// The global root has no parent. A mounted root holds a weak host reference
 /// because the mount table retains both wrappers.
@@ -47,14 +47,15 @@ pub struct Directory {
     ///
     /// Carries the directory's inode number, owning filesystem instance,
     /// metadata, permissions, and timestamps. All driver calls related to
-    /// this directory's on-disk state are dispatched through `inode.filesystem`.
+    /// this directory's on-disk state are dispatched through
+    /// `inode.filesystem`.
     pub inode: Arc<Inode>,
 
     /// The parent wrapper used for `..` traversal.
     ///
     /// `None` only for the global root. Ordinary children retain their parent;
-    /// mounted roots use a weak host reference because the mount table retains
-    /// the host while mounted.
+    /// mounted roots use a `Weak` host reference because the mount table
+    /// retains the host while mounted.
     pub parent: Option<DirectoryParent>,
 
 }
@@ -76,7 +77,7 @@ impl Directory {
     pub fn new_root(inode: Arc<Inode>) -> Self {
         Self {
             inode,
-            parent:     None,
+            parent: None,
         }
     }
 
@@ -84,7 +85,7 @@ impl Directory {
     /// strong parent reference.
     ///
     /// Used by the VFS when materializing a directory during path traversal
-    /// path resolution. Retaining the parent keeps `..` valid after the
+    /// and resolution. Retaining the parent keeps `..` valid after the
     /// path walk releases its own reference to that parent.
     ///
     /// # Arguments
@@ -98,14 +99,14 @@ impl Directory {
     pub fn new(inode: Arc<Inode>, parent: Arc<Directory>) -> Self {
         Self {
             inode,
-            parent:     Some(DirectoryParent::Ordinary(parent)),
+            parent: Some(DirectoryParent::Ordinary(parent)),
         }
     }
 
     /// Constructs a mounted root whose host is retained by the mount table.
     ///
-    /// The mount table retains both the host and mounted root while mounted.
-    /// A weak parent does not keep the host alive after that record is removed.
+    /// The mount table retains both the host and mounted root while mounted. A
+    /// `Weak` parent does not keep the host alive after that record is removed.
     ///
     /// # Arguments
     ///
@@ -118,7 +119,7 @@ impl Directory {
     pub fn new_mounted_root(inode: Arc<Inode>, host: &Arc<Directory>) -> Self {
         Self {
             inode,
-            parent:     Some(DirectoryParent::MountedRoot(Arc::downgrade(host))),
+            parent: Some(DirectoryParent::MountedRoot(Arc::downgrade(host))),
         }
     }
 
@@ -126,9 +127,8 @@ impl Directory {
     ///
     /// The lookup is a linear scan of the driver's child list. This is
     /// acceptable at this stage. A name index could be added if directory
-    /// lookup cost becomes a problem.
-    /// The snapshot is dropped after the lookup, so retained wrappers cannot
-    /// hold stale child lists.
+    /// lookup cost becomes a problem. The snapshot is dropped after the lookup,
+    /// so retained wrappers cannot hold stale child lists.
     ///
     /// The special names `.` and `..` are not stored as real entries and
     /// will not be found by this method. The path resolver handles those
@@ -155,8 +155,8 @@ impl Directory {
 
     /// Checks if this directory is the global root of the namespace.
     ///
-    /// A directory is the global root if and only if it has no parent - i.e.,
-    /// `parent` is `None`. There is exactly one such directory in the VFS at
+    /// A directory is the global root if and only if it has no parent (i.e.,
+    /// `parent` is `None`). There is exactly one such directory in the VFS at
     /// any time: the root of the boot filesystem, mounted at `/`.
     ///
     /// # Returns

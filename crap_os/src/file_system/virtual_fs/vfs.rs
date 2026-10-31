@@ -6,9 +6,9 @@
 //! volume mounting and unmounting, path resolution, file I/O, and namespace
 //! mutation all flow through it.
 //!
-//! The global instance is declared in `globals.rs`. Construction receives an
-//! existing root directory and starts with empty driver and mount tables.
-//! Drivers and additional volumes can then be registered and mounted.
+//! Construction receives an existing root directory and starts with empty
+//! driver and mount tables. Drivers and additional volumes can then be
+//! registered and mounted.
 //!
 //! The [`VirtualFileSystem`] structure owns the namespace and open-file state:
 //!
@@ -38,8 +38,10 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+
 use crate::kernel_hashmap::KernelHashMap;
 use crate::spinlock::SpinLock;
+
 use super::directory::{Directory, DirectoryParent};
 use super::driver::{BlockDevice, FileSystemDriver, FileSystemInstance};
 use super::file::File;
@@ -78,16 +80,16 @@ pub struct VirtualFileSystem {
     ///
     /// Keyed by the driver's short name string (e.g., `fat32`, etc.). Populated
     /// at kernel boot by calls to [`VirtualFileSystem::register_driver`]. The
-    /// VFS looks up a driver by name when[`VirtualFileSystem::mount`] is
+    /// VFS looks up a driver by name when [`VirtualFileSystem::mount`] is
     /// called.
     drivers: KernelHashMap<&'static str, Arc<dyn FileSystemDriver>>,
 
     /// The primary mount table.
     ///
     /// Keyed by the instance ID and inode number of the host directory (the
-    /// directory in the parent filesystem on which a volume is mounted). Each value is the
-    /// [`MountPoint`] object for that mount. Used during unmount and for
-    /// mount enumeration.
+    /// directory in the parent filesystem on which a volume is mounted). Each
+    /// value is the [`MountPoint`] object for that mount. Used during unmount
+    /// and for mount enumeration.
     pub(super) mounts: KernelHashMap<OpenFileKey, MountPoint>,
 
     /// A secondary index from mounted-root identity to host identity.
@@ -137,11 +139,6 @@ impl VirtualFileSystem {
     ///
     /// * `root` - The root directory of the boot volume, representing `/` in
     ///   the unified namespace.
-    ///
-    /// # Returns
-    ///
-    /// Returns a VFS with its root inode registered and a fresh handle ID
-    /// counter.
     pub fn new(root: Arc<Directory>) -> Self {
         let mut inodes = KernelHashMap::new();
         let root_inode = Arc::clone(&root.inode);
@@ -170,7 +167,7 @@ impl VirtualFileSystem {
     ///
     /// # Arguments
     ///
-    /// * `filesystem` - Instance that owns the requested inode.
+    /// * `filesystem`   - Instance that owns the requested inode.
     /// * `inode_number` - Inode number within that instance.
     ///
     /// # Returns
@@ -206,6 +203,7 @@ impl VirtualFileSystem {
         let key = OpenFileKey::new(
             inode.filesystem.instance_id(), inode.inode_number,
         );
+
         let mut inodes = self.inodes.lock();
         if let Some(existing) = inodes.get(&key) {
             return Arc::clone(existing);
@@ -264,10 +262,10 @@ impl VirtualFileSystem {
 
     /// Registers a filesystem driver with the VFS under its declared name.
     ///
-    /// The driver's name (returned by
-    /// [`super::driver::FileSystemDriver::name`]) is used as the registry key.
-    /// If a driver with the same name is already registered, the existing
-    /// entry is replaced, and the old driver is dropped.
+    /// The driver's name returned by [`super::driver::FileSystemDriver::name`]
+    /// is used as the registry key. If a driver with the same name is already
+    /// registered, the existing entry is replaced, and the old driver is
+    /// dropped.
     ///
     /// Drivers are typically registered once during kernel boot, before any
     /// volumes are mounted.
@@ -332,9 +330,8 @@ impl VirtualFileSystem {
         )?;
 
         // Reject the mount if a filesystem is already mounted here.
-        let host_key = OpenFileKey::new(
-            host_dir.inode.filesystem.instance_id(), host_dir.inode.inode_number,
-        );
+        let host_key = OpenFileKey::new(host_dir.inode.filesystem.instance_id(),
+            host_dir.inode.inode_number);
         if self.mounts.get(&host_key).is_some() {
             return Err(FileSystemError::AlreadyMounted);
         }
@@ -437,16 +434,15 @@ impl VirtualFileSystem {
             working_directory,
         )?;
 
-        let host_key = OpenFileKey::new(
-            host_dir.inode.filesystem.instance_id(), host_dir.inode.inode_number,
-        );
+        let host_key = OpenFileKey::new(host_dir.inode.filesystem.instance_id(),
+            host_dir.inode.inode_number);
 
         // Verify a filesystem is actually mounted here.
         if self.mounts.get(&host_key).is_none() {
             return Err(FileSystemError::NotMounted);
         }
 
-        // Retrieve the MountPoint so that we can check for open handles and
+        // Retrieve the MountPoint, so that we can check for open handles and
         // obtain the mounted-root identity for the secondary index.
         let mount_point = self.mounts
             .get(&host_key)
@@ -463,7 +459,6 @@ impl VirtualFileSystem {
         let has_open_files = self.open_files
             .keys()
             .any(|key| key.filesystem_id == filesystem_id);
-
         if has_open_files {
             return Err(FileSystemError::FileLocked);
         }
@@ -486,8 +481,8 @@ impl VirtualFileSystem {
         self.relocated_parents
             .retain(|key, _| key.filesystem_id != filesystem_id);
 
-        // The volume is no longer reachable through the VFS. Release its
-        // retained inodes only after both sync and driver unmount succeeded.
+        // The mount has been detached from its host. Release this instance's
+        // inode-table entries after both sync and driver unmount succeeded.
         self.inodes.lock()
             .retain(|key, _| key.filesystem_id != filesystem_id);
 
@@ -505,8 +500,8 @@ impl VirtualFileSystem {
     /// # Arguments
     ///
     /// * `path`              - The path string to resolve.
-    /// * `working_directory` - The working directory for relative paths.
-    ///   `None` means use the global root.
+    /// * `working_directory` - The working directory for relative paths. `None`
+    ///   means use the global root.
     ///
     /// # Returns
     ///
@@ -562,7 +557,7 @@ impl VirtualFileSystem {
     /// Resolves `path` to the [`Directory`] wrapper for the terminal
     /// component, without loading a separate inode.
     ///
-    /// This internal helper mirrors the path resolver's logic but returns the
+    /// This internal helper mirrors the path resolver's logic, but returns the
     /// [`Directory`] wrapper for the final component rather than its
     /// [`Inode`]. It is used by [`VirtualFileSystem::resolve_to_directory`]
     /// and by [`VirtualFileSystem::mount`] and [`VirtualFileSystem::unmount`],

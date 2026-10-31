@@ -3,7 +3,7 @@
 //! This module implements the file operation methods on
 //! [`super::vfs::VirtualFileSystem`]: the public interface that all kernel
 //! code uses to open, read, write, close, seek, stat, create, delete, rename,
-//! and create symlinks.
+//! and create.
 //!
 //! These methods are the bridge between the abstract VFS layer and the
 //! filesystem drivers below. Each method resolves its path argument to an
@@ -57,8 +57,9 @@ impl VirtualFileSystem {
     /// created for this open call, registered with the master record, and
     /// returned to the caller.
     ///
-    /// The VFS wraps the handle in an [`Arc`] and registers it before returning.
-    /// The caller owns that registered handle and must close it explicitly.
+    /// The VFS wraps the handle in an [`Arc`] and registers it before
+    /// returning. The caller owns that registered handle and must close it
+    /// explicitly.
     ///
     /// If `path` resolves to a symlink, the symlink is followed and the
     /// target file is opened. To open the symlink inode itself, use a path
@@ -95,10 +96,8 @@ impl VirtualFileSystem {
             return Err(FileSystemError::NotAFile);
         }
 
-        let key = OpenFileKey::new(
-            inode.filesystem.instance_id(),
-            inode.inode_number,
-        );
+        let key = OpenFileKey::new(inode.filesystem.instance_id(),
+            inode.inode_number);
 
         // A retained directory wrapper may still name an unlinked inode.
         // Its open-file master records the deletion while handles remain.
@@ -278,10 +277,8 @@ impl VirtualFileSystem {
         &mut self,
         handle: &Arc<FileHandle>,
     ) -> Result<(), FileSystemError> {
-        let key = OpenFileKey::new(
-            handle.file.inode.filesystem.instance_id(),
-            handle.file.inode.inode_number,
-        );
+        let key = OpenFileKey::new(handle.file.inode.filesystem.instance_id(),
+            handle.file.inode.inode_number);
 
         let master = Arc::clone(
             self.open_files.get(&key)
@@ -339,7 +336,8 @@ impl VirtualFileSystem {
     ///
     /// Returns `Ok(())` after seeking, or `InvalidHandle` if the handle was
     /// closed.
-    pub fn seek(&self, handle: &FileHandle, offset: u64) -> Result<(), FileSystemError> {
+    pub fn seek(&self, handle: &FileHandle, offset: u64
+    ) -> Result<(), FileSystemError> {
         handle.seek_to(offset)
     }
 
@@ -622,8 +620,7 @@ impl VirtualFileSystem {
 
         // Reject deletion of a mount point directory.
         let target_key = OpenFileKey::new(
-            target_inode.filesystem.instance_id(), target_inode.inode_number,
-        );
+            target_inode.filesystem.instance_id(), target_inode.inode_number);
         if self.mounts.get(&target_key).is_some() {
             return Err(FileSystemError::AlreadyMounted);
         }
@@ -744,15 +741,16 @@ impl VirtualFileSystem {
 
         // Reject cross-filesystem renames.
         let old_filesystem_id = old_parent.inode.filesystem.instance_id();
-        let new_filesystem_id = resolved_new_parent.inode.filesystem.instance_id();
+        let new_filesystem_id =
+            resolved_new_parent.inode.filesystem.instance_id();
         if old_filesystem_id != new_filesystem_id {
             return Err(FileSystemError::InvalidPath);
         }
 
         // Two path walks can produce different wrappers for the same directory.
         // Use one wrapper for both sides of an in-place rename.
-        let same_parent =
-            old_parent.inode.inode_number == resolved_new_parent.inode.inode_number;
+        let same_parent = old_parent.inode.inode_number ==
+            resolved_new_parent.inode.inode_number;
         let new_parent = if same_parent {
             Arc::clone(&old_parent)
         } else {
@@ -760,7 +758,7 @@ impl VirtualFileSystem {
         };
 
         // Check the source before asking the driver to rename it. Retain its
-        // identity so a successful directory move can update `..` traversal.
+        // identity, so a successful directory move can update `..` traversal.
         let moved_entry = old_parent.lookup_child(old_name)?
             .ok_or(FileSystemError::NotFound)?;
         let moved_inode = self.get_or_load_inode(
@@ -787,7 +785,7 @@ impl VirtualFileSystem {
             new_name,
         )?;
 
-        // Resolve the current parent by inode identity so retained and fresh
+        // Resolve the current parent by inode identity, so retained and fresh
         // wrappers agree after a cross-directory move.
         if moved_inode.is_directory() && !same_parent {
             let key = OpenFileKey::new(
@@ -842,7 +840,8 @@ impl VirtualFileSystem {
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` always.
+    /// Returns `Ok(())` always. The signature returns `Result` for consistency
+    /// with other internal helpers that may fail in future extensions.
     fn touch_modified(
         &self,
         inode: &Arc<super::inode::Inode>,
@@ -892,12 +891,12 @@ fn split_parent_and_name(path: &str) -> Result<(&str, &str), FileSystemError> {
     }
 
     match trimmed.rfind('/') {
-        // No slash at all - relative path with a single component like "foo".
-        // The parent is the working directory (represented as ".") and the
+        // No slash at all - relative path with a single component like `foo`.
+        // The parent is the working directory (represented as `.`) and the
         // name is the entire trimmed string.
         None => Ok((".", trimmed)),
 
-        // Slash at position 0 means the parent is the root "/".
+        // Slash at position 0 means the parent is the root `/`.
         Some(0) => {
             let name = &trimmed[1..];
             if name.is_empty() {

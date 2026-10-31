@@ -32,7 +32,7 @@ use super::driver::FileSystemInstance;
 /// in the VFS namespace.
 ///
 /// A [`MountPoint`] ties together three things: the host directory that is
-/// being overlaid (the directory in the parent filesystem on which this volume
+/// being overlaid (the directory in the parent filesystem, on which this volume
 /// is mounted), the root directory of the mounted filesystem (the directory
 /// that the path resolver switches to when it crosses the boundary downward),
 /// and the live [`FileSystemInstance`] that services all I/O on the mounted
@@ -61,7 +61,7 @@ pub struct MountPoint {
     /// The directory in the parent filesystem on which this volume is mounted.
     ///
     /// The path resolver uses this reference when handling a `..` component
-    /// at the root of the mounted filesystem - it crosses back up to this
+    /// at the root of the mounted filesystem; it crosses back up to this
     /// directory rather than staying at the mounted root. The VFS also uses
     /// this reference when resolving an unmount path to the covered host.
     pub host_directory: Arc<Directory>,

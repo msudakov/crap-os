@@ -12,10 +12,7 @@
 //! responsibility:
 //!
 //! - [`types`] - foundational enums and structs shared across all other VFS
-//!   submodules: [`types::FileSystemError`], [`types::InodeType`],
-//!   [`types::DirectoryEntryType`], [`types::AccessMode`],
-//!   [`types::FileLockState`], [`types::Timestamps`], [`types::Permissions`],
-//!   [`types::InodeStat`], and [`types::OpenFileKey`].
+//!   submodules.
 //!
 //! - [`inode`] - the in-memory inode ([`inode::Inode`]) and directory entry
 //!   ([`inode::DirectoryEntry`]) types. These are the two most fundamental

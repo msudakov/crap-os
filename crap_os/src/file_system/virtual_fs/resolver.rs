@@ -19,8 +19,8 @@
 //!    * `.`  - stay in the current directory and continue.
 //!    * `..` - move to the parent directory, crossing mount boundaries upward
 //!             if necessary.
-//!    * Any other name - look it up in a fresh driver child list, then act on the
-//!      result type (file, directory, or symlink).
+//!    * Any other name - look it up in a fresh driver child list, then act on
+//!      the result type (file, directory, or symlink).
 //! 4. After processing the final component, return the resolved inode (or
 //!    directory wrapper, depending on the entry point).
 //!
@@ -40,8 +40,8 @@
 //!
 //! To prevent infinite loops from circular symlink chains, the resolver
 //! carries a `symlink_budget` counter. Each symlink followed decrements the
-//! budget; when it reaches zero,
-//! [`super::types::FileSystemError::TooManySymlinks`] is returned.
+//! budget; when it reaches zero, the next symlink follow results in
+//! [`super::types::FileSystemError::TooManySymlinks`] being returned.
 //! The initial budget is [`MAX_SYMLINK_DEPTH`].
 //!
 //! ## Mount Boundary Crossing
@@ -68,11 +68,12 @@ use super::vfs::VirtualFileSystem;
 /// The maximum number of symlink hops the resolver will follow before
 /// returning [`super::types::FileSystemError::TooManySymlinks`].
 ///
-/// Each symlink encountered during resolution decrements an internal counter
-/// initialized to this value. When the counter reaches zero, the resolver
-/// aborts with an error. A value of 16 is sufficient for all legitimate use
-/// cases (real symlink chains are rarely deeper than 3-4 hops) while being
-/// low enough to keep the worst-case recursive stack depth manageable.
+/// Each symlink followed during resolution decrements an internal counter
+/// initialized to this value. The resolver returns `TooManySymlinks` only
+/// when another symlink must be followed with no budget remaining. A value of
+/// 16 is sufficient for all legitimate use cases (real symlink chains are
+/// rarely deeper than 3-4 hops) while being low enough to keep the worst-case
+/// recursive stack depth manageable.
 pub const MAX_SYMLINK_DEPTH: u8 = 16;
 
 impl VirtualFileSystem {
@@ -210,7 +211,7 @@ impl VirtualFileSystem {
 
         // Determine the starting directory. Absolute paths always start at
         // the global root; relative paths start from the supplied working
-        // directory, falling back to root if none is provided.
+        // directory, falling back to root if `None` is provided.
         let mut current: Arc<Directory> = if path.starts_with('/') {
             Arc::clone(&self.root)
         } else {
@@ -220,9 +221,8 @@ impl VirtualFileSystem {
         // A retained working directory can become a mount host after it was
         // acquired. Resolve relative paths in the visible mounted tree.
         if !path.starts_with('/') {
-            let key = OpenFileKey::new(
-                current.inode.filesystem.instance_id(), current.inode.inode_number,
-            );
+            let key = OpenFileKey::new(current.inode.filesystem.instance_id(),
+                current.inode.inode_number);
             if let Some(mount_point) = self.mounts.get(&key) {
                 current = Arc::clone(&mount_point.mounted_root);
             }
@@ -240,8 +240,8 @@ impl VirtualFileSystem {
             components.push(".");
         }
 
-        // If after filtering there are no components (e.g., path was "/" or
-        // "///"), the path refers to the current directory itself.
+        // If after filtering there are no components (e.g., path was `/` or
+        // `///`), the path refers to the current directory itself.
         if components.is_empty() {
             return Ok(Arc::clone(&current.inode));
         }
@@ -251,7 +251,7 @@ impl VirtualFileSystem {
         for (index, &component) in components.iter().enumerate() {
             let is_last = index == last_index;
 
-            // "." always refers to the current directory. No lookup needed;
+            // `.` always refers to the current directory. No lookup needed;
             // just continue to the next component. If this is the last
             // component, the current directory's inode is the result.
             if component == "." {
@@ -261,21 +261,22 @@ impl VirtualFileSystem {
                 continue;
             }
 
-            // ".." moves to the parent directory. Three cases apply:
+            // `..` moves to the parent directory. Three cases apply:
             if component == ".." {
                 if current.is_root() {
-                    // We are already at the global root; ".." is a no-op.
+                    // We are already at the global root; `..` is a no-op.
                     if is_last {
                         return Ok(Arc::clone(&current.inode));
                     }
                     continue;
                 }
 
-                // We are at the root of a mounted filesystem;  check whether
+                // We are at the root of a mounted filesystem; check whether
                 // the current directory is a mounted root by looking up its
                 // filesystem and inode identity in the secondary index.
                 let current_key = OpenFileKey::new(
-                    current.inode.filesystem.instance_id(), current.inode.inode_number,
+                    current.inode.filesystem.instance_id(),
+                    current.inode.inode_number,
                 );
                 if let Some(&host_key) = self
                     .mounted_root_index
@@ -298,9 +299,9 @@ impl VirtualFileSystem {
 
                 // A moved directory may have a retained wrapper with its old
                 // parent. Prefer the current parent recorded by the VFS.
-                current = if let Some(parent) = self.relocated_parents.get(&current_key) {
-                    Arc::clone(parent)
-                } else {
+                current = if let Some(parent) = self.relocated_parents.get(
+                    &current_key) { Arc::clone(parent) }
+                else {
                     current.parent()?
                 };
 
@@ -387,11 +388,10 @@ impl VirtualFileSystem {
                         .read_symlink(&symlink_inode)?;
 
                     // Build the effective path by appending any remaining
-                    // components after the symlink onto the target. For
-                    // example, if the path is "/foo/link/bar/baz" and
-                    // "link" resolves to a symlink with target "../qux",
-                    // the effective path for the recursive call is
-                    // "../qux/bar/baz".
+                    // components after the symlink onto the target. E.g., if
+                    // if the path is `/foo/link/bar/baz`, and "link" resolves
+                    // to a symlink with target `../qux`, the effective path for
+                    // the recursive call is `../qux/bar/baz`.
                     let effective_path = if index < last_index {
                         let remaining: Vec<&str> =
                             components[index + 1..].to_vec();
@@ -470,9 +470,8 @@ impl VirtualFileSystem {
 
         // Apply a mount added after the caller retained its working directory.
         if !path.starts_with('/') {
-            let key = OpenFileKey::new(
-                current.inode.filesystem.instance_id(), current.inode.inode_number,
-            );
+            let key = OpenFileKey::new(current.inode.filesystem.instance_id(),
+                current.inode.inode_number);
             if let Some(mount_point) = self.mounts.get(&key) {
                 current = Arc::clone(&mount_point.mounted_root);
             }
@@ -508,7 +507,8 @@ impl VirtualFileSystem {
                 }
 
                 let current_key = OpenFileKey::new(
-                    current.inode.filesystem.instance_id(), current.inode.inode_number,
+                    current.inode.filesystem.instance_id(),
+                    current.inode.inode_number,
                 );
                 if let Some(&host_key) = self
                     .mounted_root_index

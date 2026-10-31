@@ -75,9 +75,9 @@ pub struct Inode {
 
     /// The kind of filesystem object this inode represents.
     ///
-    /// Determines how the VFS interprets the inode during path resolution and
-    /// which wrapper type (`Directory`, `File`, or `Symlink` handling) is used
-    /// above it.
+    /// Determines how the VFS interprets the inode during path resolution.
+    /// Directories use namespace wrappers, regular files use open-file records,
+    /// and symlinks are handled directly through their inodes.
     pub inode_type: InodeType,
 
     /// Mutable metadata shared by references to this in-memory inode.
@@ -100,7 +100,7 @@ pub(crate) struct InodeMetadata {
     /// The access-control permissions associated with this inode.
     ///
     /// Currently a placeholder pending the full ACL model design. All
-    /// permission checks in the VFS treat any `Permissions` value as
+    /// permission checks in the VFS treat any [`Permissions`] value as
     /// universally permissive until the real model is in place. See
     /// [`super::types::Permissions`].
     pub(crate) permissions: Permissions,
@@ -134,13 +134,12 @@ pub(crate) struct InodeMetadata {
 }
 
 impl Inode {
-    /// Constructs a new `Inode` with the supplied identity, type, and
+    /// Constructs a new [`Inode`] with the supplied identity, type, and
     /// metadata.
     ///
-    /// `dirty` is initialized to `false`. The caller is
-    /// responsible for supplying an accurate `size`
-    /// for files and symlinks; for directories, `0` is an acceptable initial
-    /// value.
+    /// The `dirty` field is initialized to `false`. The caller is responsible
+    /// for supplying an accurate `size` for files and symlinks; for
+    /// directories, `0` is an acceptable initial value.
     ///
     /// # Arguments
     ///
@@ -241,16 +240,16 @@ impl Inode {
 
 /// A named reference from a parent directory to a child inode.
 ///
-/// A `DirectoryEntry` is the VFS-layer representation of a single slot in a
+/// A [`DirectoryEntry`] is the VFS-layer representation of a single slot in a
 /// driver-provided directory listing. It records the child's name, its inode
 /// number, and its type so the path resolver can branch without loading the
 /// full inode. Inode references are retained by the VFS, not by entries.
 ///
-/// Filesystem drivers return `DirectoryEntry` values from
+/// Filesystem drivers return [`DirectoryEntry`] values from
 /// [`super::driver::FileSystemInstance::lookup`] and
-/// [`super::driver::FileSystemInstance::read_dir`].
-/// Path resolution uses a fresh entry and asks the VFS for its shared inode
-/// when the full inode is needed.
+/// [`super::driver::FileSystemInstance::read_dir`]. Path resolution uses a
+/// fresh entry and asks the VFS for its shared inode when the full inode is
+/// needed.
 pub struct DirectoryEntry {
     /// The name of this entry within its parent directory.
     ///
@@ -275,7 +274,7 @@ pub struct DirectoryEntry {
 }
 
 impl DirectoryEntry {
-    /// Constructs a `DirectoryEntry` from a name, inode number, and type.
+    /// Constructs a [`DirectoryEntry`] from a name, inode number, and type.
     ///
     /// # Arguments
     ///

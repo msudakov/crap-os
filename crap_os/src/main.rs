@@ -188,7 +188,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             );
         }
         if cpu_topology.bsp().is_none() {
-            panic!("BSP APIC ID {:#x} not found in MADT — firmware bug or struct layout mismatch", cpu_topology.bsp_apic_id);
+            panic!("BSP APIC ID {:#x} not found in MADT: firmware bug or struct layout mismatch", cpu_topology.bsp_apic_id);
         }
     }
 

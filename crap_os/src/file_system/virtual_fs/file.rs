@@ -3,7 +3,7 @@
 //! This module defines the two-tier open-file model used by the VFS:
 //!
 //! - [`File`] is the master record for an open file. There is exactly one
-//!   `File` per unique inode that has at least one open handle anywhere in
+//!   [`File`] per unique inode that has at least one open handle anywhere in
 //!   the system. Its table entry persists from the first open until the last
 //!   close. Retained handle references can keep the record allocated after
 //!   removal from the table. It tracks registered handles, write-lock state,
@@ -11,12 +11,11 @@
 //!
 //! - [`FileHandle`] is the per-handle instance created for each individual
 //!   `open()` call. Its caller owns the returned `Arc`; a future process
-//!   handle table can hold that reference.
-//!   It carries the per-handle state that is independent between handles to
-//!   the same file: the current read/write position, and the access mode
-//!   granted at open time. It holds a strong [`Arc<File>`] reference back to
-//!   the master record, keeping the master record alive for at least as long
-//!   as the handle exists.
+//!   handle table can hold that reference. It carries the per-handle state that
+//!   is independent between handles to the same file: the current read/write
+//!   position, and the access mode granted at open time. It holds a strong
+//!   [`Arc<File>`] reference back to the master record, keeping the master
+//!   record alive for at least as long as the handle exists.
 //!
 //! The VFS open-file table holds an [`Arc<File>`] for each master record.
 //! Callers hold [`Arc<FileHandle>`] values. The [`File`] master record holds
@@ -61,23 +60,22 @@ use super::types::{AccessMode, FileLockState, FileSystemError};
 /// registered handle list and deferred-deletion state shared by all opens of
 /// that inode.
 ///
-/// Owned by the VFS open-file table, keyed by
-/// [`super::types::OpenFileKey`].
+/// Owned by the VFS open-file table, keyed by [`super::types::OpenFileKey`].
 pub struct File {
     /// The inode this master record is open for.
     ///
     /// Shared with every [`FileHandle`] that references this [`File`]. The
     /// [`Arc`] keeps the inode live in memory for the duration of the open
-    /// session, independently of whether the inode still has directory entries
+    /// session, independent of whether the inode still has directory entries
     /// pointing to it.
     pub inode: Arc<Inode>,
 
-    /// Mutable bookkeeping shared by all handles. VFS callers hold the global
+    /// Mutable book-keeping shared by all handles. VFS callers hold the global
     /// IRQ-safe lock before taking this short inner lock.
     state: SpinLock<FileState>,
 }
 
-/// Mutable bookkeeping for the handles open on one inode.
+/// Mutable book-keeping for the handles open on one inode.
 struct FileState {
     /// Exclusive write-lock owner, identified by a VFS-wide handle ID.
     lock_state: FileLockState,
@@ -91,7 +89,7 @@ struct FileState {
 }
 
 impl File {
-    /// Constructs a new `File` master record for the given inode.
+    /// Constructs a new [`File`] master record for the given inode.
     ///
     /// The initial write-lock state is `Unlocked`, the handle list is empty,
     /// and deletion is not pending. The VFS registers the first handle before
@@ -100,10 +98,6 @@ impl File {
     /// # Arguments
     ///
     /// * `inode` - The inode this master record represents.
-    ///
-    /// # Returns
-    ///
-    /// Returns a master record with no registered handles.
     pub fn new(inode: Arc<Inode>) -> Self {
         Self {
             inode,
@@ -134,7 +128,8 @@ impl File {
     ///
     /// # Returns
     ///
-    /// Returns `true` if this exact handle has an entry in the master record.
+    /// Returns `true` if this exact handle has an entry in the master record,
+    /// and `false` otherwise.
     pub(super) fn has_handle(&self, handle: &Arc<FileHandle>) -> bool {
         let ptr = Arc::as_ptr(handle);
         self.state.lock().handles.iter().any(|weak| weak.as_ptr() == ptr)
@@ -153,7 +148,6 @@ impl File {
     ///
     /// Called after the filesystem driver removes the inode's last directory
     /// entry. The VFS serializes this operation with open and close.
-    ///
     pub(super) fn mark_pending_deletion(&self) {
         self.state.lock().pending_deletion = true;
     }
@@ -163,7 +157,7 @@ impl File {
     /// # Returns
     ///
     /// Returns `true` when the inode has no directory entries and its storage
-    /// awaits reclamation.
+    /// awaits reclamation, `false` otherwise.
     pub(super) fn is_pending_deletion(&self) -> bool {
         self.state.lock().pending_deletion
     }
@@ -242,9 +236,11 @@ impl File {
         if state.lock_state != FileLockState::Unlocked {
             return Err(FileSystemError::LockContention);
         }
+
         state.lock_state = FileLockState::WriteExclusive {
             holder_handle: handle_id,
         };
+
         Ok(())
     }
 
@@ -317,7 +313,7 @@ impl File {
 ///
 /// The [`FileHandle`] holds a strong [`Arc<File>`] reference to the master
 /// record. The master record holds a corresponding [`Weak<FileHandle>`] until
-/// VFS close unregisters this open handle. Clones of its `Arc` refer to the
+/// VFS `close` unregisters this open handle. Clones of its `Arc` refer to the
 /// same open handle and become invalid together when it is closed.
 ///
 /// Owned by the caller's `Arc` references. The caller must explicitly close
@@ -368,11 +364,8 @@ impl FileHandle {
     /// * `file`        - The master record for the file being opened.
     /// * `id`          - Identifier assigned by the VFS to this open handle.
     /// * `access_mode` - The access rights granted to this handle.
-    ///
-    /// # Returns
-    ///
-    /// Returns a handle at byte offset `0` with the requested access mode.
-    pub(super) fn new(file: Arc<File>, id: u64, access_mode: AccessMode) -> Self {
+    pub(super) fn new(file: Arc<File>, id: u64, access_mode: AccessMode
+    ) -> Self {
         Self {
             file,
             id,
@@ -422,7 +415,9 @@ impl FileHandle {
         if state.closed {
             return Err(FileSystemError::InvalidHandle);
         }
+
         state.position = offset;
+
         Ok(())
     }
 }

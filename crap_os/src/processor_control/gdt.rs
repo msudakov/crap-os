@@ -272,7 +272,7 @@ impl GdtEntry {
 ///  1     | 0x08   | 0x08     | 64-bit ring-0 kernel code
 ///  2     | 0x10   | 0x10     | 64-bit ring-0 kernel data
 ///  3     | 0x18   | 0x18     | TSS descriptor low  (per-CPU TSS address)
-///  4     | 0x20   |   —      | TSS descriptor high (per-CPU TSS address)
+///  4     | 0x20   |   -      | TSS descriptor high (per-CPU TSS address)
 ///  5     | 0x28   | 0x2B     | 64-bit ring-3 user data  (RPL=3)
 ///  6     | 0x30   | 0x33     | 64-bit ring-3 user code  (RPL=3)
 #[repr(C, align(8))]

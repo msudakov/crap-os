@@ -4,17 +4,15 @@
 //! implement to plug into the VFS:
 //!
 //! - [`FileSystemDriver`] is the stateless factory trait. A driver implements
-//!   this trait once and registers itself with the VFS at boot via
-//!   [`super::vfs::VirtualFileSystem::register_driver`]. Its sole
-//!   responsibility is recognizing a block device's on-disk format and
-//!   producing a live [`FileSystemInstance`] from it.
+//!   this trait once and registers itself with the VFS via
+//!   [`super::vfs::VirtualFileSystem::register_driver`]. Native drivers
+//!   validate a device's format before producing a live
+//!   [`FileSystemInstance`]. The in-memory stub driver ignores its device.
 //!
-//! - [`FileSystemInstance`] is the stateful trait representing a single
-//!   mounted volume. The VFS holds one [`Arc<dyn FileSystemInstance>`] per
-//!   mounted filesystem and dispatches all namespace and I/O operations
-//!   through it. The instance owns whatever in-memory state the driver needs
-//!   to service requests: the superblock, allocation bitmaps, inode tables,
-//!   and so on.
+//! - [`FileSystemInstance`] is the stateful trait representing one mounted
+//!   filesystem. Mount records and VFS inodes retain instance references;
+//!   namespace and I/O operations dispatch through the inode's instance.
+//!   The instance owns whatever state its driver needs to service requests.
 //!
 //! Splitting the factory from the live instance is deliberate. A driver such
 //! as a FAT driver is a single zero-state object registered once. The same
@@ -25,16 +23,17 @@
 //!
 //! Both traits interact with storage through the [`BlockDevice`] trait defined
 //! in this module. A [`BlockDevice`] represents any addressable block storage:
-//! a physical disk partition, a RAM disk, or a future virtual device. Drivers
-//! receive a [`BlockDevice`] reference at mount time and use it for all disk
-//! I/O. The VFS itself never reads from or writes to a block device directly.
+//! a physical disk partition, a RAM disk, or a virtual device. Drivers
+//! receive a [`BlockDevice`] reference at mount time and use it for disk I/O
+//! when their format requires storage. The VFS itself never reads from or
+//! writes to a block device directly.
 //!
 //! All read and write operations at the VFS-to-driver boundary use byte
 //! offsets and byte lengths. The driver is responsible for all internal block
-//! arithmetic - translating a byte range into the block numbers that must be
-//! read or written, handling partial first and last blocks, and managing block
-//! allocation. The VFS does not currently use `block_size()`; a future cache
-//! manager may need the driver's logical block size.
+//! arithmetic, such as translating a byte range into the block numbers that
+//! must be read or written, handling partial first and last blocks, and
+//! managing block allocation. The VFS does not currently use `block_size()`;
+//! a future cache manager may need the driver's logical block size.
 
 #![allow(dead_code)]
 
@@ -48,10 +47,9 @@ use super::types::{FileSystemError, Permissions, Timestamps};
 /// A raw block storage device that a filesystem driver reads from and writes
 /// to.
 ///
-/// Every mounted filesystem receives a reference to a [`BlockDevice`] at mount
-/// time. All disk I/O performed by the driver goes through this trait. The
-/// VFS never calls [`BlockDevice`] methods directly; it is purely a
-/// driver-to-storage interface.
+/// The VFS passes a [`BlockDevice`] to the driver at mount time. Drivers that
+/// perform disk I/O use it for storage access; the in-memory stub ignores it.
+/// The VFS never calls [`BlockDevice`] methods directly.
 ///
 /// Reads and writes are expressed in terms of logical block numbers and a
 /// byte buffer. The block size is fixed per device and must match the value
@@ -66,11 +64,9 @@ pub trait BlockDevice: Send + Sync {
     ///
     /// This value is fixed for the lifetime of the device and must be a
     /// power of two no smaller than the device's physical sector size. All
-    /// calls to [`read_block`] and [`write_block`] must supply buffers whose
-    /// length equals this value.
-    ///
-    /// [`read_block`]: BlockDevice::read_block
-    ///
+    /// calls to [`BlockDevice::read_block`] and [`BlockDevice::write_block`]
+    /// must supply buffers whose length equals this value.
+    /// 
     /// # Returns
     ///
     /// Returns the block size in bytes.
@@ -78,10 +74,8 @@ pub trait BlockDevice: Send + Sync {
 
     /// Gets the total number of addressable logical blocks on this device.
     ///
-    /// Block numbers passed to [`read_block`] and [`write_block`] must be
-    /// strictly less than this value.
-    ///
-    /// [`read_block`]: BlockDevice::read_block
+    /// Block numbers passed to [`BlockDevice::read_block`] and
+    /// [`BlockDevice::write_block`] must be strictly less than this value.
     ///
     /// # Returns
     ///
@@ -90,25 +84,21 @@ pub trait BlockDevice: Send + Sync {
 
     /// Reads one logical block into `buffer`.
     ///
-    /// `buffer` must be exactly [`block_size`] bytes long. The driver fills
-    /// it with the raw bytes of the block at `block_number`. If the device
-    /// reports a read error, the contents of `buffer` are undefined.
-    ///
-    /// [`block_size`]: BlockDevice::block_size
+    /// `buffer` must be exactly [`BlockDevice::block_size`] bytes long. The
+    /// driver fills it with the raw bytes of the block at `block_number`. If
+    /// the device reports a read error, the contents of `buffer` are undefined.
     ///
     /// # Arguments
     ///
-    /// * `block_number` - The zero-based logical block address to read. Must
-    ///   be less than [`block_count`].
-    /// * `buffer`       - The destination buffer. Must be exactly
-    ///   [`block_size`] bytes long.
+    /// * `block_number` - The zero-based logical block address to read; must
+    ///   be less than [`BlockDevice::block_count`].
+    /// * `buffer`       - The destination buffer; must be exactly
+    ///   [`BlockDevice::block_size`] bytes long.
     ///
     /// # Returns
     ///
     /// Returns `Ok(())` on success, or `Err(FileSystemError::DiskReadError)`
     /// if the device reports a hardware error.
-    ///
-    /// [`block_count`]: BlockDevice::block_count
     fn read_block(
         &self,
         block_number: u64,
@@ -117,25 +107,21 @@ pub trait BlockDevice: Send + Sync {
 
     /// Writes one logical block from `buffer` to the device.
     ///
-    /// `buffer` must be exactly [`block_size`] bytes long. The driver writes
-    /// its contents to the block at `block_number`. If the device reports a
-    /// write error, the on-disk state of that block is undefined.
-    ///
-    /// [`block_size`]: BlockDevice::block_size
+    /// `buffer` must be exactly [`BlockDevice::block_size`] bytes long. The
+    /// driver writes its contents to the block at `block_number`. If the device
+    /// reports a write error, the on-disk state of that block is undefined.
     ///
     /// # Arguments
     ///
-    /// * `block_number` - The zero-based logical block address to write. Must
-    ///   be less than [`block_count`].
-    /// * `buffer`       - The source buffer. Must be exactly [`block_size`]
-    ///   bytes long.
+    /// * `block_number` - The zero-based logical block address to write; must
+    ///   be less than [`BlockDevice::block_count`].
+    /// * `buffer`       - The source buffer; must be exactly
+    ///   [`BlockDevice::block_size`] bytes long.
     ///
     /// # Returns
     ///
     /// Returns `Ok(())` on success, or `Err(FileSystemError::DiskWriteError)`
     /// if the device reports a hardware error.
-    ///
-    /// [`block_count`]: BlockDevice::block_count
     fn write_block(
         &self,
         block_number: u64,
@@ -143,23 +129,21 @@ pub trait BlockDevice: Send + Sync {
     ) -> Result<(), FileSystemError>;
 }
 
-/// A stateless factory that recognizes an on-disk filesystem format and
-/// produces a live [`FileSystemInstance`] from a block device.
+/// A stateless factory that produces a live [`FileSystemInstance`] from a
+/// block device. Native implementations validate their on-disk format.
 ///
-/// Implementations of this trait are registered with the VFS once at kernel
-/// boot via [`super::vfs::VirtualFileSystem::register_driver`] and remain
-/// registered for the system's lifetime. The VFS calls [`mount`] when a
-/// caller requests that a volume be mounted under a given driver name.
+/// Implementations are registered with the VFS through
+/// [`super::vfs::VirtualFileSystem::register_driver`]. The VFS calls
+/// [`FileSystemDriver::mount`] when a caller requests that a volume be mounted
+/// under a given driver name.
 ///
-/// A single `FileSystemDriver` implementation may produce any number of
+/// A single [`FileSystemDriver`] implementation may produce any number of
 /// independent [`FileSystemInstance`] values if multiple volumes of the same
 /// format are mounted simultaneously. The driver itself must be stateless;
 /// all per-mount state lives in the returned instance.
 ///
 /// `Send + Sync` are required because the driver registry is a global
 /// structure accessible from any kernel context.
-///
-/// [`mount`]: FileSystemDriver::mount
 pub trait FileSystemDriver: Send + Sync {
     /// Returns the short identifying name for this driver.
     ///
@@ -175,21 +159,19 @@ pub trait FileSystemDriver: Send + Sync {
     /// Attempts to mount a filesystem of this driver's format from the given
     /// block device.
     ///
-    /// The driver reads the device's superblock or equivalent on-disk
-    /// structure, validates the format magic number and version, initializes
-    /// any in-memory state required to service subsequent requests, and
-    /// returns a live [`FileSystemInstance`].
+    /// A native driver reads and validates the device's superblock or
+    /// equivalent on-disk structure, initializes the state needed to service
+    /// requests, and returns a live [`FileSystemInstance`]. The test-only
+    /// in-memory stub accepts any device without inspecting it.
     ///
-    /// If the device does not contain a filesystem of this driver's format,
-    /// the driver must return [`FileSystemError::InvalidFormat`] without
-    /// modifying the device. If the on-disk structures are present but
-    /// corrupt, the driver should return [`FileSystemError::CorruptStructure`].
+    /// A native driver returns [`FileSystemError::InvalidFormat`] without
+    /// modifying a device that has a different format. It should return
+    /// [`FileSystemError::CorruptStructure`] for corrupt format structures.
     ///
     /// # Arguments
     ///
-    /// * `device` - The block device to mount. The driver retains this
-    ///   reference for the lifetime of the returned instance and uses it for
-    ///   all subsequent disk I/O.
+    /// * `device` - The block device to mount. A driver that performs disk
+    ///   I/O retains it for the lifetime of the returned instance.
     ///
     /// # Returns
     ///
@@ -204,16 +186,14 @@ pub trait FileSystemDriver: Send + Sync {
 /// A live mounted filesystem instance that services VFS namespace and I/O
 /// operations.
 ///
-/// The VFS holds one [`Arc<dyn FileSystemInstance>`] per mounted volume and
-/// dispatches every operation on that volume through this trait. The
-/// implementation owns all per-mount state: the superblock, block allocation
-/// structures, open inode metadata, journal handles, and the [`BlockDevice`]
-/// reference used for disk I/O.
+/// Mount records and VFS inodes retain [`Arc<dyn FileSystemInstance>`]
+/// references, and VFS operations dispatch through this trait. The
+/// implementation owns the per-instance state it needs, such as a native
+/// format's superblock, allocation structures, and [`BlockDevice`] reference.
 ///
-/// Methods are grouped by operation type below. All methods that modify on-disk
-/// state are expected to maintain the filesystem's internal consistency
-/// invariants. Drivers that implement journaling or copy-on-write should
-/// ensure that partial failures leave the volume in a recoverable state.
+/// Methods are grouped by operation type below. A driver must keep its backing
+/// state consistent when a mutation succeeds or reports an error. Native
+/// drivers must also account for failures during persistent writes.
 ///
 /// `Send + Sync` are required because the VFS may call into instances from
 /// different kernel threads in SMP context.
@@ -240,7 +220,7 @@ pub trait FileSystemInstance: Send + Sync {
     ///
     /// Must equal the block size of the underlying [`BlockDevice`] and
     /// remain constant for the lifetime of the instance. The VFS does not
-    /// currently query this value; a future cache manager may use it.
+    /// currently query this value, but a future cache manager may use it.
     ///
     /// # Returns
     ///
@@ -261,9 +241,9 @@ pub trait FileSystemInstance: Send + Sync {
     // Inode Operations
     // =========================================================================
 
-    /// Loads the inode identified by `inode_number` from disk into memory.
+    /// Loads the inode identified by `inode_number` into a VFS record.
     ///
-    /// The driver reads the inode's on-disk record, populates a VFS-layer
+    /// The driver reads its backing inode record and populates a VFS-layer
     /// [`Inode`] with the generic metadata fields (type, size, permissions,
     /// timestamps, link count), and returns it wrapped in an [`Arc`]. Any
     /// driver-private per-inode state is stored separately within the instance
@@ -272,10 +252,10 @@ pub trait FileSystemInstance: Send + Sync {
     /// The returned [`Inode`]'s `filesystem` field must be set to an
     /// [`Arc<dyn FileSystemInstance>`] pointing back to this instance, so that
     /// subsequent VFS operations on the inode can dispatch through it without
-    /// an external lookup.
-    /// The driver need not return the same allocation on repeated calls. The
-    /// VFS keeps one in-memory [`Inode`] per filesystem instance and inode
-    /// number while that inode remains registered.
+    /// an external lookup. The driver does not need to return the same
+    /// allocation on repeated calls. The VFS keeps one in-memory [`Inode`] per
+    /// filesystem instance and inode number while that inode remains
+    /// registered.
     ///
     /// # Arguments
     ///
@@ -285,30 +265,30 @@ pub trait FileSystemInstance: Send + Sync {
     /// # Returns
     ///
     /// Returns `Ok(Arc<Inode>)` on success, or `Err(FileSystemError)` if the
-    /// inode number is out of range, the on-disk record is corrupt, or the
-    /// block device reports a read error.
+    /// inode number is unknown or the backing record cannot be read.
     fn load_inode(
         &self,
         inode_number: u64,
     ) -> Result<Arc<Inode>, FileSystemError>;
 
-    /// Writes the current in-memory state of `inode` back to disk.
+    /// Synchronizes the current in-memory state of `inode` with driver storage.
     ///
     /// The driver can obtain a consistent snapshot of the generic metadata
     /// (size, permissions, timestamps, and link count) with `inode.stat()` and
-    /// persist it to the on-disk record. The VFS does not hold the inode's
-    /// metadata lock across driver calls. The VFS clears the dirty flag only
-    /// after this method succeeds during volume unmount.
+    /// persist it in its backing record. The in-memory stub has nothing to
+    /// persist. The VFS does not hold the inode's metadata lock across driver
+    /// calls. It clears the dirty flag only after this method succeeds during
+    /// volume unmount.
     ///
     /// # Arguments
     ///
     /// * `inode` - The inode whose metadata should be persisted. The driver
-    ///   uses `inode.inode_number` to locate the on-disk record.
+    ///   uses `inode.inode_number` to locate its backing record.
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` on success, or `Err(FileSystemError)` if the block
-    /// device reports a write error.
+    /// Returns `Ok(())` on success, or a driver error if synchronization
+    /// fails.
     fn sync_inode(
         &self,
         inode: &Inode,
@@ -316,25 +296,25 @@ pub trait FileSystemInstance: Send + Sync {
 
     /// Frees the inode slot and all data blocks belonging to `inode`.
     ///
-    /// Called by the VFS when an inode's link count reaches zero and no
-    /// further operation through an open handle can access its storage. The
-    /// driver must mark the inode slot as free in its
-    /// allocation structure and return all data blocks to the free-block pool.
+    /// Called by the VFS after unlink brings an inode's link count to zero.
+    /// With no open handles, the VFS calls it immediately. Otherwise it waits
+    /// for the last close. On success, the driver releases the inode slot and
+    /// its data blocks.
     ///
-    /// On deferred deletion, the VFS calls this method during the last close,
-    /// before unregistering that handle. The global VFS lock prevents another
-    /// handle operation during the call. If the driver returns an error, the
-    /// handle stays open so close can retry reclamation.
+    /// On deferred deletion, the final handle remains registered during this
+    /// call so a failure can leave it open for a retry. The global VFS lock
+    /// prevents a concurrent handle operation while storage is being freed.
+    /// After success, the VFS closes the handle and forgets the inode.
+    /// A failed immediate free has no VFS retry path yet.
     ///
     /// # Arguments
     ///
     /// * `inode` - The inode to free. The driver uses `inode.inode_number`
-    ///   to locate and release the on-disk record and associated data blocks.
+    ///   to locate its backing record and associated data.
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` on success, or `Err(FileSystemError)` if the block
-    /// device reports a write error during deallocation.
+    /// Returns `Ok(())` on success, or a driver error if deallocation fails.
     fn free_inode(
         &self,
         inode: &Inode,
@@ -347,16 +327,17 @@ pub trait FileSystemInstance: Send + Sync {
     /// Looks up a single child by name within a directory inode.
     ///
     /// The driver searches the directory identified by `directory` for an
-    /// entry whose name exactly matches `name`, and returns it as a
-    /// [`DirectoryEntry`] with the `inode` field set to `None`. The VFS
-    /// populates the `inode` field lazily via [`load_inode`] if and when the
-    /// entry is traversed or opened.
+    /// entry whose name exactly matches `name`, and returns a
+    /// [`DirectoryEntry`] containing its name, inode number, and type. The
+    /// entry does not hold an inode reference. When traversal needs the full
+    /// inode, the VFS acquires its shared inode by number, loading it through
+    /// [`FileSystemInstance::load_inode`] if it is not already retained.
+    /// The current resolver uses [`FileSystemInstance::read_dir`] for child
+    /// lookups rather than calling this method.
     ///
     /// The special names `.` and `..` are handled entirely by the VFS path
     /// resolver and must not be stored as real entries on disk. Drivers must
     /// not return them from this method.
-    ///
-    /// [`load_inode`]: FileSystemInstance::load_inode
     ///
     /// # Arguments
     ///
@@ -379,10 +360,10 @@ pub trait FileSystemInstance: Send + Sync {
     /// entries.
     ///
     /// The driver reads the complete contents of the directory identified by
-    /// `directory` and returns one [`DirectoryEntry`] per child, with each
-    /// entry's `inode` field set to `None`. The VFS stores the returned list
-    /// in the [`super::directory::Directory`] wrapper's `children` field as
-    /// the result of lazy loading.
+    /// `directory` and returns one [`DirectoryEntry`] per child. Each entry
+    /// supplies a name, inode number, and type. Directory wrappers do not
+    /// retain this list: the VFS reads a fresh listing for each child lookup
+    /// and loads the child's inode separately when needed.
     ///
     /// The special entries `.` and `..` must not appear in the returned list;
     /// the VFS synthesizes them during path resolution.
@@ -394,8 +375,8 @@ pub trait FileSystemInstance: Send + Sync {
     /// # Returns
     ///
     /// Returns `Ok(Vec<DirectoryEntry>)` containing one entry per child on
-    /// success, or `Err(FileSystemError)` if the directory's on-disk
-    /// structures could not be read.
+    /// success, or a driver error if the directory's backing state cannot be
+    /// read.
     fn read_dir(
         &self,
         directory: &Inode,
@@ -415,7 +396,7 @@ pub trait FileSystemInstance: Send + Sync {
     ///
     /// # Arguments
     ///
-    /// * `inode`  - The file inode to read from. Must have `inode_type`
+    /// * `inode`  - The file inode to read from; must have `inode_type`
     ///   [`super::types::InodeType::File`].
     /// * `offset` - The byte offset within the file at which to begin reading.
     /// * `buffer` - The destination buffer. The driver fills as much of this
@@ -438,14 +419,14 @@ pub trait FileSystemInstance: Send + Sync {
     /// The driver translates the byte range `[offset, offset + buffer.len())`
     /// into the appropriate block writes, allocating new blocks as needed if
     /// the write extends beyond the file's current size. The driver updates
-    /// the inode's on-disk size field if the write extends the file.
+    /// its stored file length if the write extends the file.
     ///
     /// The VFS updates the inode's protected in-memory size and dirty flag
     /// after a successful write; the driver need not modify them directly.
     ///
     /// # Arguments
     ///
-    /// * `inode`  - The file inode to write to. Must have `inode_type`
+    /// * `inode`  - The file inode to write to; must have `inode_type`
     ///   [`super::types::InodeType::File`].
     /// * `offset` - The byte offset within the file at which to begin writing.
     /// * `buffer` - The source buffer whose entire contents are written.
@@ -469,9 +450,9 @@ pub trait FileSystemInstance: Send + Sync {
     /// Creates a new regular file in the given parent directory.
     ///
     /// The driver allocates a new inode of type
-    /// [`super::types::InodeType::File`], writes an initial on-disk record
-    /// with the supplied metadata, and adds a directory entry for `name` in
-    /// `parent`. The new inode's link count starts at `1`.
+    /// [`super::types::InodeType::File`], creates a backing record with the
+    /// supplied metadata, and adds a directory entry for `name` in `parent`.
+    /// The new inode's link count starts at `1`.
     ///
     /// # Arguments
     ///
@@ -499,9 +480,9 @@ pub trait FileSystemInstance: Send + Sync {
     /// Creates a new directory in the given parent directory.
     ///
     /// The driver allocates a new inode of type
-    /// [`super::types::InodeType::Directory`], writes an initial on-disk
-    /// record with the supplied metadata, and adds a directory entry for
-    /// `name` in `parent`. The new inode's link count starts at `1`.
+    /// [`super::types::InodeType::Directory`], creates a backing record with
+    /// the supplied metadata, and adds a directory entry for `name` in
+    /// `parent`. The new inode's link count starts at `1`.
     ///
     /// # Arguments
     ///
@@ -531,9 +512,9 @@ pub trait FileSystemInstance: Send + Sync {
     ///
     /// The driver allocates a new inode of type
     /// [`super::types::InodeType::Symlink`], stores `target` as the inode's
-    /// data, writes an initial on-disk record with the supplied metadata, and
-    /// adds a directory entry for `name` in `parent`. The new inode's link
-    /// count starts at `1`.
+    /// data, creates a backing record with the supplied metadata, and adds a
+    /// directory entry for `name` in `parent`. The new inode's link count
+    /// starts at `1`.
     ///
     /// # Arguments
     ///
@@ -559,19 +540,17 @@ pub trait FileSystemInstance: Send + Sync {
         timestamps: Timestamps,
     ) -> Result<Arc<Inode>, FileSystemError>;
 
-    /// Removes a directory entry from its parent directory on disk.
+    /// Removes a directory entry from its parent directory.
     ///
     /// The driver removes the entry named `name` from the directory identified
-    /// by `parent` and decrements the target inode's on-disk link count. It
-    /// must not free the inode's data blocks; that is done separately by
-    /// [`free_inode`] once the VFS confirms that the link count has reached
-    /// zero and all open handles are closed.
+    /// by `parent`. A native driver also decrements the target's persistent
+    /// link count. After success, the VFS decrements its retained inode's
+    /// in-memory link count. The driver must leave the inode's storage intact;
+    /// the VFS calls [`FileSystemInstance::free_inode`] separately when the
+    /// count reaches zero.
     ///
-    /// This separation implements POSIX unlink semantics: the name disappears
-    /// from the namespace immediately, but the inode's data remains accessible
-    /// through any existing open handles until they are all closed.
-    ///
-    /// [`free_inode`]: FileSystemInstance::free_inode
+    /// The name disappears immediately, while any existing open handles can
+    /// access the data until the final close frees the inode.
     ///
     /// # Arguments
     ///
@@ -593,15 +572,15 @@ pub trait FileSystemInstance: Send + Sync {
     ///
     /// The driver removes the entry named `old_name` from `old_parent`,
     /// creates a new entry named `new_name` in `new_parent` pointing to the
-    /// same inode, and updates any affected on-disk structures atomically
-    /// where the filesystem's journaling or copy-on-write mechanism allows.
-    /// `old_parent` and `new_parent` may refer to the same directory (an
+    /// same inode, and updates the driver's backing namespace. The VFS
+    /// preflights both names, but does not roll back a partial driver mutation.
+    /// `old_parent` and `new_parent` may refer to the same directory (i.e., an
     /// in-place rename).
     ///
     /// If an entry named `new_name` already exists in `new_parent`, the
-    /// driver must return [`FileSystemError::AlreadyExists`]; the VFS is
-    /// responsible for removing the destination first if the caller requested
-    /// an overwriting rename.
+    /// driver returns [`FileSystemError::AlreadyExists`]. The current VFS
+    /// also rejects an existing destination; overwriting rename is not
+    /// implemented.
     ///
     /// # Arguments
     ///
@@ -613,7 +592,7 @@ pub trait FileSystemInstance: Send + Sync {
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` on success, or `Err(FileSystemError)` if either source
+    /// Returns `Ok(())` on success, or `Err(FileSystemError)` if the source
     /// entry does not exist, the destination name already exists, or a disk
     /// write fails.
     fn rename(
@@ -637,7 +616,7 @@ pub trait FileSystemInstance: Send + Sync {
     ///
     /// # Arguments
     ///
-    /// * `inode` - The symlink inode whose target path should be read. Must
+    /// * `inode` - The symlink inode whose target path should be read; must
     ///   have `inode_type` [`super::types::InodeType::Symlink`].
     ///
     /// # Returns
@@ -656,7 +635,7 @@ pub trait FileSystemInstance: Send + Sync {
 
     /// Replaces the permissions on the inode identified by `inode`.
     ///
-    /// The driver updates the inode's on-disk permission record with the
+    /// A native driver updates the inode's stored permission record with the
     /// supplied `permissions` value. A VFS caller must update the protected
     /// in-memory metadata after this method succeeds. The current VFS has no
     /// public permission-change operation.
@@ -664,7 +643,7 @@ pub trait FileSystemInstance: Send + Sync {
     /// # Arguments
     ///
     /// * `inode`       - The inode whose permissions should be updated. The
-    ///   driver uses `inode.inode_number` to locate the on-disk record.
+    ///   driver uses `inode.inode_number` to locate its backing record.
     /// * `permissions` - The new permissions to apply.
     ///
     /// # Returns
@@ -679,7 +658,7 @@ pub trait FileSystemInstance: Send + Sync {
 
     /// Replaces the timestamps on the inode identified by `inode`.
     ///
-    /// The driver updates the inode's on-disk timestamp fields with the
+    /// A native driver updates the inode's stored timestamp fields with the
     /// supplied `timestamps` value. A VFS caller must update the protected
     /// in-memory metadata after this method succeeds. The current VFS has no
     /// public timestamp-change operation.
@@ -687,7 +666,7 @@ pub trait FileSystemInstance: Send + Sync {
     /// # Arguments
     ///
     /// * `inode`      - The inode whose timestamps should be updated. The
-    ///   driver uses `inode.inode_number` to locate the on-disk record.
+    ///   driver uses `inode.inode_number` to locate its backing record.
     /// * `timestamps` - The new timestamps to apply, in Unix epoch
     ///   milliseconds.
     ///
@@ -708,13 +687,12 @@ pub trait FileSystemInstance: Send + Sync {
     /// Flushes all pending writes and releases resources held by this
     /// filesystem instance.
     ///
-    /// Called by the VFS during unmount, after verifying that no open file
-    /// handles remain on this volume. The driver must flush pending writes
-    /// and filesystem metadata it owns before releasing resources needed for
-    /// filesystem operations. On an error, the instance remains mounted and
-    /// usable so the VFS can retry unmount. On success, the VFS removes the
-    /// mount and drops its reference to the instance; other inode references
-    /// may remain.
+    /// Called by the VFS during unmount, after checking for open handles and
+    /// syncing dirty VFS inodes. The driver must flush pending writes and
+    /// metadata it owns before releasing resources needed for filesystem
+    /// operations. On an error, the instance remains mounted and usable so the
+    /// VFS can retry unmount. On success, the VFS removes the mount record and
+    /// its retained inodes; other external inode references may remain.
     ///
     /// # Returns
     ///

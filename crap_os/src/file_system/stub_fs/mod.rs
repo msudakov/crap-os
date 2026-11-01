@@ -118,7 +118,7 @@ fn fail_next_unmount_for(instance_id: u64) {
 ///
 /// Stored in [`StubFsInstance::inodes`], keyed by inode number. Holds
 /// everything the stub needs to service VFS trait calls for a given inode:
-/// its type, its parent's inode number (for directory walk-up), its
+/// its type, its directory parent number, its backing link count, its
 /// children's directory entries (for directories), and its symlink target
 /// (for symlinks). File content is stored separately in
 /// [`StubFsInstance::file_data`].
@@ -129,10 +129,15 @@ struct StubInode {
     /// The kind of filesystem object this inode represents.
     inode_type: InodeType,
 
-    /// The inode number of this inode's parent directory.
+    /// Number of directory entries naming this inode. The root starts at one
+    /// as the stub's namespace anchor. Link and unlink update this backing
+    /// count independently of the VFS's canonical in-memory metadata.
+    link_count: u32,
+
+    /// The parent inode number for a directory; `0` for the root.
     ///
-    /// `0` for the root inode, which has no parent within this filesystem
-    /// instance.
+    /// For files and symlinks this retains the creation parent only and is
+    /// not authoritative: those inodes may have names in several directories.
     parent_inode_number: u64,
 
     /// The direct children of this inode, if it is a directory.
@@ -169,6 +174,7 @@ impl StubInode {
         Self {
             inode_number,
             inode_type: InodeType::Directory,
+            link_count: 1,
             parent_inode_number,
             children: Vec::new(),
             symlink_target: String::new(),
@@ -191,6 +197,7 @@ impl StubInode {
         Self {
             inode_number,
             inode_type: InodeType::File,
+            link_count: 1,
             parent_inode_number,
             children: Vec::new(),
             symlink_target: String::new(),
@@ -214,6 +221,7 @@ impl StubInode {
         Self {
             inode_number,
             inode_type: InodeType::Symlink,
+            link_count: 1,
             parent_inode_number,
             children: Vec::new(),
             symlink_target: target.to_string(),
@@ -410,7 +418,7 @@ impl StubFsInstance {
             stub.size,
             Permissions::all_permissive(),
             crate::file_system::virtual_fs::types::Timestamps::new(now),
-            1,
+            stub.link_count,
         ))
     }
 }
@@ -674,6 +682,87 @@ impl FileSystemInstance for StubFsInstance {
         self.load_inode(new_ino)
     }
 
+    /// Adds a name and increments its backing count under the inode-table lock.
+    ///
+    /// All returned-error checks precede insertion. No inode or data record is
+    /// created, and the source's creation-parent field remains unchanged.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - Live file or symlink inode owned by the receiving stub
+    ///   instance, with a nonzero backing link count.
+    /// * `destination_parent` - Live destination directory owned by the
+    ///   receiving stub instance, with a nonzero backing link count.
+    /// * `destination_name` - Name for the new entry within
+    ///   `destination_parent`. No entry with this name may already exist;
+    ///   the name must satisfy [`FileSystemInstance::link`].
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` after insertion, `AlreadyExists` for an occupied name,
+    /// `TooManyHardLinks` for count overflow, or an error for a missing record,
+    /// an unlinked inode, or an invalid inode type. Returned errors leave the
+    /// destination entry and backing count unchanged.
+    fn link(
+        &self,
+        source: &Inode,
+        destination_parent: &Inode,
+        destination_name: &str,
+    ) -> Result<(), FileSystemError> {
+        let mut inodes = self.inodes.lock();
+        let source_idx = Self::find_inode_index(&inodes, source.inode_number)?;
+        let destination_parent_idx =
+            Self::find_inode_index(&inodes, destination_parent.inode_number)?;
+
+        let entry_type = match inodes[source_idx].inode_type {
+            InodeType::File => DirectoryEntryType::File,
+            InodeType::Symlink => DirectoryEntryType::Symlink,
+            InodeType::Directory => {
+                return Err(FileSystemError::OperationNotAllowed);
+            }
+        };
+        if inodes[destination_parent_idx].inode_type != InodeType::Directory {
+            return Err(FileSystemError::NotADirectory);
+        }
+        if inodes[source_idx].link_count == 0
+            || inodes[destination_parent_idx].link_count == 0
+        {
+            return Err(FileSystemError::NotFound);
+        }
+        if inodes[destination_parent_idx].children.iter()
+            .any(|(name, _, _)| name == destination_name)
+        {
+            return Err(FileSystemError::AlreadyExists);
+        }
+        let new_count = inodes[source_idx].link_count.checked_add(1)
+            .ok_or(FileSystemError::TooManyHardLinks)?;
+
+        // Allocate the entry before insertion. After it is inserted, only
+        // the infallible backing-count assignment remains.
+        let entry = (
+            destination_name.to_string(), source.inode_number, entry_type,
+        );
+        inodes[destination_parent_idx].children.push(entry);
+        inodes[source_idx].link_count = new_count;
+        Ok(())
+    }
+
+    /// Removes one name and decrements its backing count without freeing data.
+    ///
+    /// The inode-table lock covers both changes. The VFS updates its own count
+    /// after success and separately decides when to free the inode.
+    ///
+    /// # Arguments
+    ///
+    /// * `parent` - Directory containing the entry, owned by the receiving
+    ///   stub instance.
+    /// * `name` - Child entry to remove.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` after removing the entry and decrementing the count,
+    /// `NotFound` for a missing record or name, or `InternalError` for a zero
+    /// backing count. Returned errors leave both entry and count unchanged.
     fn unlink(
         &self,
         parent: &Inode,
@@ -681,15 +770,16 @@ impl FileSystemInstance for StubFsInstance {
     ) -> Result<(), FileSystemError> {
         let mut inodes = self.inodes.lock();
         let parent_idx = Self::find_inode_index(&inodes, parent.inode_number)?;
-
-        let pos = inodes[parent_idx]
-            .children
-            .iter()
+        let pos = inodes[parent_idx].children.iter()
             .position(|(n, _, _)| n == name)
             .ok_or(FileSystemError::NotFound)?;
+        let target_number = inodes[parent_idx].children[pos].1;
+        let target_idx = Self::find_inode_index(&inodes, target_number)?;
+        let remaining = inodes[target_idx].link_count.checked_sub(1)
+            .ok_or(FileSystemError::InternalError)?;
 
         inodes[parent_idx].children.remove(pos);
-
+        inodes[target_idx].link_count = remaining;
         Ok(())
     }
 
@@ -732,9 +822,12 @@ impl FileSystemInstance for StubFsInstance {
             child_type,
         ));
 
-        // Update the child inode's parent pointer.
-        if let Ok(child_idx) = Self::find_inode_index(&inodes, child_ino) {
-            inodes[child_idx].parent_inode_number = new_parent.inode_number;
+        // Only directories have one authoritative parent. Files and symlinks
+        // can have names in several directories.
+        if child_type == DirectoryEntryType::Directory {
+            if let Ok(child_idx) = Self::find_inode_index(&inodes, child_ino) {
+                inodes[child_idx].parent_inode_number = new_parent.inode_number;
+            }
         }
 
         Ok(())

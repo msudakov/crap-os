@@ -83,6 +83,14 @@ pub enum FileSystemError {
     /// A directory entry with the requested name already exists.
     AlreadyExists,
 
+    /// The operation requires its source and destination to belong to the
+    /// same file system instance, but they belong to different instances.
+    CrossFileSystemOperation,
+
+    /// Creating another hard link would exceed the VFS or driver limit
+    /// on the number of directory entries naming one inode.
+    TooManyHardLinks,
+
     /// A directory that was expected to be empty (e.g., for removal) still
     /// contains entries.
     DirectoryNotEmpty,
@@ -91,6 +99,11 @@ pub enum FileSystemError {
     /// [`crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH`] hops,
     /// indicating a symlink loop or an exceedingly-deep chain.
     TooManySymlinks,
+
+    /// The requested operation is prohibited by the rules for the target
+    /// object, regardless of the caller's permissions (e.g., creating a
+    /// directory hard link).
+    OperationNotAllowed,
 
     /// The calling context does not have the required permissions for the
     /// requested operation.

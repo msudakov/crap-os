@@ -540,6 +540,51 @@ pub trait FileSystemInstance: Send + Sync {
         timestamps: Timestamps,
     ) -> Result<Arc<Inode>, FileSystemError>;
 
+    /// Creates a destination directory entry referencing an existing inode.
+    ///
+    /// The source inode and destination directory must both belong to the
+    /// file system instance receiving this call. The source must be a regular
+    /// file or symlink with at least one existing directory entry.
+    ///
+    /// The driver adds the destination entry and increments the source inode's
+    /// backing link count without allocating another inode or copying data.
+    /// These changes must succeed together: a returned error must leave both
+    /// the destination directory and backing link count unchanged.
+    ///
+    /// The caller serializes namespace mutations. After success, the VFS
+    /// updates the source inode's protected in-memory link count. The driver
+    /// must not modify that protected metadata itself. The VFS does not hold
+    /// an inode metadata lock during this call.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - Existing regular file or symlink inode to give another
+    ///   name. It must belong to the file system instance receiving this call.
+    ///   The caller has already resolved whether to link a symlink itself or
+    ///   its target.
+    /// * `destination_parent` - Existing directory in the receiving file system
+    ///   instance that will contain the new entry. Its link count must be
+    ///   nonzero.
+    /// * `destination_name` - Name for the new entry within
+    ///   `destination_parent`. No entry with this name may already exist.
+    ///   It must be a non-empty single path component other than `.` or `..`,
+    ///   contain neither `/` nor NUL, and satisfy the driver's additional
+    ///   format-specific name restrictions.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` after adding the destination entry and incrementing
+    /// the source inode's backing link count. Returns `AlreadyExists` if
+    /// the destination name is occupied, `TooManyHardLinks` if the driver
+    /// cannot represent another hard link, or another driver error.
+    /// Returned errors leave both changes uncommitted.
+    fn link(
+        &self,
+        source: &Inode,
+        destination_parent: &Inode,
+        destination_name: &str,
+    ) -> Result<(), FileSystemError>;
+
     /// Removes a directory entry from its parent directory.
     ///
     /// The driver removes the entry named `name` from the directory identified
@@ -549,8 +594,9 @@ pub trait FileSystemInstance: Send + Sync {
     /// the VFS calls [`FileSystemInstance::free_inode`] separately when the
     /// count reaches zero.
     ///
-    /// The name disappears immediately, while any existing open handles can
-    /// access the data until the final close frees the inode.
+    /// The removed name disappears immediately. Other hard links and existing
+    /// open handles remain usable. The inode is freed only after its last
+    /// directory entry is removed and its last open handle is closed.
     ///
     /// # Arguments
     ///
@@ -578,9 +624,9 @@ pub trait FileSystemInstance: Send + Sync {
     /// in-place rename).
     ///
     /// If an entry named `new_name` already exists in `new_parent`, the
-    /// driver returns [`FileSystemError::AlreadyExists`]. The current VFS
-    /// also rejects an existing destination; overwriting rename is not
-    /// implemented.
+    /// driver returns [`FileSystemError::AlreadyExists`]. The VFS handles a
+    /// same-inode destination as a successful no-op without calling this method.
+    /// Replacing a different destination inode is not implemented.
     ///
     /// # Arguments
     ///

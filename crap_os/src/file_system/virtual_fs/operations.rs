@@ -1,25 +1,28 @@
 //! # Virtual File System - File Operations
 //!
-//! This module implements the file operation methods on
-//! [`super::vfs::VirtualFileSystem`]: the public interface that all kernel
-//! code uses to open, read, write, close, seek, stat, create, delete, rename,
-//! and create.
+//! This module implements the file and namespace operation methods on
+//! [`super::vfs::VirtualFileSystem`], including opening files, transferring
+//! data, querying metadata, and creating, removing, or renaming directory
+//! entries.
 //!
-//! These methods are the bridge between the abstract VFS layer and the
-//! filesystem drivers below. Each method resolves its path argument to an
-//! inode via the resolver, performs any necessary checks (type, permissions,
-//! lock state, access mode), dispatches to the appropriate
-//! [`super::driver::FileSystemInstance`] method, and updates the in-memory
-//! state (open-file table and inode metadata) to reflect
-//! the result.
+//! These methods coordinate VFS state with filesystem driver operations.
+//! Path-based methods resolve the object or its parent directory; handle-based
+//! methods use the registered open file. Each operation checks the applicable
+//! type, access mode, and lock state, calls the driver when needed, and updates
+//! the VFS state to reflect the result.
 //!
 //! ## Caller Responsibilities
 //!
 //! These methods operate at the kernel level and return kernel-side objects.
-//! The syscall layer above them is responsible for:
+//! Callers are responsible for:
 //!
-//! - Inserting the VFS-registered [`super::file::FileHandle`] into the calling
-//!   process's handle table and closing it before dropping the last reference.
+//! - Retaining each VFS-registered [`super::file::FileHandle`] in an owning
+//!   structure, such as a process handle table or kernel subsystem.
+//! - Closing each handle through the VFS before dropping its last reference.
+//!   A failed close leaves the handle open; its owner must retain it for retry.
+//!
+//! A future syscall layer is additionally responsible for:
+//!
 //! - Translating kernel-side [`super::types::FileSystemError`] values into
 //!   appropriate userspace error codes.
 //! - Copying [`super::types::InodeStat`] snapshots into userspace buffers
@@ -561,6 +564,104 @@ impl VirtualFileSystem {
         Ok(self.retain_inode(new_inode))
     }
 
+    /// Creates another directory entry for the inode at `source_path`.
+    ///
+    /// Both names share the same inode, data, metadata, and open-file master.
+    /// Only regular files and symlinks can be linked, and the destination
+    /// directory must belong to the source inode's file system instance.
+    /// An existing destination is never replaced, even when it names the
+    /// source inode.
+    ///
+    /// The caller holds the global VFS lock throughout. All VFS checks and
+    /// count arithmetic precede the driver mutation. After the driver commits,
+    /// only the canonical inode's in-memory link count is changed. The driver
+    /// has already updated its backing count, so this change does not itself
+    /// mark the inode dirty. Content timestamps remain unchanged.
+    ///
+    /// # Arguments
+    ///
+    /// * `source_path` - Existing absolute or relative source path.
+    ///   Intermediate symlinks are followed. A trailing slash requires a
+    ///   directory, which cannot be hard-linked.
+    /// * `destination_path` - New absolute or relative name. Its parent must
+    ///   exist. The final component must not be empty, `.` or `..`, contain
+    ///   NUL, or be followed by a trailing slash.
+    /// * `working_directory` - Base for both relative paths; `None` uses root.
+    /// * `follow_symlinks` - Whether to follow a final source symlink. When
+    ///   false, the new name refers to the symlink inode itself, even if its
+    ///   target does not exist. Relative symlink targets are interpreted from
+    ///   the directory containing whichever name is used to follow the link.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` after creating the name, `OperationNotAllowed` for a
+    /// directory source, `CrossFileSystemOperation` for different file system
+    /// instances, `AlreadyExists` for an occupied destination, or
+    /// `TooManyHardLinks` at the count limit. Invalid names, resolution failures,
+    /// and driver failures return their corresponding errors. A returned
+    /// error leaves the destination entry and source link count unchanged.
+    pub fn create_hard_link(
+        &mut self,
+        source_path: &str,
+        destination_path: &str,
+        working_directory: Option<Arc<Directory>>,
+        follow_symlinks: bool,
+    ) -> Result<(), FileSystemError> {
+        let (destination_parent_path, destination_name) =
+            split_parent_and_name(destination_path)?;
+        if destination_path.ends_with('/') {
+            return Err(FileSystemError::NotADirectory);
+        }
+        if destination_name == "." || destination_name == ".."
+            || destination_name.contains('\0')
+        {
+            return Err(FileSystemError::InvalidPath);
+        }
+
+        let source = self.resolve(
+            source_path, working_directory.clone(), follow_symlinks,
+        )?;
+        if source.is_directory() {
+            return Err(FileSystemError::OperationNotAllowed);
+        }
+
+        let destination_parent = self.resolve_dir_with_budget(
+            destination_parent_path,
+            working_directory,
+            super::resolver::MAX_SYMLINK_DEPTH,
+        )?;
+        if source.filesystem.instance_id()
+            != destination_parent.inode.filesystem.instance_id()
+        {
+            return Err(FileSystemError::CrossFileSystemOperation);
+        }
+        // A retained wrapper must not allow creation in an unlinked directory.
+        if destination_parent.inode.metadata.lock().link_count == 0 {
+            return Err(FileSystemError::NotFound);
+        }
+        if destination_parent.lookup_child(destination_name)?.is_some() {
+            return Err(FileSystemError::AlreadyExists);
+        }
+
+        let new_count = {
+            let metadata = source.metadata.lock();
+            if metadata.link_count == 0 {
+                return Err(FileSystemError::NotFound);
+            }
+            metadata.link_count.checked_add(1)
+                .ok_or(FileSystemError::TooManyHardLinks)?
+        };
+
+        // Do not hold the metadata lock while the driver commits its entry
+        // and backing count. The global VFS lock serializes this operation.
+        source.filesystem.link(
+            &source, &destination_parent.inode, destination_name,
+        )?;
+        source.metadata.lock().link_count = new_count;
+
+        Ok(())
+    }
+
     /// Removes the directory entry for the filesystem object at `path`.
     ///
     /// Resolves `path` to its parent directory and terminal name, then calls
@@ -699,9 +800,9 @@ impl VirtualFileSystem {
     /// mounted volumes, are not supported and return
     /// [`FileSystemError::InvalidPath`].
     ///
-    /// If an entry already exists at `new_path`, the rename is rejected with
-    /// [`FileSystemError::AlreadyExists`]. The caller is responsible for
-    /// removing the destination first if an overwriting rename is desired.
+    /// If both names refer to the same inode, returns success without changing
+    /// either entry. An existing destination for a different inode returns
+    /// [`FileSystemError::AlreadyExists`]; replacement is not implemented.
     ///
     /// # Arguments
     ///
@@ -712,12 +813,13 @@ impl VirtualFileSystem {
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` on success, `Err(FileSystemError::NotFound)` if
-    /// `old_path` does not exist, `Err(FileSystemError::AlreadyExists)` if
-    /// `new_path` already exists, `Err(FileSystemError::InvalidPath)` if the
-    /// two paths are on different filesystems, or other `Err(FileSystemError)`
-    /// variants for resolution, allocation, and I/O failures. No VFS lookup
-    /// occurs after a successful driver rename.
+    /// Returns `Ok(())` on success, including a same-inode no-op,
+    /// `Err(FileSystemError::NotFound)` if `old_path` does not exist,
+    /// `Err(FileSystemError::AlreadyExists)` if `new_path` names a different
+    /// inode, `Err(FileSystemError::InvalidPath)` if the two paths are on
+    /// different filesystems, or other `Err(FileSystemError)` variants for
+    /// resolution, allocation, and I/O failures. No VFS lookup occurs after
+    /// a successful driver rename.
     pub fn rename(
         &mut self,
         old_path: &str,
@@ -772,8 +874,12 @@ impl VirtualFileSystem {
             return Err(FileSystemError::NotADirectory);
         }
 
-        // Check the destination before changing driver state.
-        if new_parent.lookup_child(new_name)?.is_some() {
+        // Renaming between names of one inode is a successful no-op. Keep
+        // both directory entries and their shared link count unchanged.
+        if let Some(destination) = new_parent.lookup_child(new_name)? {
+            if destination.inode_number == moved_inode.inode_number {
+                return Ok(());
+            }
             return Err(FileSystemError::AlreadyExists);
         }
 

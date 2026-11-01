@@ -16,8 +16,8 @@
 //! represents a named reference to an inode within a specific parent
 //! directory. These are deliberately kept separate:
 //!
-//! - One inode may be referenced by multiple directory entries in the future
-//!   when hardlink support is added (TODO: add hardlinks in the future).
+//! - Regular-file and symlink inodes may be referenced by multiple directory
+//!   entries through hard links. Directories retain a single parent.
 //! - Removing a directory entry (unlinking) does not immediately destroy the
 //!   inode; the inode survives until its link count reaches zero and all open
 //!   handles are closed.
@@ -115,9 +115,8 @@ pub(crate) struct InodeMetadata {
 
     /// The number of directory entries that currently reference this inode.
     ///
-    /// Starts at `1` when the inode is created. Incremented when a new
-    /// directory entry pointing to this inode is created (in future hardlink
-    /// support), and decremented when a directory entry is removed. When
+    /// Starts at `1` when the inode is created. Incremented when a hard link
+    /// is created, and decremented when a directory entry is removed. When
     /// `link_count` reaches `0` and no open file handles remain, the VFS
     /// instructs the filesystem driver to free the inode's data blocks and
     /// release the inode slot.

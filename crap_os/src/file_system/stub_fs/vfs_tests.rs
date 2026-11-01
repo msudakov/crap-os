@@ -33,7 +33,9 @@
 //!     and real unmount lookup.
 //! 16. **Moved working directory** - checks `..` from a retained wrapper.
 //! 17. **Trailing slashes** - requires a directory at the end of a path.
-//! 18. **Teardown** - drops the root volume cleanly.
+//! 18. **Hard links** - checks alias identity, data, counts, symlink policy,
+//!     rejected mutations, rename between aliases, and final reclamation.
+//! 19. **Teardown** - drops the root volume cleanly.
 
 extern crate alloc;
 
@@ -86,6 +88,7 @@ pub fn run_vfs_tests() {
     test_mount_wrapper_consistency();
     test_moved_working_directory_parent();
     test_trailing_slash_paths();
+    test_hard_links();
     test_unmount();
 
     sprintln!("[VFS TEST] ----------------------------------------");
@@ -1561,6 +1564,303 @@ fn test_trailing_slash_paths() {
     );
 
     sprintln!("[VFS TEST] trailing slash paths ... PASS");
+}
+
+/// Checks hard-link identity, failure behavior, and final-name reclamation.
+///
+/// Uses private fixtures so existing tests retain their expected namespace.
+/// Direct driver loads verify backing counts independently of VFS retention.
+///
+/// # Panics
+///
+/// Panics if a link changes identity, a failed mutation changes counts or
+/// entries, alias data differs, or storage is freed at the wrong lifetime.
+fn test_hard_links() {
+    sprintln!("[VFS TEST] hard links ...");
+
+    with_vfs(|vfs| {
+        let source = expect_ok(vfs.create_file(
+            "/etc/hard-source", Permissions::all_permissive(), None,
+        ), "create hard-link source");
+        let cwd = expect_ok(vfs.resolve_dir_with_budget(
+            "/etc", None,
+            crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH,
+        ), "retain hard-link destination parent");
+
+        expect_ok(vfs.create_hard_link(
+            "hard-source",
+            "../var/log/hard-alias",
+            Some(Arc::clone(&cwd)),
+            false,
+        ), "create cross-directory relative hard link");
+
+        let alias = expect_ok(vfs.resolve(
+            "/var/log/hard-alias", None, false,
+        ), "resolve hard-link alias");
+        assert!(Arc::ptr_eq(&source, &alias),
+            "[VFS TEST] FAIL - hard-link names must share the canonical inode");
+        assert_eq!(source.stat().link_count, 2);
+
+        let backing = expect_ok(source.filesystem.load_inode(
+            source.inode_number,
+        ), "reload backing count after link");
+        assert_eq!(backing.stat().link_count, 2);
+
+        let first = expect_ok(vfs.open(
+            "/etc/hard-source", AccessMode::ReadWrite, None,
+        ), "open first name");
+        let second = expect_ok(vfs.open(
+            "/var/log/hard-alias", AccessMode::ReadWrite, None,
+        ), "open second name");
+
+        assert!(Arc::ptr_eq(&first.file, &second.file),
+            "[VFS TEST] FAIL - hard-link opens must share the file master");
+        assert_eq!(
+            expect_ok(vfs.write(&first, b"shared"), "write first name"),
+            6,
+        );
+
+        let mut data = [0u8; 6];
+        assert_eq!(
+            expect_ok(vfs.read(&second, &mut data), "read second name"),
+            6,
+        );
+        assert_eq!(&data, b"shared");
+        assert_eq!(alias.stat().size, 6);
+
+        expect_ok(vfs.rename(
+            "/etc/hard-source", "/var/log/hard-alias", None,
+        ), "rename between aliases is a no-op");
+        assert_eq!(expect_ok(vfs.stat(
+            "/etc/hard-source", None, false,
+        ), "source survives same-inode rename").link_count, 2);
+        assert_eq!(expect_ok(vfs.stat(
+            "/var/log/hard-alias", None, false,
+        ), "alias survives same-inode rename").link_count, 2);
+
+        // VFS preflight failures must not publish another name or count.
+        expect_err(vfs.create_hard_link(
+            "/etc/hard-source", "/var/log/hard-alias", None, false,
+        ), FileSystemError::AlreadyExists, "existing alias destination");
+
+        expect_err(vfs.create_hard_link(
+            "/etc/hard-source", "/etc/hard-source", None, false,
+        ), FileSystemError::AlreadyExists, "hard link onto its own name");
+
+        expect_err(vfs.create_hard_link(
+            "/etc", "/etc/hard-directory", None, false,
+        ), FileSystemError::OperationNotAllowed, "directory hard link");
+
+        expect_err(vfs.create_hard_link(
+            "/etc/hard-source", "/etc/hard-slash/", None, false,
+        ), FileSystemError::NotADirectory, "destination trailing slash");
+
+        expect_err(vfs.create_hard_link(
+            "/etc/hard-source/", "/etc/hard-source-slash", None, false,
+        ), FileSystemError::NotADirectory, "source trailing slash");
+
+        for name in ["/etc/.", "/etc/..", "/etc/hard\0invalid"] {
+            expect_err(vfs.create_hard_link(
+                "/etc/hard-source", name, None, false,
+            ), FileSystemError::InvalidPath, "invalid destination component");
+        }
+
+        expect_err(vfs.create_hard_link(
+            "/etc/hard-missing", "/etc/hard-uncreated", None, false,
+        ), FileSystemError::NotFound, "missing source");
+
+        expect_err(vfs.create_hard_link(
+            "/etc/hard-source", "/etc/hard-missing/child", None, false,
+        ), FileSystemError::NotFound, "missing destination parent");
+
+        // Exercise the driver's own failed-mutation path, bypassing VFS
+        // preflight but leaving the canonical count untouched.
+        expect_err(source.filesystem.link(
+            &source, &cwd.inode, "hard-source",
+        ), FileSystemError::AlreadyExists, "driver rejects duplicate name");
+        assert_eq!(source.stat().link_count, 2);
+        assert_eq!(expect_ok(source.filesystem.load_inode(
+            source.inode_number,
+        ), "backing count after rejected driver link").stat().link_count, 2);
+
+        // Temporarily raise only the VFS count to exercise its arithmetic
+        // limit. Restore it before any successful driver mutation.
+        source.metadata.lock().link_count = u32::MAX;
+        let overflow = vfs.create_hard_link(
+            "/etc/hard-source", "/etc/hard-overflow", None, false,
+        );
+        source.metadata.lock().link_count = 2;
+        expect_err(
+            overflow,
+            FileSystemError::TooManyHardLinks,
+            "VFS count limit",
+        );
+
+        for path in [
+            "/etc/hard-directory",
+            "/etc/hard-slash",
+            "/etc/hard-source-slash",
+            "/etc/hard-uncreated",
+            "/etc/hard-overflow",
+        ] {
+            expect_err(
+                vfs.resolve(path, None, false),
+                FileSystemError::NotFound,
+                "rejected link left no entry",
+            );
+        }
+
+        // First unlink leaves a live alias. Closing every current handle
+        // must not free it; a later open through that alias still succeeds.
+        expect_ok(vfs.delete(
+            "/etc/hard-source", None,
+        ), "unlink first name");
+        assert_eq!(source.stat().link_count, 1);
+        assert_eq!(expect_ok(source.filesystem.load_inode(
+            source.inode_number,
+        ), "backing count after first unlink").stat().link_count, 1);
+
+        expect_ok(vfs.close(&first), "close first handle with alias remaining");
+        expect_ok(vfs.close(&second), "close second handle with alias remaining");
+
+        let reopened = expect_ok(vfs.open(
+            "/var/log/hard-alias", AccessMode::ReadWrite, None,
+        ), "reopen surviving alias");
+        let independent = expect_ok(vfs.open(
+            "/var/log/hard-alias", AccessMode::ReadOnly, None,
+        ), "second open before final unlink");
+
+        expect_ok(vfs.delete(
+            "/var/log/hard-alias", None,
+        ), "unlink final name");
+        assert_eq!(source.stat().link_count, 0);
+
+        expect_err(vfs.open(
+            "/var/log/hard-alias", AccessMode::ReadOnly, None,
+        ), FileSystemError::NotFound, "final name is gone");
+        assert_eq!(expect_ok(source.filesystem.load_inode(
+            source.inode_number,
+        ), "unlinked backing inode remains open").stat().link_count, 0);
+
+        let mut after_unlink = [0u8; 6];
+        assert_eq!(expect_ok(
+            vfs.read(&reopened, &mut after_unlink),
+            "read after final unlink",
+        ), 6);
+        assert_eq!(&after_unlink, b"shared");
+
+        expect_ok(vfs.close(&reopened), "close one unlinked open");
+        expect_ok(
+            source.filesystem.load_inode(source.inode_number),
+            "storage survives a non-final close",
+        );
+        expect_ok(vfs.close(&independent), "final close reclaims inode");
+        expect_err(
+            source.filesystem.load_inode(source.inode_number),
+            FileSystemError::NotFound,
+            "backing inode reclaimed",
+        );
+
+        // No-open-handle final unlink must reclaim storage immediately too.
+        let immediate = expect_ok(vfs.create_file(
+            "/etc/hard-immediate", Permissions::all_permissive(), None,
+        ), "create immediate-free fixture");
+
+        expect_ok(vfs.create_hard_link(
+            "/etc/hard-immediate",
+            "/etc/hard-immediate-alias",
+            None,
+            false,
+        ), "link immediate-free fixture");
+
+        expect_ok(vfs.delete(
+            "/etc/hard-immediate", None,
+        ), "first immediate unlink");
+        expect_ok(vfs.delete(
+            "/etc/hard-immediate-alias", None,
+        ), "last immediate unlink");
+        expect_err(
+            immediate.filesystem.load_inode(immediate.inode_number),
+            FileSystemError::NotFound,
+            "immediate inode reclaimed",
+        );
+
+        // Both source-symlink policies, including dangling targets.
+        let target = expect_ok(vfs.create_file(
+            "/etc/hard-target", Permissions::all_permissive(), None,
+        ), "create symlink target");
+        let symlink = expect_ok(vfs.create_symlink(
+            "/etc/hard-symlink", "/etc/hard-target", None,
+        ), "create source symlink");
+
+        expect_ok(vfs.create_hard_link(
+            "/etc/hard-symlink", "/etc/hard-symlink-alias", None, false,
+        ), "link symlink itself");
+        expect_ok(vfs.create_hard_link(
+            "/etc/hard-symlink", "/etc/hard-target-alias", None, true,
+        ), "link followed symlink target");
+
+        assert!(Arc::ptr_eq(&symlink, &expect_ok(vfs.resolve(
+            "/etc/hard-symlink-alias", None, false,
+        ), "resolve symlink alias without following")));
+        assert!(Arc::ptr_eq(&target, &expect_ok(vfs.resolve(
+            "/etc/hard-target-alias", None, false,
+        ), "resolve followed-target alias")));
+        assert_eq!(symlink.stat().link_count, 2);
+        assert_eq!(target.stat().link_count, 2);
+
+        let dangling = expect_ok(vfs.create_symlink(
+            "/etc/hard-dangling", "/etc/hard-absent-target", None,
+        ), "create dangling symlink");
+        expect_ok(vfs.create_hard_link(
+            "/etc/hard-dangling", "/etc/hard-dangling-alias", None, false,
+        ), "link dangling symlink inode");
+        expect_err(vfs.create_hard_link(
+            "/etc/hard-dangling", "/etc/hard-dangling-followed", None, true,
+        ), FileSystemError::NotFound, "follow dangling source symlink");
+        expect_err(vfs.create_hard_link(
+            "/etc/hard-target", "/etc/hard-dangling", None, false,
+        ), FileSystemError::AlreadyExists, "dangling destination is occupied");
+        assert_eq!(dangling.stat().link_count, 2);
+
+        // A destination on another mounted instance cannot name this inode.
+        expect_ok(vfs.create_directory(
+            "/etc/hard-mount", Permissions::all_permissive(), None,
+        ), "create hard-link mount host");
+        expect_ok(vfs.mount(
+            "stubfs", Arc::new(StubBlockDevice), "/etc/hard-mount", None,
+        ), "mount hard-link boundary fixture");
+
+        expect_err(vfs.create_hard_link(
+            "/etc/hard-target", "/etc/hard-mount/hard-cross", None, false,
+        ), FileSystemError::CrossFileSystemOperation, "cross-instance hard link");
+        expect_err(
+            vfs.resolve("/etc/hard-mount/hard-cross", None, false),
+            FileSystemError::NotFound,
+            "no cross-instance destination created",
+        );
+        assert_eq!(target.stat().link_count, 2);
+
+        expect_ok(vfs.unmount(
+            "/etc/hard-mount", None,
+        ), "unmount boundary fixture");
+        expect_ok(vfs.delete(
+            "/etc/hard-mount", None,
+        ), "remove mount host");
+
+        for path in [
+            "/etc/hard-symlink",
+            "/etc/hard-symlink-alias",
+            "/etc/hard-dangling",
+            "/etc/hard-dangling-alias",
+            "/etc/hard-target",
+            "/etc/hard-target-alias",
+        ] {
+            expect_ok(vfs.delete(path, None), "remove hard-link fixture");
+        }
+    });
+
+    sprintln!("[VFS TEST] hard links ... PASS");
 }
 
 /// Tears down the stub filesystem cleanly.

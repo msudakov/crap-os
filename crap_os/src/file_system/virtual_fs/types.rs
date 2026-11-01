@@ -39,11 +39,7 @@ use crate::kernel_hashmap::KernelHash;
 /// Every fallible function in the VFS layer returns `Result<T,
 /// FileSystemError>`. Filesystem drivers map their own internal error
 /// conditions onto these variants when returning from trait methods, so the
-/// VFS and path resolver never need to know which driver is
-/// underneath.
-///
-/// Variants are ordered from most-structural (format/mount problems) to
-/// most-operational (I/O and permission failures) for readability.
+/// VFS and path resolver never need to know which driver is underneath.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum FileSystemError {
     /// The on-disk format was not recognized by the driver, or the superblock
@@ -61,7 +57,7 @@ pub enum FileSystemError {
     /// The block device reported an unrecoverable write error.
     DiskWriteError,
 
-    /// The filesystem is mounted read-only and the requested operation would
+    /// The filesystem is mounted read-only, and the requested operation would
     /// modify it.
     ReadOnlyFilesystem,
 
@@ -87,14 +83,27 @@ pub enum FileSystemError {
     /// A directory entry with the requested name already exists.
     AlreadyExists,
 
+    /// The operation requires its source and destination to belong to the
+    /// same file system instance, but they belong to different instances.
+    CrossFileSystemOperation,
+
+    /// Creating another hard link would exceed the VFS or driver limit
+    /// on the number of directory entries naming one inode.
+    TooManyHardLinks,
+
     /// A directory that was expected to be empty (e.g., for removal) still
     /// contains entries.
     DirectoryNotEmpty,
 
     /// Symlink resolution exceeded
     /// [`crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH`] hops,
-    /// indicating a symlink loop or a pathologically deep chain.
+    /// indicating a symlink loop or an exceedingly-deep chain.
     TooManySymlinks,
+
+    /// The requested operation is prohibited by the rules for the target
+    /// object, regardless of the caller's permissions (e.g., creating a
+    /// directory hard link).
+    OperationNotAllowed,
 
     /// The calling context does not have the required permissions for the
     /// requested operation.
@@ -113,17 +122,16 @@ pub enum FileSystemError {
     /// holds an exclusive write lock on the same file.
     FileLocked,
 
-    /// The supplied handle value did not correspond to any live entry in the
-    /// calling process's handle table.
+    /// A file handle was closed, was not registered with this VFS, or did not
+    /// belong to the expected open-file master record.
     InvalidHandle,
 
     /// The path string was empty, contained illegal characters, or exceeded
     /// the maximum supported length.
     InvalidPath,
 
-    /// An operation was attempted on an inode that has been marked for
-    /// deletion (all directory entries removed) and is awaiting final
-    /// reclamation once its last handle closes.
+    /// An operation was attempted on a file whose last directory entry was
+    /// removed and whose storage awaits reclamation after its last close.
     PendingDeletion,
 
     /// A mount point could not be established because the target directory
@@ -145,13 +153,13 @@ pub enum FileSystemError {
 
 /// Classifies an inode by the kind of filesystem object it represents.
 ///
-/// The VFS recognizes exactly three inode kinds. Each maps to a distinct
-/// wrapper type (`File`, `Directory`, `Symlink`) and is handled separately
-/// throughout path resolution and the open-file machinery.
+/// The VFS recognizes exactly three inode kinds: regular files, directories,
+/// and symlinks. Symlinks are handled directly through their inodes rather
+/// than through a separate wrapper type.
 ///
-/// Deliberately narrow: devices, pipes, and sockets are not filesystem objects
-/// in this kernel's model and are managed by their own subsystems outside the
-/// VFS.
+/// This is deliberately narrow. Devices, pipes, and sockets are not
+/// filesystem objects in this kernel's model and are managed by their own
+/// subsystems outside the VFS.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InodeType {
     /// A regular file is a named sequence of bytes stored on disk.
@@ -257,12 +265,12 @@ pub enum FileLockState {
     /// [`holder_handle`]. No other handle may write to this file until the lock
     /// is released.
     ///
-    /// The [`holder_handle`] field stores the process-local handle value (a
-    /// `u32`) of the handle that acquired the lock, allowing the VFS to
-    /// identify and validate lock-release requests.
+    /// The [`holder_handle`] field stores the VFS-wide identifier of the
+    /// handle that acquired the lock. Process-local handle values are not
+    /// unique across processes and cannot identify a lock holder here.
     WriteExclusive {
-        /// The process-local handle value of the lock holder.
-        holder_handle: u32,
+        /// The VFS-wide identifier of the lock holder.
+        holder_handle: u64,
     },
 }
 
@@ -275,7 +283,7 @@ pub enum FileLockState {
 ///
 /// Timestamps are set and updated exclusively by VFS-layer code; filesystem
 /// drivers receive a populated [`Timestamps`] value when creating or syncing an
-/// inode and write it to disk as-is.
+/// inode and write it to disk as it is.
 ///
 /// When the `WallClock` is not yet initialized (before the RTC anchor is
 /// established during kernel boot), callers should substitute `0` as a
@@ -307,7 +315,7 @@ impl Timestamps {
     ///
     /// # Returns
     ///
-    /// Returns a `Timestamps` where `created`, `modified`, and `accessed` are
+    /// Returns a [`Timestamps`] where `created`, `modified`, and `accessed` are
     /// all equal to `now`.
     pub fn new(now: u64) -> Self {
         Self {
@@ -326,7 +334,7 @@ impl Timestamps {
     ///
     /// # Returns
     ///
-    /// Returns a `Timestamps` where `created`, `modified`, and `accessed`
+    /// Returns a [`Timestamps`] where `created`, `modified`, and `accessed`
     /// are all `0`.
     pub fn zero() -> Self {
         Self {
@@ -359,15 +367,15 @@ pub struct Permissions {
 }
 
 impl Permissions {
-    /// Constructs a permissive `Permissions` value that grants all access.
+    /// Constructs a permissive [`Permissions`] value that grants all access.
     ///
-    /// Used as a stand-in everywhere a `Permissions` value is required before
+    /// Used as a stand-in everywhere a [`Permissions`] value is required before
     /// the real ACL model is in place. All permission checks against this
     /// value must pass unconditionally.
     ///
     /// # Returns
     ///
-    /// Returns a `Permissions` instance representing unrestricted access.
+    /// Returns a [`Permissions`] instance representing unrestricted access.
     pub fn all_permissive() -> Self {
         Self { _reserved: 0 }
     }
@@ -381,7 +389,7 @@ impl Permissions {
 /// directly onto what a future `stat()` syscall will need to copy into a
 /// userspace buffer.
 ///
-/// Filesystem drivers do not produce `InodeStat` directly; the VFS constructs
+/// Filesystem drivers do not produce [`InodeStat`] directly; the VFS constructs
 /// one from a loaded `Inode` at the point `stat()` is called.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InodeStat {
@@ -393,16 +401,15 @@ pub struct InodeStat {
 
     /// The total size of the inode's data in bytes.
     ///
-    /// For regular files this is the file length. For symlinks this is the
-    /// byte length of the target path string. For directories this field is
+    /// For regular files, this is the file length. For symlinks, this is the
+    /// byte length of the target path string. For directories, this field is
     /// filesystem-defined and should not be relied upon by callers.
     pub size: u64,
 
-    /// The access-control permissions associated with this inode.
+    /// The access control permissions associated with this inode.
     pub permissions: Permissions,
 
-    /// Creation, modification, and last-access timestamps in Unix epoch
-    /// milliseconds.
+    /// Creation, modification, and last-access timestamps.
     pub timestamps: Timestamps,
 
     /// The number of directory entries that reference this inode.
@@ -422,8 +429,8 @@ pub struct InodeStat {
 /// combines a per-instance `filesystem_id` with the `inode_number` to
 /// guarantee global uniqueness across all mounted volumes.
 ///
-/// The `filesystem_id` is assigned by the `VirtualFileSystem` when a filesystem
-/// is mounted and remains stable for the lifetime of that mount.
+/// The `filesystem_id` is assigned by the filesystem driver when it creates
+/// a mounted instance and remains stable for that instance's lifetime.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct OpenFileKey {
     /// The unique identifier assigned to the mounted filesystem instance that
@@ -447,21 +454,21 @@ impl OpenFileKey {
     ///
     /// # Returns
     ///
-    /// Returns a new `OpenFileKey` combining both identifiers.
+    /// Returns a new [`OpenFileKey`] combining both identifiers.
     pub fn new(filesystem_id: u64, inode_number: u64) -> Self {
         Self { filesystem_id, inode_number }
     }
 }
 
-/// Implements [`crate::kernel_hashmap::KernelHash`] for [`OpenFileKey`] so
+/// Implements [`crate::kernel_hashmap::KernelHash`] for [`OpenFileKey`], so
 /// that it can be used as a key in [`crate::kernel_hashmap::KernelHashMap`].
 impl KernelHash for OpenFileKey {
-    /// Computes the hash by running FNV-1a over `filesystem_id` first (via its
-    /// own [`crate::kernel_hashmap::KernelHash`] impl), then continuing the
-    /// FNV-1a state over the bytes of `inode_number`. Chaining the two fields
-    /// through a single FNV-1a pass (rather than XOR-ing two independent hashes
-    /// together) ensures that field order contributes to the result, so
-    /// `(a, b)` and `(b, a)` produce different hash values and the risk of
+    /// Computes the hash by running the algorithm over `filesystem_id` first
+    /// (via its own [`crate::kernel_hashmap::KernelHash`] impl), then
+    /// continuing the state over the bytes of `inode_number`. Chaining the two
+    /// fields through a single pass (rather than XOR-ing two independent hashes
+    /// together) ensures that field order contributes to the result. This way,
+    /// `(a, b)` and `(b, a)` produce different hash values, and the risk of
     /// systematic collisions between transposed key pairs is avoided.
     /// 
     /// # Returns

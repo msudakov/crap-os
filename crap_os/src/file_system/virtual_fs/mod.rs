@@ -12,10 +12,7 @@
 //! responsibility:
 //!
 //! - [`types`] - foundational enums and structs shared across all other VFS
-//!   submodules: [`types::FileSystemError`], [`types::InodeType`],
-//!   [`types::DirectoryEntryType`], [`types::AccessMode`],
-//!   [`types::FileLockState`], [`types::Timestamps`], [`types::Permissions`],
-//!   [`types::InodeStat`], and [`types::OpenFileKey`].
+//!   submodules.
 //!
 //! - [`inode`] - the in-memory inode ([`inode::Inode`]) and directory entry
 //!   ([`inode::DirectoryEntry`]) types. These are the two most fundamental
@@ -23,14 +20,14 @@
 //!   representations onto them.
 //!
 //! - [`directory`] - the [`directory::Directory`] wrapper, which sits above
-//!   an [`inode::Inode`] of type [`types::InodeType::Directory`] and adds
-//!   the VFS-layer state needed for tree traversal: a lazily loaded child
-//!   list, a weak parent reference, and an optional mount-root pointer.
+//!   an [`inode::Inode`] of type [`types::InodeType::Directory`] and retains
+//!   the parent reference needed for `..` traversal. Child lookups read fresh
+//!   driver listings; mount state lives in the VFS mount table.
 //!
 //! - [`file`] - the two-tier open-file model: [`file::File`] is the master
-//!   record (one per inode with at least one open handle, owned by the object
-//!   manager), and [`file::FileHandle`] is the per-open-call instance (one
-//!   per `open()` call, owned by the calling process's handle table entry).
+//!   record (one per inode with at least one open handle, held in the VFS
+//!   open-file table), and [`file::FileHandle`] is the per-open-call instance
+//!   returned to the caller as an `Arc`.
 //!
 //! - [`driver`] - the [`driver::FileSystemDriver`] and
 //!   [`driver::FileSystemInstance`] traits that every filesystem driver must
@@ -47,13 +44,14 @@
 //!
 //! - [`resolver`] - the path resolution algorithm, implemented as methods on
 //!   [`vfs::VirtualFileSystem`]. Walks a path string component by component
-//!   through the in-memory directory tree, handling `.`, `..`, symlink
+//!   through fresh driver directory listings, handling `.`, `..`, symlink
 //!   following (with a configurable depth limit), and mount boundary crossing
 //!   in both directions.
 //!
 //! - [`operations`] - the file operation methods on [`vfs::VirtualFileSystem`]:
 //!   `open`, `read`, `write`, `close`, `seek`, `stat`, `create_file`,
-//!   `create_directory`, `create_symlink`, `delete`, and `rename`.
+//!   `create_directory`, `create_symlink`, `create_hard_link`, `delete`, and
+//!   `rename`.
 //!
 //! ## Dependency Order
 //!

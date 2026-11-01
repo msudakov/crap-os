@@ -1,25 +1,28 @@
 //! # Virtual File System - File Operations
 //!
-//! This module implements the file operation methods on
-//! [`super::vfs::VirtualFileSystem`]: the public interface that all kernel
-//! code uses to open, read, write, close, seek, stat, create, delete, rename,
-//! and create symlinks.
+//! This module implements the file and namespace operation methods on
+//! [`super::vfs::VirtualFileSystem`], including opening files, transferring
+//! data, querying metadata, and creating, removing, or renaming directory
+//! entries.
 //!
-//! These methods are the bridge between the abstract VFS layer and the
-//! filesystem drivers below. Each method resolves its path argument to an
-//! inode via the resolver, performs any necessary checks (type, permissions,
-//! lock state, access mode), dispatches to the appropriate
-//! [`super::driver::FileSystemInstance`] method, and updates the in-memory
-//! state (open-file table, directory child lists, inode metadata) to reflect
-//! the result.
+//! These methods coordinate VFS state with filesystem driver operations.
+//! Path-based methods resolve the object or its parent directory; handle-based
+//! methods use the registered open file. Each operation checks the applicable
+//! type, access mode, and lock state, calls the driver when needed, and updates
+//! the VFS state to reflect the result.
 //!
 //! ## Caller Responsibilities
 //!
 //! These methods operate at the kernel level and return kernel-side objects.
-//! The syscall layer above them is responsible for:
+//! Callers are responsible for:
 //!
-//! - Registering the returned [`super::file::FileHandle`] with the object
-//!   manager and inserting it into the calling process's handle table.
+//! - Retaining each VFS-registered [`super::file::FileHandle`] in an owning
+//!   structure, such as a process handle table or kernel subsystem.
+//! - Closing each handle through the VFS before dropping its last reference.
+//!   A failed close leaves the handle open; its owner must retain it for retry.
+//!
+//! A future syscall layer is additionally responsible for:
+//!
 //! - Translating kernel-side [`super::types::FileSystemError`] values into
 //!   appropriate userspace error codes.
 //! - Copying [`super::types::InodeStat`] snapshots into userspace buffers
@@ -30,10 +33,10 @@
 //! The open-file table in [`super::vfs::VirtualFileSystem`] holds one
 //! [`super::file::File`] master record per inode that has at least one open
 //! handle. [`super::vfs::VirtualFileSystem::open`] inserts a master record on
-//! the first open and registers each subsequent handle with the existing
-//! record. [`super::vfs::VirtualFileSystem::close`] decrements the handle
-//! count and removes the master record when the last handle closes, triggering
-//! any pending deletion if the inode's link count has reached zero.
+//! the first open and registers every returned handle with its record.
+//! [`super::vfs::VirtualFileSystem::close`] unregisters the exact handle and
+//! removes the master record when no registrations remain, reclaiming the
+//! inode first if the master is pending deletion.
 
 #![allow(dead_code)]
 
@@ -41,16 +44,15 @@ use alloc::sync::Arc;
 
 use super::directory::Directory;
 use super::file::{File, FileHandle};
-use super::inode::DirectoryEntry;
 use super::types::{
-    AccessMode, DirectoryEntryType, FileSystemError, InodeStat, InodeType,
-    OpenFileKey, Permissions, Timestamps,
+    AccessMode, FileSystemError, InodeStat, OpenFileKey,
+    Permissions, Timestamps,
 };
 use super::vfs::VirtualFileSystem;
 use crate::globals;
 
 impl VirtualFileSystem {
-    /// Opens the file at `path` and returns a new [`FileHandle`] for it.
+    /// Opens the file at `path` and returns a registered [`FileHandle`].
     ///
     /// Resolves `path` to an inode, verifies it is a regular file, then
     /// either retrieves the existing [`super::file::File`] master record from
@@ -58,10 +60,9 @@ impl VirtualFileSystem {
     /// created for this open call, registered with the master record, and
     /// returned to the caller.
     ///
-    /// The returned [`FileHandle`] must be wrapped in an [`Arc`] by the caller
-    /// and registered with the object manager before being placed in a process
-    /// handle table. The [`Arc`] is what keeps the handle alive and what the
-    /// master record holds a `Weak` reference to.
+    /// The VFS wraps the handle in an [`Arc`] and registers it before
+    /// returning. The caller owns that registered handle and must close it
+    /// explicitly.
     ///
     /// If `path` resolves to a symlink, the symlink is followed and the
     /// target file is opened. To open the symlink inode itself, use a path
@@ -78,9 +79,7 @@ impl VirtualFileSystem {
     ///
     /// # Returns
     ///
-    /// Returns `Ok(FileHandle)` on success. The caller must immediately wrap
-    /// this in an [`Arc<FileHandle>`] and register it with the master record
-    /// via [`super::file::File::register_handle`]. Returns
+    /// Returns `Ok(Arc<FileHandle>)` on success. Returns
     /// `Err(FileSystemError::NotFound)` if the path does not exist,
     /// `Err(FileSystemError::NotAFile)` if it resolves to a non-file inode,
     /// or other `Err(FileSystemError)` variants for I/O and resolution
@@ -90,7 +89,7 @@ impl VirtualFileSystem {
         path: &str,
         access_mode: AccessMode,
         working_directory: Option<Arc<Directory>>,
-    ) -> Result<FileHandle, FileSystemError> {
+    ) -> Result<Arc<FileHandle>, FileSystemError> {
         // Resolve the path, following symlinks so the caller gets the target
         // file rather than the symlink inode.
         let inode = self.resolve(path, working_directory, true)?;
@@ -100,24 +99,33 @@ impl VirtualFileSystem {
             return Err(FileSystemError::NotAFile);
         }
 
-        // Reject opens on inodes that are pending deletion. The inode has no
-        // directory entries left and cannot be found by name, so this path
-        // can only be reached through a race; we treat it as NotFound.
-        if inode.pending_deletion {
+        let key = OpenFileKey::new(inode.filesystem.instance_id(),
+            inode.inode_number);
+
+        // A retained directory wrapper may still name an unlinked inode.
+        // Its open-file master records the deletion while handles remain.
+        if self.open_files.get(&key)
+            .is_some_and(|master| master.is_pending_deletion())
+        {
             return Err(FileSystemError::NotFound);
         }
 
-        let key = OpenFileKey::new(
-            inode.filesystem.instance_id(),
-            inode.inode_number,
-        );
+        // Refuse ID exhaustion rather than reusing the identity of a handle
+        // that could still hold an exclusive write lock.
+        let handle_id = self.next_handle_id;
+        self.next_handle_id = handle_id
+            .checked_add(1)
+            .ok_or(FileSystemError::InternalError)?;
 
         // Retrieve the existing master record or create a new one.
         let master = self.open_files
             .entry(key)
             .or_insert_with(|| Arc::new(File::new(Arc::clone(&inode))));
 
-        let handle = FileHandle::new(Arc::clone(master), access_mode);
+        let handle = Arc::new(FileHandle::new(
+            Arc::clone(master), handle_id, access_mode,
+        ));
+        master.register_handle(&handle);
         Ok(handle)
     }
 
@@ -128,11 +136,14 @@ impl VirtualFileSystem {
     /// driver via [`super::driver::FileSystemInstance::read`].
     ///
     /// After a successful read, `accessed` on the underlying inode's timestamps
-    /// is updated, and the inode is marked dirty for a future sync.
+    /// is updated, and the inode is marked dirty for a later sync.
     ///
     /// A read of zero bytes (e.g., because the handle is at the end of the
     /// file) is not an error; the driver returns `0` and the handle position
     /// is unchanged.
+    /// The handle state is locked through the driver read and offset update so
+    /// operations sharing this handle cannot read from the same offset. A
+    /// closed handle returns `InvalidHandle` before calling the driver.
     ///
     /// # Arguments
     ///
@@ -146,21 +157,25 @@ impl VirtualFileSystem {
     ///
     /// Returns `Ok(usize)` with the number of bytes read and placed in
     /// `buffer`. Returns `Err(FileSystemError::InvalidAccessMode)` if the
-    /// handle does not permit reads, or other `Err(FileSystemError)` variants
-    /// for I/O failures.
+    /// handle does not permit reads, `InvalidHandle` if it was closed, or
+    /// other `Err(FileSystemError)` variants for I/O failures.
     pub fn read(
         &mut self,
-        handle: &mut FileHandle,
+        handle: &FileHandle,
         buffer: &mut [u8],
     ) -> Result<usize, FileSystemError> {
+        let mut state = handle.state.lock();
+        if state.closed {
+            return Err(FileSystemError::InvalidHandle);
+        }
         if !handle.can_read() {
             return Err(FileSystemError::InvalidAccessMode);
         }
 
         let inode = Arc::clone(&handle.file.inode);
-        let bytes_read = inode.filesystem.read(&inode, handle.position,buffer)?;
-
-        handle.advance_position(bytes_read);
+        let bytes_read = inode.filesystem.read(&inode, state.position, buffer)?;
+        state.position = state.position.saturating_add(bytes_read as u64);
+        drop(state);
 
         // Update the accessed timestamp and mark the inode dirty.
         self.touch_accessed(&inode)?;
@@ -181,15 +196,15 @@ impl VirtualFileSystem {
     ///
     /// After a successful write, `modified` and `accessed` on the underlying
     /// inode's timestamps are updated, `size` is updated if the write extended
-    /// the file, and the inode is marked dirty for a future sync.
+    /// the file, and the inode is marked dirty for a later sync.
+    /// The handle state is locked through the driver write and offset update so
+    /// operations sharing this handle cannot write from the same offset. A
+    /// closed handle returns `InvalidHandle` before calling the driver.
     ///
     /// # Arguments
     ///
     /// * `handle`       - The file handle to write through. Must have
     ///   [`AccessMode::WriteOnly`] or [`AccessMode::ReadWrite`].
-    /// * `handle_value` - The process-local handle value for `handle`, used
-    ///   to check write-lock ownership. Supplied by the object manager at the
-    ///   syscall boundary.
     /// * `buffer`       - The source buffer whose entire contents are written
     ///   starting at the handle's current position.
     ///
@@ -197,113 +212,109 @@ impl VirtualFileSystem {
     ///
     /// Returns `Ok(usize)` with the number of bytes written, which equals
     /// `buffer.len()` on success. Returns
-    /// `Err(FileSystemError::InvalidAccessMode)` if the handle does not permit
-    /// writes, `Err(FileSystemError::FileLocked)` if the file is exclusively
-    /// locked by another handle, or other `Err(FileSystemError)` variants for
-    /// I/O failures.
+    /// `Err(FileSystemError::InvalidHandle)` if the handle was closed,
+    /// `Err(FileSystemError::InvalidAccessMode)` if it does not permit writes,
+    /// `Err(FileSystemError::FileLocked)` if another handle owns the exclusive
+    /// write lock, or other `Err(FileSystemError)` variants for I/O failures.
     pub fn write(
         &mut self,
-        handle: &mut FileHandle,
-        handle_value: u32,
+        handle: &FileHandle,
         buffer: &[u8],
     ) -> Result<usize, FileSystemError> {
+        let mut state = handle.state.lock();
+        if state.closed {
+            return Err(FileSystemError::InvalidHandle);
+        }
         if !handle.can_write() {
             return Err(FileSystemError::InvalidAccessMode);
         }
 
         // Check whether another handle holds an exclusive write lock.
-        if handle.file.is_write_blocked(handle_value) {
+        if handle.file.is_write_blocked(handle.id) {
             return Err(FileSystemError::FileLocked);
         }
 
         let inode = Arc::clone(&handle.file.inode);
         let bytes_written = inode.filesystem.write(
             &inode,
-            handle.position,
+            state.position,
             buffer,
         )?;
 
-        handle.advance_position(bytes_written);
+        state.position = state.position.saturating_add(bytes_written as u64);
 
         // Update size if the write extended the file, then mark dirty.
-        let new_end = handle.position;
+        let new_end = state.position;
+        drop(state);
         self.touch_modified(&inode, new_end)?;
 
         Ok(bytes_written)
     }
 
-    /// Closes a file handle, unregistering it from the master record and
-    /// removing the master record from the open-file table if this was the
-    /// last handle.
+    /// Closes one registered file handle and invalidates all of its `Arc`
+    /// clones. Separate opens of the same inode remain usable.
     ///
-    /// If this was the last handle, and the underlying inode has
-    /// `pending_deletion` set (meaning all directory entries were removed
-    /// while the file was open), this method calls
+    /// If this was the last handle, and its open-file master is pending
+    /// deletion (meaning all directory entries were removed while the file
+    /// was open), this method calls
     /// [`super::driver::FileSystemInstance::free_inode`] to release the
     /// inode's data blocks, completing the deferred deletion.
     ///
-    /// If the closing handle currently holds an exclusive write lock, the lock
-    /// is released before the handle is unregistered.
+    /// If the closing handle owns the exclusive write lock, unregistering it
+    /// releases that lock. A failed deferred free leaves the handle open and
+    /// registered so its owner can retry close.
     ///
-    /// The [`Arc<FileHandle>`] passed here should be the one held by the
-    /// process's handle table entry. After this call returns, the caller must
-    /// remove the handle table entry so that the [`Arc`] reference count drops
-    /// to zero and the [`FileHandle`] is freed.
+    /// After success, the caller removes and drops its handle-table entry.
     ///
     /// # Arguments
     ///
-    /// * `handle`       - The [`Arc<FileHandle>`] to close. Must have been
-    ///   obtained from `open`.
-    /// * `handle_value` - The process-local handle value, used to release any
-    ///   write lock held by this handle.
+    /// * `handle` - The exact [`Arc<FileHandle>`] returned by `open`, or a
+    ///   clone of it. The caller retains this reference on failure.
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` on success, or `Err(FileSystemError)` if a deferred
-    /// free_inode call fails on a pending-deletion inode.
+    /// Returns `Ok(())` on success, `InvalidHandle` if the handle is closed or
+    /// not registered with this VFS, or a driver error if deferred freeing
+    /// fails. On a driver error, the handle remains open.
     pub fn close(
         &mut self,
-        handle: Arc<FileHandle>,
-        handle_value: u32,
+        handle: &Arc<FileHandle>,
     ) -> Result<(), FileSystemError> {
-        let key = OpenFileKey::new(
-            handle.file.inode.filesystem.instance_id(),
-            handle.file.inode.inode_number,
+        let key = OpenFileKey::new(handle.file.inode.filesystem.instance_id(),
+            handle.file.inode.inode_number);
+
+        let master = Arc::clone(
+            self.open_files.get(&key)
+                .ok_or(FileSystemError::InvalidHandle)?
         );
 
+        // The key alone does not prove that this handle belongs to the master
+        // currently in the table. A stale handle may name the same inode.
+        if !Arc::ptr_eq(&master, &handle.file) {
+            return Err(FileSystemError::InvalidHandle);
+        }
+
+        let mut handle_state = handle.state.lock();
+        if handle_state.closed || !master.has_handle(handle) {
+            return Err(FileSystemError::InvalidHandle);
+        }
+
+        // Free before committing the last close. On a driver error the handle
+        // and table entry remain intact, so the caller can retry.
+        if master.registered_handle_count() == 1
+            && master.is_pending_deletion()
         {
-            let master_ptr = Arc::as_ptr(&handle.file) as *mut File;
-            let master = unsafe { &mut *master_ptr };
+            master.inode.filesystem.free_inode(&master.inode)?;
+            // Only a successful free removes the canonical VFS inode.
+            self.forget_inode(&key);
+        }
 
-            if master.is_lock_holder(handle_value) {
-                // Ignore the error here; if the handle is not the lock
-                // holder, release_write_lock returns InvalidHandle, which
-                // is harmless at close time.
-                let _ = master.release_write_lock(handle_value);
-            }
+        let remaining = master.unregister_handle(handle)?;
+        handle_state.closed = true;
+        drop(handle_state);
 
-            // Prune stale weak references and count remaining live handles.
-            // The handle we are closing is still alive (the caller holds the
-            // Arc), so the live count will be at least 1 here.
-            let live_count = master.prune_and_count_handles();
-
-            // We check whether it will reach 0 by comparing against 1.
-            if live_count <= 1 {
-                // This is the last (or only) handle. Remove the master record
-                // from the open-file table. Dropping the Arc<File> here will
-                // destroy the master record once the caller also drops their
-                // Arc<FileHandle>, which holds the last Arc<File> reference.
-                if let Some(master_arc) = self.open_files.remove(&key) {
-                    // If the inode is pending deletion, and the link count is
-                    // zero, instruct the driver to free the inode's storage.
-                    if master_arc.inode.pending_deletion
-                        && master_arc.inode.link_count == 0
-                    {
-                        master_arc.inode.filesystem
-                            .free_inode(&master_arc.inode)?;
-                    }
-                }
-            }
+        if remaining == 0 {
+            self.open_files.remove(&key);
         }
 
         Ok(())
@@ -315,15 +326,22 @@ impl VirtualFileSystem {
     /// Does not validate `offset` against the file's current size. Seeking
     /// beyond the end of the file is permitted; a subsequent write will extend
     /// the file (with the gap zero-filled by the driver), and a subsequent
-    /// read will return zero bytes.
+    /// read will return zero bytes. Seeking takes the handle's state lock so
+    /// it cannot interleave with a read, write, or close on the same handle.
     ///
     /// # Arguments
     ///
     /// * `handle` - The file handle whose position should be updated.
     /// * `offset` - The absolute byte offset to seek to, measured from the
     ///   beginning of the file.
-    pub fn seek(&self, handle: &mut FileHandle, offset: u64) {
-        handle.seek_to(offset);
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` after seeking, or `InvalidHandle` if the handle was
+    /// closed.
+    pub fn seek(&self, handle: &FileHandle, offset: u64
+    ) -> Result<(), FileSystemError> {
+        handle.seek_to(offset)
     }
 
     /// Returns a metadata snapshot for the inode at `path`.
@@ -365,9 +383,8 @@ impl VirtualFileSystem {
     /// Resolves the parent directory of `path`, verifies that no entry with
     /// the terminal name already exists, then calls
     /// [`super::driver::FileSystemInstance::create_file`] on the parent
-    /// directory's filesystem driver. On success, a new
-    /// [`super::inode::DirectoryEntry`] is added to the parent directory's
-    /// in-memory child list.
+    /// directory's filesystem driver. Each later lookup reads the driver's
+    /// current directory state.
     ///
     /// # Arguments
     ///
@@ -382,8 +399,9 @@ impl VirtualFileSystem {
     ///
     /// Returns `Ok(Arc<Inode>)` for the newly created file inode on success,
     /// `Err(FileSystemError::AlreadyExists)` if an entry with that name
-    /// already exists in the parent directory, or other `Err(FileSystemError)`
-    /// variants for resolution and I/O failures.
+    /// already exists in the parent directory,
+    /// `Err(FileSystemError::NotADirectory)` if `path` ends in `/`, or other
+    /// `Err(FileSystemError)` variants for resolution and I/O failures.
     pub fn create_file(
         &mut self,
         path: &str,
@@ -393,6 +411,9 @@ impl VirtualFileSystem {
         FileSystemError>
     {
         let (parent_path, file_name) = split_parent_and_name(path)?;
+        if path.ends_with('/') {
+            return Err(FileSystemError::NotADirectory);
+        }
 
         let parent_dir = self.resolve_dir_with_budget(
             parent_path,
@@ -401,13 +422,8 @@ impl VirtualFileSystem {
         )?;
 
         // Reject if the name already exists in the parent directory.
-        {
-            let dir_ptr = Arc::as_ptr(&parent_dir) as *mut
-                super::directory::Directory;
-            let dir = unsafe { &mut *dir_ptr };
-            if dir.lookup_child(file_name)?.is_some() {
-                return Err(FileSystemError::AlreadyExists);
-            }
+        if parent_dir.lookup_child(file_name)?.is_some() {
+            return Err(FileSystemError::AlreadyExists);
         }
 
         let now = current_timestamp();
@@ -420,22 +436,7 @@ impl VirtualFileSystem {
             timestamps,
         )?;
 
-        // Add the new entry to the parent's in-memory child list.
-        let entry = DirectoryEntry::with_inode(
-            alloc::string::ToString::to_string(file_name),
-            new_inode.inode_number,
-            DirectoryEntryType::File,
-            Arc::clone(&new_inode),
-        );
-
-        {
-            let dir_ptr = Arc::as_ptr(&parent_dir) as *mut
-                super::directory::Directory;
-            let dir = unsafe { &mut *dir_ptr };
-            dir.add_child(entry)?;
-        }
-
-        Ok(new_inode)
+        Ok(self.retain_inode(new_inode))
     }
 
     /// Creates a new directory at `path`.
@@ -443,9 +444,8 @@ impl VirtualFileSystem {
     /// Resolves the parent directory of `path`, verifies that no entry with
     /// the terminal name already exists, then calls
     /// [`super::driver::FileSystemInstance::create_directory`] on the parent
-    /// directory's filesystem driver. On success, a new
-    /// [`super::inode::DirectoryEntry`] is added to the parent directory's
-    /// in-memory child list.
+    /// directory's filesystem driver. Each later lookup reads the driver's
+    /// current directory state.
     ///
     /// # Arguments
     ///
@@ -478,13 +478,8 @@ impl VirtualFileSystem {
             super::resolver::MAX_SYMLINK_DEPTH,
         )?;
 
-        {
-            let dir_ptr = Arc::as_ptr(&parent_dir) as *mut
-                super::directory::Directory;
-            let dir = unsafe { &mut *dir_ptr };
-            if dir.lookup_child(dir_name)?.is_some() {
-                return Err(FileSystemError::AlreadyExists);
-            }
+        if parent_dir.lookup_child(dir_name)?.is_some() {
+            return Err(FileSystemError::AlreadyExists);
         }
 
         let now = current_timestamp();
@@ -497,21 +492,7 @@ impl VirtualFileSystem {
             timestamps,
         )?;
 
-        let entry = DirectoryEntry::with_inode(
-            alloc::string::ToString::to_string(dir_name),
-            new_inode.inode_number,
-            DirectoryEntryType::Directory,
-            Arc::clone(&new_inode),
-        );
-
-        {
-            let dir_ptr = Arc::as_ptr(&parent_dir) as *mut
-                super::directory::Directory;
-            let dir = unsafe { &mut *dir_ptr };
-            dir.add_child(entry)?;
-        }
-
-        Ok(new_inode)
+        Ok(self.retain_inode(new_inode))
     }
 
     /// Creates a new symbolic link at `path` pointing to `target`.
@@ -519,9 +500,8 @@ impl VirtualFileSystem {
     /// Resolves the parent directory of `path`, verifies that no entry with
     /// the terminal name already exists, then calls
     /// [`super::driver::FileSystemInstance::create_symlink`] on the parent
-    /// directory's filesystem driver. On success, a new
-    /// [`super::inode::DirectoryEntry`] is added to the parent directory's
-    /// in-memory child list.
+    /// directory's filesystem driver. Each later lookup reads the driver's
+    /// current directory state.
     ///
     /// The `target` string is stored verbatim as the symlink's data. It may
     /// be an absolute or relative path; the resolver interprets it at
@@ -541,8 +521,9 @@ impl VirtualFileSystem {
     /// Returns `Ok(Arc<Inode>)` for the newly created symlink inode on
     /// success, `Err(FileSystemError::AlreadyExists)` if an entry with that
     /// name already exists, `Err(FileSystemError::InvalidPath)` if `target`
-    /// is empty, or other `Err(FileSystemError)` variants for resolution and
-    /// I/O failures.
+    /// is empty, `Err(FileSystemError::NotADirectory)` if `path` ends in `/`,
+    /// or other `Err(FileSystemError)` variants for resolution and I/O
+    /// failures.
     pub fn create_symlink(
         &mut self,
         path: &str,
@@ -556,6 +537,9 @@ impl VirtualFileSystem {
         }
 
         let (parent_path, link_name) = split_parent_and_name(path)?;
+        if path.ends_with('/') {
+            return Err(FileSystemError::NotADirectory);
+        }
 
         let parent_dir = self.resolve_dir_with_budget(
             parent_path,
@@ -563,13 +547,8 @@ impl VirtualFileSystem {
             super::resolver::MAX_SYMLINK_DEPTH,
         )?;
 
-        {
-            let dir_ptr = Arc::as_ptr(&parent_dir) as *mut
-                super::directory::Directory;
-            let dir = unsafe { &mut *dir_ptr };
-            if dir.lookup_child(link_name)?.is_some() {
-                return Err(FileSystemError::AlreadyExists);
-            }
+        if parent_dir.lookup_child(link_name)?.is_some() {
+            return Err(FileSystemError::AlreadyExists);
         }
 
         let now = current_timestamp();
@@ -582,35 +561,121 @@ impl VirtualFileSystem {
             timestamps,
         )?;
 
-        let entry = DirectoryEntry::with_inode(
-            alloc::string::ToString::to_string(link_name),
-            new_inode.inode_number,
-            DirectoryEntryType::Symlink,
-            Arc::clone(&new_inode),
-        );
+        Ok(self.retain_inode(new_inode))
+    }
 
+    /// Creates another directory entry for the inode at `source_path`.
+    ///
+    /// Both names share the same inode, data, metadata, and open-file master.
+    /// Only regular files and symlinks can be linked, and the destination
+    /// directory must belong to the source inode's file system instance.
+    /// An existing destination is never replaced, even when it names the
+    /// source inode.
+    ///
+    /// The caller holds the global VFS lock throughout. All VFS checks and
+    /// count arithmetic precede the driver mutation. After the driver commits,
+    /// only the canonical inode's in-memory link count is changed. The driver
+    /// has already updated its backing count, so this change does not itself
+    /// mark the inode dirty. Content timestamps remain unchanged.
+    ///
+    /// # Arguments
+    ///
+    /// * `source_path` - Existing absolute or relative source path.
+    ///   Intermediate symlinks are followed. A trailing slash requires a
+    ///   directory, which cannot be hard-linked.
+    /// * `destination_path` - New absolute or relative name. Its parent must
+    ///   exist. The final component must not be empty, `.` or `..`, contain
+    ///   NUL, or be followed by a trailing slash.
+    /// * `working_directory` - Base for both relative paths; `None` uses root.
+    /// * `follow_symlinks` - Whether to follow a final source symlink. When
+    ///   false, the new name refers to the symlink inode itself, even if its
+    ///   target does not exist. Relative symlink targets are interpreted from
+    ///   the directory containing whichever name is used to follow the link.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` after creating the name, `OperationNotAllowed` for a
+    /// directory source, `CrossFileSystemOperation` for different file system
+    /// instances, `AlreadyExists` for an occupied destination, or
+    /// `TooManyHardLinks` at the count limit. Invalid names, resolution failures,
+    /// and driver failures return their corresponding errors. A returned
+    /// error leaves the destination entry and source link count unchanged.
+    pub fn create_hard_link(
+        &mut self,
+        source_path: &str,
+        destination_path: &str,
+        working_directory: Option<Arc<Directory>>,
+        follow_symlinks: bool,
+    ) -> Result<(), FileSystemError> {
+        let (destination_parent_path, destination_name) =
+            split_parent_and_name(destination_path)?;
+        if destination_path.ends_with('/') {
+            return Err(FileSystemError::NotADirectory);
+        }
+        if destination_name == "." || destination_name == ".."
+            || destination_name.contains('\0')
         {
-            let dir_ptr = Arc::as_ptr(&parent_dir) as *mut
-                super::directory::Directory;
-            let dir = unsafe { &mut *dir_ptr };
-            dir.add_child(entry)?;
+            return Err(FileSystemError::InvalidPath);
         }
 
-        Ok(new_inode)
+        let source = self.resolve(
+            source_path, working_directory.clone(), follow_symlinks,
+        )?;
+        if source.is_directory() {
+            return Err(FileSystemError::OperationNotAllowed);
+        }
+
+        let destination_parent = self.resolve_dir_with_budget(
+            destination_parent_path,
+            working_directory,
+            super::resolver::MAX_SYMLINK_DEPTH,
+        )?;
+        if source.filesystem.instance_id()
+            != destination_parent.inode.filesystem.instance_id()
+        {
+            return Err(FileSystemError::CrossFileSystemOperation);
+        }
+        // A retained wrapper must not allow creation in an unlinked directory.
+        if destination_parent.inode.metadata.lock().link_count == 0 {
+            return Err(FileSystemError::NotFound);
+        }
+        if destination_parent.lookup_child(destination_name)?.is_some() {
+            return Err(FileSystemError::AlreadyExists);
+        }
+
+        let new_count = {
+            let metadata = source.metadata.lock();
+            if metadata.link_count == 0 {
+                return Err(FileSystemError::NotFound);
+            }
+            metadata.link_count.checked_add(1)
+                .ok_or(FileSystemError::TooManyHardLinks)?
+        };
+
+        // Do not hold the metadata lock while the driver commits its entry
+        // and backing count. The global VFS lock serializes this operation.
+        source.filesystem.link(
+            &source, &destination_parent.inode, destination_name,
+        )?;
+        source.metadata.lock().link_count = new_count;
+
+        Ok(())
     }
 
     /// Removes the directory entry for the filesystem object at `path`.
     ///
     /// Resolves `path` to its parent directory and terminal name, then calls
     /// [`super::driver::FileSystemInstance::unlink`] to remove the on-disk
-    /// directory entry and decrement the inode's link count. The in-memory
-    /// child list of the parent directory is updated to reflect the removal.
+    /// directory entry and decrement the inode's link count. The next lookup
+    /// reads the driver's updated directory state. Deleting a moved directory
+    /// also removes its relocated parent entry.
     ///
     /// If the inode's link count reaches zero, and no open handles exist for
     /// it, [`super::driver::FileSystemInstance::free_inode`] is called
     /// immediately to release the inode's data blocks. If open handles exist,
-    /// `pending_deletion` is set on the inode and the data blocks are freed
-    /// when the last handle closes via [`VirtualFileSystem::close`].
+    /// the open-file master is marked for deferred reclamation, and the data
+    /// blocks are freed when the last handle closes via
+    /// [`VirtualFileSystem::close`].
     ///
     /// Deleting a non-empty directory returns
     /// [`FileSystemError::DirectoryNotEmpty`]. Deleting a directory that is
@@ -641,20 +706,29 @@ impl VirtualFileSystem {
             super::resolver::MAX_SYMLINK_DEPTH,
         )?;
 
-        // Resolve the target inode so we can inspect its type, link count,
-        // and open-handle state.
-        let target_inode = self.resolve(path, None, false)?;
+        // Use the resolved parent for the final component. This preserves
+        // relative-path semantics and does not follow a final symlink.
+        let target_entry = parent_dir.lookup_child(entry_name)?
+            .ok_or(FileSystemError::NotFound)?;
+        let target_inode = self.get_or_load_inode(
+            &parent_dir.inode.filesystem, target_entry.inode_number,
+        )?;
+
+        // A trailing slash names a directory, never a file or symlink.
+        if path.ends_with('/') && !target_inode.is_directory() {
+            return Err(FileSystemError::NotADirectory);
+        }
 
         // Reject deletion of a mount point directory.
-        if target_inode.mount_flag {
+        let target_key = OpenFileKey::new(
+            target_inode.filesystem.instance_id(), target_inode.inode_number);
+        if self.mounts.get(&target_key).is_some() {
             return Err(FileSystemError::AlreadyMounted);
         }
 
         // Reject deletion of a non-empty directory.
         if target_inode.is_directory() {
-            // Load the directory's children to check emptiness.
-            // Look up the target as a child of parent to get its wrapper.
-            // We only need the child count so a read_dir call suffices.
+            // Read the target directory to check whether it is empty.
             let child_inode_count = target_inode.filesystem
                 .read_dir(&target_inode)?
                 .len();
@@ -664,45 +738,46 @@ impl VirtualFileSystem {
             }
         }
 
-        // Remove the on-disk directory entry and decrement the link count.
-        target_inode.filesystem.unlink(&parent_dir.inode, entry_name)?;
-
-        // Remove the entry from the parent's in-memory child list.
-        {
-            let dir_ptr = Arc::as_ptr(&parent_dir) as *mut
-                super::directory::Directory;
-            let dir = unsafe { &mut *dir_ptr };
-            dir.remove_child(entry_name)?;
-        }
-
-        // Decrement the in-memory link count.
-        {
-            let inode_ptr =
-                Arc::as_ptr(&target_inode) as *mut
-                super::inode::Inode;
-            unsafe {
-                (*inode_ptr).link_count
-                    = (*inode_ptr).link_count.saturating_sub(1);
-            }
-        }
-
-        // If the link count has reached zero, decide whether to free
-        // immediately or defer until the last handle closes.
-        if target_inode.link_count == 0 {
+        // Prepare the post-unlink decision before changing driver state.
+        let remaining_links = {
+            let metadata = target_inode.metadata.lock();
+            metadata.link_count.checked_sub(1)
+                .ok_or(FileSystemError::InternalError)?
+        };
+        let open_master = if remaining_links == 0 {
             let key = OpenFileKey::new(
                 target_inode.filesystem.instance_id(),
                 target_inode.inode_number,
             );
+            self.open_files.get(&key).cloned()
+        } else {
+            None
+        };
 
-            if self.open_files.contains_key(&key) {
-                // Open handles exist - mark for deferred deletion.
-                let inode_ptr =
-                    Arc::as_ptr(&target_inode) as *mut
-                    super::inode::Inode;
-                unsafe { (*inode_ptr).pending_deletion = true; }
+        // Remove the on-disk directory entry and decrement the link count.
+        target_inode.filesystem.unlink(&parent_dir.inode, entry_name)?;
+
+        // A deleted directory's inode number may later be reused.
+        if target_inode.is_directory() && remaining_links == 0 {
+            self.relocated_parents.remove(&target_key);
+        }
+
+        // Decrement this in-memory inode's link count after the driver commits.
+        {
+            let mut metadata = target_inode.metadata.lock();
+            metadata.link_count = remaining_links;
+        }
+
+        // If the link count has reached zero, decide whether to free
+        // immediately or defer until the last handle closes.
+        if remaining_links == 0 {
+            if let Some(master) = open_master {
+                // The master retains the unlinked inode until the last close.
+                master.mark_pending_deletion();
             } else {
                 // No open handles - free immediately.
                 target_inode.filesystem.free_inode(&target_inode)?;
+                self.forget_inode(&target_key);
             }
         }
 
@@ -712,19 +787,22 @@ impl VirtualFileSystem {
     /// Moves the directory entry at `old_path` to `new_path`, optionally
     /// changing its name.
     ///
-    /// Resolves both paths to their respective parent directories and terminal
-    /// names, then calls [`super::driver::FileSystemInstance::rename`] on the
-    /// source inode's filesystem driver. The in-memory child lists of both
-    /// parent directories are updated to reflect the move.
+    /// Resolves both parents and validates source and destination names before
+    /// calling [`super::driver::FileSystemInstance::rename`]. After the driver
+    /// succeeds, later lookups read the driver's new directory state. A
+    /// cross-directory move also records the directory's new parent for
+    /// retained wrappers. The caller must hold the global VFS lock throughout
+    /// the operation.
     ///
     /// `old_path` and `new_path` may share the same parent directory, in
-    /// which case this is an in-place rename. Cross-filesystem renames (where
-    /// the two paths reside on different mounted volumes) are not supported
-    /// and return [`FileSystemError::InvalidPath`].
+    /// which case both sides use the same directory wrapper for this operation.
+    /// Cross-filesystem renames, where the two paths reside on different
+    /// mounted volumes, are not supported and return
+    /// [`FileSystemError::InvalidPath`].
     ///
-    /// If an entry already exists at `new_path`, the rename is rejected with
-    /// [`FileSystemError::AlreadyExists`]. The caller is responsible for
-    /// removing the destination first if an overwriting rename is desired.
+    /// If both names refer to the same inode, returns success without changing
+    /// either entry. An existing destination for a different inode returns
+    /// [`FileSystemError::AlreadyExists`]; replacement is not implemented.
     ///
     /// # Arguments
     ///
@@ -735,11 +813,13 @@ impl VirtualFileSystem {
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` on success, `Err(FileSystemError::NotFound)` if
-    /// `old_path` does not exist, `Err(FileSystemError::AlreadyExists)` if
-    /// `new_path` already exists, `Err(FileSystemError::InvalidPath)` if the
-    /// two paths are on different filesystems, or other `Err(FileSystemError)`
-    /// variants for resolution and I/O failures.
+    /// Returns `Ok(())` on success, including a same-inode no-op,
+    /// `Err(FileSystemError::NotFound)` if `old_path` does not exist,
+    /// `Err(FileSystemError::AlreadyExists)` if `new_path` names a different
+    /// inode, `Err(FileSystemError::InvalidPath)` if the two paths are on
+    /// different filesystems, or other `Err(FileSystemError)` variants for
+    /// resolution, allocation, and I/O failures. No VFS lookup occurs after
+    /// a successful driver rename.
     pub fn rename(
         &mut self,
         old_path: &str,
@@ -755,30 +835,55 @@ impl VirtualFileSystem {
             super::resolver::MAX_SYMLINK_DEPTH,
         )?;
 
-        let new_parent = self.resolve_dir_with_budget(
+        let resolved_new_parent = self.resolve_dir_with_budget(
             new_parent_path,
             working_directory,
             super::resolver::MAX_SYMLINK_DEPTH,
         )?;
 
         // Reject cross-filesystem renames.
-        if old_parent.inode.filesystem.instance_id()
-            != new_parent.inode.filesystem.instance_id()
-        {
+        let old_filesystem_id = old_parent.inode.filesystem.instance_id();
+        let new_filesystem_id =
+            resolved_new_parent.inode.filesystem.instance_id();
+        if old_filesystem_id != new_filesystem_id {
             return Err(FileSystemError::InvalidPath);
         }
 
-        // Reject if the destination name already exists.
+        // Two path walks can produce different wrappers for the same directory.
+        // Use one wrapper for both sides of an in-place rename.
+        let same_parent = old_parent.inode.inode_number ==
+            resolved_new_parent.inode.inode_number;
+        let new_parent = if same_parent {
+            Arc::clone(&old_parent)
+        } else {
+            resolved_new_parent
+        };
+
+        // Check the source before asking the driver to rename it. Retain its
+        // identity, so a successful directory move can update `..` traversal.
+        let moved_entry = old_parent.lookup_child(old_name)?
+            .ok_or(FileSystemError::NotFound)?;
+        let moved_inode = self.get_or_load_inode(
+            &old_parent.inode.filesystem, moved_entry.inode_number,
+        )?;
+
+        // Either path may end in `/` only when moving a directory.
+        if (old_path.ends_with('/') || new_path.ends_with('/'))
+            && !moved_inode.is_directory()
         {
-            let dir_ptr = Arc::as_ptr(&new_parent) as *mut
-                super::directory::Directory;
-            let dir = unsafe { &mut *dir_ptr };
-            if dir.lookup_child(new_name)?.is_some() {
-                return Err(FileSystemError::AlreadyExists);
-            }
+            return Err(FileSystemError::NotADirectory);
         }
 
-        // Dispatch to the driver.
+        // Renaming between names of one inode is a successful no-op. Keep
+        // both directory entries and their shared link count unchanged.
+        if let Some(destination) = new_parent.lookup_child(new_name)? {
+            if destination.inode_number == moved_inode.inode_number {
+                return Ok(());
+            }
+            return Err(FileSystemError::AlreadyExists);
+        }
+
+        // Only the driver operation can now return a filesystem error.
         old_parent.inode.filesystem.rename(
             &old_parent.inode,
             old_name,
@@ -786,36 +891,14 @@ impl VirtualFileSystem {
             new_name,
         )?;
 
-        // Update the in-memory child lists. Remove the old entry from its
-        // parent and add a new entry (carrying the same inode) to the new
-        // parent.
-        let moved_inode = self.resolve(old_path, None, false)?;
-
-        {
-            let dir_ptr = Arc::as_ptr(&old_parent) as *mut
-                super::directory::Directory;
-            let dir = unsafe { &mut *dir_ptr };
-            dir.remove_child(old_name)?;
-        }
-
-        let entry_type = match moved_inode.inode_type {
-            InodeType::File      => DirectoryEntryType::File,
-            InodeType::Directory => DirectoryEntryType::Directory,
-            InodeType::Symlink   => DirectoryEntryType::Symlink,
-        };
-
-        let new_entry = DirectoryEntry::with_inode(
-            alloc::string::ToString::to_string(new_name),
-            moved_inode.inode_number,
-            entry_type,
-            moved_inode,
-        );
-
-        {
-            let dir_ptr = Arc::as_ptr(&new_parent) as *mut
-                super::directory::Directory;
-            let dir = unsafe { &mut *dir_ptr };
-            dir.add_child(new_entry)?;
+        // Resolve the current parent by inode identity, so retained and fresh
+        // wrappers agree after a cross-directory move.
+        if moved_inode.is_directory() && !same_parent {
+            let key = OpenFileKey::new(
+                moved_inode.filesystem.instance_id(),
+                moved_inode.inode_number,
+            );
+            self.relocated_parents.insert(key, Arc::clone(&new_parent));
         }
 
         Ok(())
@@ -824,9 +907,8 @@ impl VirtualFileSystem {
     /// Updates the `accessed` timestamp on `inode` and marks it dirty.
     ///
     /// Called internally after a successful read operation. The `accessed`
-    /// field is updated to the current wall-clock time. If the update causes
-    /// `accessed` to change, `dirty` is set so the change will be persisted
-    /// by a future sync.
+    /// field is updated to the current wall-clock time. The inode is marked
+    /// dirty on every successful call for a later sync.
     ///
     /// # Arguments
     ///
@@ -841,13 +923,10 @@ impl VirtualFileSystem {
         inode: &Arc<super::inode::Inode>,
     ) -> Result<(), FileSystemError> {
         let now = current_timestamp();
-        let inode_ptr = Arc::as_ptr(inode) as *mut super::inode::Inode;
-    
-        unsafe {
-            (*inode_ptr).timestamps.accessed = now;
-            (*inode_ptr).dirty = true;
-        }
-    
+        let mut metadata = inode.metadata.lock();
+        metadata.timestamps.accessed = now;
+        metadata.dirty = true;
+
         Ok(())
     }
 
@@ -867,25 +946,19 @@ impl VirtualFileSystem {
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` always.
+    /// Returns `Ok(())` always. The signature returns `Result` for consistency
+    /// with other internal helpers that may fail in future extensions.
     fn touch_modified(
         &self,
         inode: &Arc<super::inode::Inode>,
         new_end: u64,
     ) -> Result<(), FileSystemError> {
         let now = current_timestamp();
-        let inode_ptr = Arc::as_ptr(inode) as *mut super::inode::Inode;
-
-        unsafe {
-            (*inode_ptr).timestamps.modified = now;
-            (*inode_ptr).timestamps.accessed = now;
-
-            if new_end > (*inode_ptr).size {
-                (*inode_ptr).size = new_end;
-            }
-
-            (*inode_ptr).dirty = true;
-        }
+        let mut metadata = inode.metadata.lock();
+        metadata.timestamps.modified = now;
+        metadata.timestamps.accessed = now;
+        metadata.size = metadata.size.max(new_end);
+        metadata.dirty = true;
 
         Ok(())
     }
@@ -897,9 +970,10 @@ impl VirtualFileSystem {
 /// Given `/foo/bar/baz`, returns `("/foo/bar", "baz")`. Given `/baz`, returns
 /// `("/", "baz")`. Given a relative path `foo/bar`, returns `("foo", "bar")`.
 ///
-/// Returns [`FileSystemError::InvalidPath`] if `path` is empty, consists
-/// entirely of `/` separators with no terminal name, or ends with a trailing
-/// `/` (which would produce an empty terminal name).
+/// Trailing slashes are removed to find the terminal name. Callers enforce
+/// whether their operation permits a directory path ending in `/`. Returns
+/// [`FileSystemError::InvalidPath`] if `path` is empty or consists entirely
+/// of `/` separators with no terminal name.
 ///
 /// # Arguments
 ///
@@ -915,20 +989,20 @@ fn split_parent_and_name(path: &str) -> Result<(&str, &str), FileSystemError> {
         return Err(FileSystemError::InvalidPath);
     }
 
-    // Strip a single trailing slash if present to normalize paths like
-    // "/foo/bar/". A path that is nothing but slashes has no terminal name.
+    // Trim trailing slashes to locate the name. The caller checks whether
+    // the operation permits this path form before changing driver state.
     let trimmed = path.trim_end_matches('/');
     if trimmed.is_empty() {
         return Err(FileSystemError::InvalidPath);
     }
 
     match trimmed.rfind('/') {
-        // No slash at all - relative path with a single component like "foo".
-        // The parent is the working directory (represented as ".") and the
+        // No slash at all - relative path with a single component like `foo`.
+        // The parent is the working directory (represented as `.`) and the
         // name is the entire trimmed string.
         None => Ok((".", trimmed)),
 
-        // Slash at position 0 means the parent is the root "/".
+        // Slash at position 0 means the parent is the root `/`.
         Some(0) => {
             let name = &trimmed[1..];
             if name.is_empty() {

@@ -18,6 +18,8 @@ mod tests;
 mod kernel_hashmap;
 mod file_system;
 
+use file_system::stub_fs::vfs_tests;
+
 use hardware_manager::FramebufferInfo;
 use memory_manager::{MemoryManager, GlobalHeapAllocator};
 use process_manager::nop_thread_stub;
@@ -186,7 +188,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             );
         }
         if cpu_topology.bsp().is_none() {
-            panic!("BSP APIC ID {:#x} not found in MADT — firmware bug or struct layout mismatch", cpu_topology.bsp_apic_id);
+            panic!("BSP APIC ID {:#x} not found in MADT: firmware bug or struct layout mismatch", cpu_topology.bsp_apic_id);
         }
     }
 
@@ -417,8 +419,10 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             );
         }
     }
-    
 
+
+    // Testing VFS via Stub-FS
+    crate::vfs_tests::run_vfs_tests();
 
 
     // Signal the Task Scheduler that the kernel has completed its
@@ -432,18 +436,8 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // re-enable maskable hardware interrupts.
     unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
 
-
-    //globals::PROCESS_MANAGER.print_processes();
-
     // Enter halt loop on the idle task
-    let mut count = 0;
     loop {
-        //crate::hardware_manager::sprint("+");
-        count += 1;
-        if count == 10 {
-            count = 0;
-            //globals::PROCESS_MANAGER.print_processes();
-        }
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
     } 
 }

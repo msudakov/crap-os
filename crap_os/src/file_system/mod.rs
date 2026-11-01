@@ -22,5 +22,5 @@
 //!   driver contracts.
 
 pub mod virtual_fs;
-//pub mod stub_fs;
+pub mod stub_fs;
 //pub mod native_fs;

@@ -909,7 +909,7 @@ pub(super) fn reclaim_acpi_memory(
 
             // The direct-map mapping for this page was already established
             // by build_direct_map() and must remain in place permanently,
-            // exactly like every other page of usable RAM — the direct map
+            // exactly like every other page of usable RAM. The direct map
             // is this kernel's sole general-purpose physical-access window,
             // not a temporary alias to be torn down. Simply returning the
             // frame to the free list is correct and matches

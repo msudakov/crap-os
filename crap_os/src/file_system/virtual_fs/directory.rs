@@ -10,6 +10,10 @@
 //! in the namespace, its relationship to adjacent directories, and any mount
 //! point overlaid on top of it.
 //!
+//! A wrapper registers its lifetime in the canonical inode. A removed
+//! directory's storage remains allocated until all wrappers drop, and the VFS
+//! explicitly reclaims it. Destructors never invoke filesystem drivers.
+//!
 //! Each child lookup reads a fresh driver snapshot because several wrappers
 //! can refer to the same directory inode. The VFS mount table determines
 //! whether path resolution crosses into another filesystem.
@@ -17,6 +21,8 @@
 #![allow(dead_code)]
 
 use alloc::sync::{Arc, Weak};
+use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 use super::inode::{Inode, DirectoryEntry};
 use super::types::FileSystemError;
@@ -75,6 +81,8 @@ impl Directory {
     ///
     /// Returns a root wrapper with no parent.
     pub fn new_root(inode: Arc<Inode>) -> Self {
+        inode.directory_wrappers.fetch_add(1, Ordering::AcqRel);
+
         Self {
             inode,
             parent: None,
@@ -97,6 +105,8 @@ impl Directory {
     ///
     /// Returns a wrapper that keeps its ordinary parent alive.
     pub fn new(inode: Arc<Inode>, parent: Arc<Directory>) -> Self {
+        inode.directory_wrappers.fetch_add(1, Ordering::AcqRel);
+
         Self {
             inode,
             parent: Some(DirectoryParent::Ordinary(parent)),
@@ -117,6 +127,8 @@ impl Directory {
     ///
     /// Returns a mounted-root wrapper with a weak host reference.
     pub fn new_mounted_root(inode: Arc<Inode>, host: &Arc<Directory>) -> Self {
+        inode.directory_wrappers.fetch_add(1, Ordering::AcqRel);
+
         Self {
             inode,
             parent: Some(DirectoryParent::MountedRoot(Arc::downgrade(host))),
@@ -143,10 +155,16 @@ impl Directory {
     ///
     /// Returns the matching owned [`DirectoryEntry`] if found, `None` if no
     /// entry has that name, or `Err(FileSystemError)` if the driver read fails.
+    /// Detached directories return `None` without consulting the driver.
     pub fn lookup_child(
         &self,
         name: &str,
     ) -> Result<Option<DirectoryEntry>, FileSystemError> {
+        // Removed directories remain inspectable, but can never gain children.
+        if self.inode.metadata.lock().link_count == 0 {
+            return Ok(None);
+        }
+
         Ok(self.inode.filesystem
             .read_dir(&self.inode)?
             .into_iter()
@@ -184,6 +202,52 @@ impl Directory {
                 host.upgrade().ok_or(FileSystemError::InternalError)
             }
             None => Err(FileSystemError::InternalError),
+        }
+    }
+}
+
+impl Drop for Directory {
+    /// Releases this wrapper's lifetime registration without calling a driver.
+    ///
+    /// The VFS must later call
+    /// [`super::vfs::VirtualFileSystem::reclaim_removed_directories`] to
+    /// reclaim an unlinked directory. Parent references drop after this method
+    /// returns.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal accounting bug releases an unregistered wrapper.
+    fn drop(&mut self) {
+        let previous = self.inode.directory_wrappers.fetch_sub(1,
+            Ordering::AcqRel);
+        assert!(previous != 0, "Directory wrapper count underflow");
+    }
+}
+
+/// Owned protection against changes to a directory's namespace ancestry.
+///
+/// Created only by [`super::vfs::VirtualFileSystem::protect_directory_path`].
+/// The token is deliberately not cloneable: acquire another token for an
+/// independent holder. Dropping it releases every contribution without VFS
+/// locks or I/O. Protection does not prohibit changes to directory contents.
+pub struct DirectoryPathGuard {
+    /// Canonical inodes from the protected directory through the global root,
+    /// including mount hosts. This vector is complete before counts change.
+    pub(super) protected_inodes: Vec<Arc<Inode>>,
+}
+
+impl Drop for DirectoryPathGuard {
+    /// Releases this token's protection from every recorded ancestor.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal accounting bug releases protection not acquired
+    /// by this token. Ordinary caller misuse cannot construct such a token.
+    fn drop(&mut self) {
+        for inode in &self.protected_inodes {
+            let previous = inode.directory_path_guards.fetch_sub(1,
+                Ordering::AcqRel);
+            assert!(previous != 0, "Directory path guard count underflow");
         }
     }
 }

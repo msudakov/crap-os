@@ -19,14 +19,16 @@
 //! - Regular-file and symlink inodes may be referenced by multiple directory
 //!   entries through hard links. Directories retain a single parent.
 //! - Removing a directory entry (unlinking) does not immediately destroy the
-//!   inode; the inode survives until its link count reaches zero and all open
-//!   handles are closed.
+//!   inode. File storage survives until its link count reaches zero and all
+//!   registered handles close. Directory storage also survives every live
+//!   directory wrapper and is reclaimed by explicit VFS cleanup.
 //! - The path resolver works with directory entries during traversal and only
 //!   loads the full inode when it is needed.
 
 #![allow(dead_code)]
 
 use alloc::sync::Arc;
+use core::sync::atomic::AtomicUsize;
 use alloc::string::String;
 use crate::spinlock::SpinLock;
 
@@ -85,6 +87,16 @@ pub struct Inode {
     /// Hold the guard only while reading or changing fields, and release it
     /// before calling a filesystem driver.
     pub(crate) metadata: SpinLock<InodeMetadata>,
+
+    /// Number of live directory wrappers, including wrappers retained by
+    /// children. Arc clones of one wrapper share a single registration.
+    /// Destructors only decrement this counter; VFS cleanup frees storage.
+    pub(super) directory_wrappers: AtomicUsize,
+
+    /// Number of path guards protecting this directory identity. Each guard
+    /// contributes once for this directory and once for each ancestor.
+    /// Acquisition is serialized by the VFS; release may occur independently.
+    pub(super) directory_path_guards: AtomicUsize,
 }
 
 /// Metadata fields that can change while an [`Inode`] is shared.
@@ -117,9 +129,9 @@ pub(crate) struct InodeMetadata {
     ///
     /// Starts at `1` when the inode is created. Incremented when a hard link
     /// is created, and decremented when a directory entry is removed. When
-    /// `link_count` reaches `0` and no open file handles remain, the VFS
-    /// instructs the filesystem driver to free the inode's data blocks and
-    /// release the inode slot.
+    /// `link_count` reaches `0`, files await their last registered handle.
+    /// Directories additionally await their last wrapper and explicit VFS
+    /// cleanup before the driver frees storage and releases the inode slot.
     pub(crate) link_count: u32,
 
     /// Indicates that this inode has been modified in memory but not yet
@@ -163,6 +175,8 @@ impl Inode {
             inode_number,
             filesystem,
             inode_type,
+            directory_wrappers: AtomicUsize::new(0),
+            directory_path_guards: AtomicUsize::new(0),
             metadata: SpinLock::new(InodeMetadata {
                 size,
                 permissions,

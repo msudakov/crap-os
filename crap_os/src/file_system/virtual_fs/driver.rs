@@ -592,11 +592,18 @@ pub trait FileSystemInstance: Send + Sync {
     /// link count. After success, the VFS decrements its retained inode's
     /// in-memory link count. The driver must leave the inode's storage intact;
     /// the VFS calls [`FileSystemInstance::free_inode`] separately when the
-    /// count reaches zero.
+    /// count reaches zero and the VFS lifetime conditions are satisfied.
+    ///
+    /// This driver primitive serves both VFS `unlink` and `remove_directory`.
+    /// The VFS checks type, empty-directory, special-name, mount, and
+    /// path-guard rules before invoking it. A returned error must leave both
+    /// the name and backing link count unchanged.
     ///
     /// The removed name disappears immediately. Other hard links and existing
-    /// open handles remain usable. The inode is freed only after its last
-    /// directory entry is removed and its last open handle is closed.
+    /// file handles remain usable. Directories also retain backing storage
+    /// while directory wrappers exist. Only an explicit VFS `free_inode` call
+    /// authorizes reclamation; `unlink` itself must never reuse the inode
+    /// number.
     ///
     /// # Arguments
     ///

@@ -41,6 +41,7 @@
 #![allow(dead_code)]
 
 use alloc::sync::Arc;
+use core::sync::atomic::Ordering;
 
 use super::directory::Directory;
 use super::file::{File, FileHandle};
@@ -426,6 +427,10 @@ impl VirtualFileSystem {
             return Err(FileSystemError::AlreadyExists);
         }
 
+        if parent_dir.inode.metadata.lock().link_count == 0 {
+            return Err(FileSystemError::NotFound);
+        }
+
         let now = current_timestamp();
         let timestamps = Timestamps::new(now);
 
@@ -480,6 +485,10 @@ impl VirtualFileSystem {
 
         if parent_dir.lookup_child(dir_name)?.is_some() {
             return Err(FileSystemError::AlreadyExists);
+        }
+
+        if parent_dir.inode.metadata.lock().link_count == 0 {
+            return Err(FileSystemError::NotFound);
         }
 
         let now = current_timestamp();
@@ -549,6 +558,10 @@ impl VirtualFileSystem {
 
         if parent_dir.lookup_child(link_name)?.is_some() {
             return Err(FileSystemError::AlreadyExists);
+        }
+
+        if parent_dir.inode.metadata.lock().link_count == 0 {
+            return Err(FileSystemError::NotFound);
         }
 
         let now = current_timestamp();
@@ -662,43 +675,103 @@ impl VirtualFileSystem {
         Ok(())
     }
 
-    /// Removes the directory entry for the filesystem object at `path`.
+    /// Removes one name for a regular file or symlink without following it.
     ///
-    /// Resolves `path` to its parent directory and terminal name, then calls
-    /// [`super::driver::FileSystemInstance::unlink`] to remove the on-disk
-    /// directory entry and decrement the inode's link count. The next lookup
-    /// reads the driver's updated directory state. Deleting a moved directory
-    /// also removes its relocated parent entry.
-    ///
-    /// If the inode's link count reaches zero, and no open handles exist for
-    /// it, [`super::driver::FileSystemInstance::free_inode`] is called
-    /// immediately to release the inode's data blocks. If open handles exist,
-    /// the open-file master is marked for deferred reclamation, and the data
-    /// blocks are freed when the last handle closes via
-    /// [`VirtualFileSystem::close`].
-    ///
-    /// Deleting a non-empty directory returns
-    /// [`FileSystemError::DirectoryNotEmpty`]. Deleting a directory that is
-    /// currently a mount point returns [`FileSystemError::AlreadyMounted`].
+    /// The caller holds the global VFS lock throughout this operation.
+    /// Other hard links and registered open handles preserve file lifetime.
+    /// Directories, including mount hosts, return `OperationNotAllowed`.
+    /// Trailing slashes on files or symlinks return `NotADirectory`, even if a
+    /// symlink targets a directory. This is an intentional contract.
     ///
     /// # Arguments
     ///
-    /// * `path`              - The path of the entry to delete.
-    /// * `working_directory` - The starting directory for relative paths.
-    ///   `None` means use the global root.
+    /// * `path` - Entry to unlink. Empty paths return `NotFound`, root-only
+    ///   paths return `ResourceBusy`, and final `.` or `..` components return
+    ///   `OperationNotAllowed`, including with trailing separators.
+    /// * `working_directory` - Base for relative paths; `None` uses root.
+    ///   Intermediate `.` and `..` retain ordinary traversal semantics.
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` on success, `Err(FileSystemError::NotFound)` if the
-    /// path does not exist, `Err(FileSystemError::DirectoryNotEmpty)` if the
-    /// target is a non-empty directory, or other `Err(FileSystemError)`
-    /// variants for resolution and I/O failures.
-    pub fn delete(
+    /// Returns `Ok(())` after removal, or a pathname, type, or driver error.
+    /// File reclamation retains the existing final-close behavior. Immediate
+    /// file-free failures can still be reported after unlink has committed.
+    pub fn unlink(
         &mut self,
         path: &str,
         working_directory: Option<Arc<Directory>>,
     ) -> Result<(), FileSystemError> {
+        self.remove_directory_entry(path, working_directory, false)
+    }
+
+    /// Removes an empty directory's name while preserving retained wrappers.
+    ///
+    /// The caller holds the global VFS lock throughout this operation.
+    /// Real directories permit trailing separators. Final symlinks are never
+    /// followed, including with trailing separators. Protected directories and
+    /// active mount hosts return `ResourceBusy` before any driver mutation.
+    /// Removed wrappers retain their former parent for `..`, permit inspection,
+    /// and cannot be used to create children, acquire guards, or mount volumes.
+    /// Call [`super::vfs::VirtualFileSystem::reclaim_removed_directories`]
+    /// after releasing retained references to reclaim detached storage; removal
+    /// itself performs no directory free.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Directory name. Empty paths return `NotFound`, root-only
+    ///   paths return `ResourceBusy`, and final `.` or `..` return
+    ///   `OperationNotAllowed`, including with trailing separators.
+    /// * `working_directory` - Base for relative paths; `None` uses root.
+    ///   Intermediate `.` and `..` retain normal traversal semantics.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` after detachment, `NotADirectory` for files or symlinks,
+    /// `DirectoryNotEmpty` for nonempty directories, or the applicable path,
+    /// protection, mount, or driver error. Rejections leave the entry intact.
+    pub fn remove_directory(
+        &mut self,
+        path: &str,
+        working_directory: Option<Arc<Directory>>,
+    ) -> Result<(), FileSystemError> {
+        self.remove_directory_entry(path, working_directory, true)
+    }
+
+    /// Applies the common preflight and commit sequence for namespace removal.
+    ///
+    /// All type, protection, mount, and emptiness checks precede driver unlink.
+    /// Directory reclamation is deferred to explicit VFS cleanup; file lifetime
+    /// continues to use link counts and registered open-file masters.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Unnormalized pathname whose final spelling is validated.
+    /// * `working_directory` - Relative-path base, or root when absent.
+    /// * `directory_only` - Selects directory removal rather than file unlink.
+    ///
+    /// # Returns
+    ///
+    /// Returns success after detachment or the applicable validation or driver
+    /// error. File free errors may occur after the namespace commit.
+    fn remove_directory_entry(
+        &mut self,
+        path: &str,
+        working_directory: Option<Arc<Directory>>,
+        directory_only: bool,
+    ) -> Result<(), FileSystemError> {
+        if path.is_empty() {
+            return Err(FileSystemError::NotFound);
+        }
+
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return Err(FileSystemError::ResourceBusy);
+        }
+
         let (parent_path, entry_name) = split_parent_and_name(path)?;
+        if entry_name == "." || entry_name == ".." {
+            return Err(FileSystemError::OperationNotAllowed);
+        }
 
         let parent_dir = self.resolve_dir_with_budget(
             parent_path,
@@ -719,11 +792,23 @@ impl VirtualFileSystem {
             return Err(FileSystemError::NotADirectory);
         }
 
+        if directory_only && !target_inode.is_directory() {
+            return Err(FileSystemError::NotADirectory);
+        }
+
+        if !directory_only && target_inode.is_directory() {
+            return Err(FileSystemError::OperationNotAllowed);
+        }
+
+        if target_inode.directory_path_guards.load(Ordering::Acquire) != 0 {
+            return Err(FileSystemError::ResourceBusy);
+        }
+
         // Reject deletion of a mount point directory.
         let target_key = OpenFileKey::new(
             target_inode.filesystem.instance_id(), target_inode.inode_number);
         if self.mounts.get(&target_key).is_some() {
-            return Err(FileSystemError::AlreadyMounted);
+            return Err(FileSystemError::ResourceBusy);
         }
 
         // Reject deletion of a non-empty directory.
@@ -757,9 +842,10 @@ impl VirtualFileSystem {
         // Remove the on-disk directory entry and decrement the link count.
         target_inode.filesystem.unlink(&parent_dir.inode, entry_name)?;
 
-        // A deleted directory's inode number may later be reused.
+        // Preserve the actual former parent even when retained wrappers were
+        // created before a move. This record is released only after free.
         if target_inode.is_directory() && remaining_links == 0 {
-            self.relocated_parents.remove(&target_key);
+            self.relocated_parents.insert(target_key, Arc::clone(&parent_dir));
         }
 
         // Decrement this in-memory inode's link count after the driver commits.
@@ -770,7 +856,7 @@ impl VirtualFileSystem {
 
         // If the link count has reached zero, decide whether to free
         // immediately or defer until the last handle closes.
-        if remaining_links == 0 {
+        if remaining_links == 0 && !target_inode.is_directory() {
             if let Some(master) = open_master {
                 // The master retains the unlinked inode until the last close.
                 master.mark_pending_deletion();
@@ -801,7 +887,10 @@ impl VirtualFileSystem {
     /// [`FileSystemError::InvalidPath`].
     ///
     /// If both names refer to the same inode, returns success without changing
-    /// either entry. An existing destination for a different inode returns
+    /// either entry. Otherwise, moving or renaming a path-protected directory
+    /// returns `ResourceBusy`. Child entries remain mutable even when their
+    /// parent is protected. Moving into a removed directory returns `NotFound`.
+    /// An existing destination for a different inode returns
     /// [`FileSystemError::AlreadyExists`]; replacement is not implemented.
     ///
     /// # Arguments
@@ -881,6 +970,14 @@ impl VirtualFileSystem {
                 return Ok(());
             }
             return Err(FileSystemError::AlreadyExists);
+        }
+
+        if moved_inode.directory_path_guards.load(Ordering::Acquire) != 0 {
+            return Err(FileSystemError::ResourceBusy);
+        }
+
+        if new_parent.inode.metadata.lock().link_count == 0 {
+            return Err(FileSystemError::NotFound);
         }
 
         // Only the driver operation can now return a filesystem error.

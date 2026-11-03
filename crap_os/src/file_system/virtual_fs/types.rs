@@ -95,6 +95,10 @@ pub enum FileSystemError {
     /// contains entries.
     DirectoryNotEmpty,
 
+    /// A namespace object is protected, is an active mount point, or is the
+    /// global root. Retry after its holders release protection where possible.
+    ResourceBusy,
+
     /// Symlink resolution exceeded
     /// [`crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH`] hops,
     /// indicating a symlink loop or an exceedingly-deep chain.
@@ -415,8 +419,9 @@ pub struct InodeStat {
     /// The number of directory entries that reference this inode.
     ///
     /// For regular files and directories this starts at `1` on creation.
-    /// When it reaches `0` and no open handles remain, the inode and its
-    /// data blocks are freed by the filesystem driver.
+    /// At `0`, files survive until their last registered handle closes.
+    /// Directories also survive retained directory wrappers and await explicit
+    /// VFS reclamation. The filesystem driver frees storage only afterward.
     pub link_count: u32,
 }
 

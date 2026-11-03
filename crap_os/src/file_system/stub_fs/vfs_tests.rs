@@ -35,7 +35,9 @@
 //! 17. **Trailing slashes** - requires a directory at the end of a path.
 //! 18. **Hard links** - checks alias identity, data, counts, symlink policy,
 //!     rejected mutations, rename between aliases, and final reclamation.
-//! 19. **Teardown** - drops the root volume cleanly.
+//! 19. **Directory removal and guards** - checks removal contracts, retained
+//!     directory reclamation, ancestor protection, and mount boundaries.
+//! 20. **Teardown** - drops the root volume cleanly.
 
 extern crate alloc;
 
@@ -89,6 +91,8 @@ pub fn run_vfs_tests() {
     test_moved_working_directory_parent();
     test_trailing_slash_paths();
     test_hard_links();
+    test_directory_removal_and_guards();
+    expect_ok(with_vfs(|vfs| vfs.reclaim_removed_directories()), "final directory cleanup");
     test_unmount();
 
     sprintln!("[VFS TEST] ----------------------------------------");
@@ -516,7 +520,7 @@ fn test_inode_coherence() {
         "[VFS TEST] FAIL - retained and fresh inode sizes disagree");
 
     expect_ok(
-        with_vfs(|vfs| vfs.delete(path, None)),
+        with_vfs(|vfs| vfs.unlink(path, None)),
         "unlink file while handle remains open",
     );
     assert!(created.stat().link_count == 0
@@ -940,7 +944,7 @@ fn test_delete() {
     sprintln!("[VFS TEST] delete ...");
 
     expect_ok(
-        with_vfs(|vfs| vfs.delete("/bin/tools/debug", None)),
+        with_vfs(|vfs| vfs.unlink("/bin/tools/debug", None)),
         "delete /bin/tools/debug",
     );
 
@@ -953,7 +957,7 @@ fn test_delete() {
 
     // Deleting again should return NotFound.
     expect_err(
-        with_vfs(|vfs| vfs.delete("/bin/tools/debug", None)),
+        with_vfs(|vfs| vfs.unlink("/bin/tools/debug", None)),
         FileSystemError::NotFound,
         "double delete",
     );
@@ -995,7 +999,7 @@ fn test_posix_deferred_delete() {
 
     // The open-file master must retain the deferred-free decision.
     expect_ok(
-        with_vfs(|vfs| vfs.delete("/etc/config.txt", None)),
+        with_vfs(|vfs| vfs.unlink("/etc/config.txt", None)),
         "delete /etc/config.txt with open handle",
     );
 
@@ -1085,7 +1089,7 @@ fn test_posix_deferred_delete() {
         "open file for relative deferred delete",
     );
     expect_ok(
-        with_vfs(|vfs| vfs.delete(
+        with_vfs(|vfs| vfs.unlink(
             "deferred-relative.tmp",
             Some(log_dir),
         )),
@@ -1177,7 +1181,7 @@ fn test_retained_directory_namespace() {
         "[VFS TEST] FAIL - renamed file differs across wrappers");
 
     expect_ok(
-        with_vfs(|vfs| vfs.delete("/var/log/wrapper-renamed.tmp", None)),
+        with_vfs(|vfs| vfs.unlink("/var/log/wrapper-renamed.tmp", None)),
         "delete file through fresh path",
     );
     expect_err(
@@ -1268,9 +1272,9 @@ fn test_mount_wrapper_consistency() {
         "second mount on /etc",
     );
     expect_err(
-        with_vfs(|vfs| vfs.delete("/etc", None)),
-        FileSystemError::AlreadyMounted,
-        "delete covered /etc mount host",
+        with_vfs(|vfs| vfs.remove_directory("/etc", None)),
+        FileSystemError::ResourceBusy,
+        "remove covered /etc mount host",
     );
     let busy_handle = open_file("/etc/bin/shell", AccessMode::ReadOnly);
     expect_err(
@@ -1496,7 +1500,7 @@ fn test_trailing_slash_paths() {
         "open regular file with trailing slash",
     );
     expect_err(
-        with_vfs(|vfs| vfs.delete("/etc/hosts.cfg/", None)),
+        with_vfs(|vfs| vfs.unlink("/etc/hosts.cfg/", None)),
         FileSystemError::NotADirectory,
         "delete regular file with trailing slash",
     );
@@ -1542,7 +1546,7 @@ fn test_trailing_slash_paths() {
         "stat symlink to file with trailing slash",
     );
     expect_ok(
-        with_vfs(|vfs| vfs.delete("/etc/trailing-file-link", None)),
+        with_vfs(|vfs| vfs.unlink("/etc/trailing-file-link", None)),
         "delete symlink used by trailing-slash lookup",
     );
 
@@ -1559,7 +1563,7 @@ fn test_trailing_slash_paths() {
     assert!(directory.inode_type == InodeType::Directory,
         "[VFS TEST] FAIL - trailing-slash directory lookup returned another inode type");
     expect_ok(
-        with_vfs(|vfs| vfs.delete("/bin/trailing-dir/", None)),
+        with_vfs(|vfs| vfs.remove_directory("/bin/trailing-dir/", None)),
         "delete directory with trailing slash",
     );
 
@@ -1712,7 +1716,7 @@ fn test_hard_links() {
 
         // First unlink leaves a live alias. Closing every current handle
         // must not free it; a later open through that alias still succeeds.
-        expect_ok(vfs.delete(
+        expect_ok(vfs.unlink(
             "/etc/hard-source", None,
         ), "unlink first name");
         assert_eq!(source.stat().link_count, 1);
@@ -1730,7 +1734,7 @@ fn test_hard_links() {
             "/var/log/hard-alias", AccessMode::ReadOnly, None,
         ), "second open before final unlink");
 
-        expect_ok(vfs.delete(
+        expect_ok(vfs.unlink(
             "/var/log/hard-alias", None,
         ), "unlink final name");
         assert_eq!(source.stat().link_count, 0);
@@ -1773,10 +1777,10 @@ fn test_hard_links() {
             false,
         ), "link immediate-free fixture");
 
-        expect_ok(vfs.delete(
+        expect_ok(vfs.unlink(
             "/etc/hard-immediate", None,
         ), "first immediate unlink");
-        expect_ok(vfs.delete(
+        expect_ok(vfs.unlink(
             "/etc/hard-immediate-alias", None,
         ), "last immediate unlink");
         expect_err(
@@ -1844,7 +1848,7 @@ fn test_hard_links() {
         expect_ok(vfs.unmount(
             "/etc/hard-mount", None,
         ), "unmount boundary fixture");
-        expect_ok(vfs.delete(
+        expect_ok(vfs.remove_directory(
             "/etc/hard-mount", None,
         ), "remove mount host");
 
@@ -1856,7 +1860,7 @@ fn test_hard_links() {
             "/etc/hard-target",
             "/etc/hard-target-alias",
         ] {
-            expect_ok(vfs.delete(path, None), "remove hard-link fixture");
+            expect_ok(vfs.unlink(path, None), "remove hard-link fixture");
         }
     });
 
@@ -1887,4 +1891,120 @@ fn test_unmount() {
     }
 
     sprintln!("[VFS TEST] unmount ... PASS");
+}
+
+/// Exercises distinct removal contracts, detached lifetimes, and path guards.
+///
+/// Runs against isolated fixtures after the hard-link tests. Driver loads
+/// distinguish preserved backing storage from merely retained Arc objects.
+/// Guards cover fresh and retained wrappers, moved ancestry, mount boundaries,
+/// and independent holders. All fixtures are removed before suite teardown.
+///
+/// # Panics
+///
+/// Panics on the first unexpected result or inconsistent lifetime observation.
+fn test_directory_removal_and_guards() {
+    sprintln!("[VFS TEST] directory removal and path guards ...");
+    with_vfs(|vfs| {
+        let budget = crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH;
+        let permissions = Permissions::all_permissive();
+        for path in ["/etc/remove-case", "/etc/remove-case/a", "/etc/remove-case/b",
+            "/etc/remove-case/a/leaf"] {
+            expect_ok(vfs.create_directory(path, permissions.clone(), None), "create removal fixture");
+        }
+        expect_ok(vfs.create_file("/etc/remove-case/file", permissions.clone(), None), "create file");
+        expect_ok(vfs.create_symlink("/etc/remove-case/link", "/etc/remove-case/a",
+            None), "create directory symlink");
+        expect_ok(vfs.create_symlink("/etc/remove-case/dangling", "/absent-target",
+            None), "create dangling symlink");
+
+        for path in ["", "/", "////", ".", "..", "/etc/remove-case/a/.",
+            "/etc/remove-case/a/..///"] {
+            let error = if path.is_empty() { FileSystemError::NotFound }
+                else if path.trim_matches('/').is_empty() { FileSystemError::ResourceBusy }
+                else { FileSystemError::OperationNotAllowed };
+            expect_err(vfs.unlink(path, None), error.clone(), "unlink special spelling");
+            expect_err(vfs.remove_directory(path, None), error, "rmdir special spelling");
+        }
+        for path in ["/etc/remove-case/file", "/etc/remove-case/link", "/etc/remove-case/dangling",
+            "/etc/remove-case/file///", "/etc/remove-case/link///", "/etc/remove-case/dangling///"] {
+            expect_err(vfs.remove_directory(path, None), FileSystemError::NotADirectory, "rmdir type");
+        }
+        for path in ["/etc/remove-case/file///", "/etc/remove-case/link///", "/etc/remove-case/dangling///"] {
+            expect_err(vfs.unlink(path, None), FileSystemError::NotADirectory, "unlink trailing slash");
+        }
+        for path in ["/etc/remove-case/a", "/etc/remove-case/a/leaf///"] {
+            expect_err(vfs.unlink(path, None), FileSystemError::OperationNotAllowed, "unlink directory");
+        }
+        expect_err(vfs.remove_directory("/etc/remove-case/a", None),
+            FileSystemError::DirectoryNotEmpty, "nonempty directory");
+
+        let retained = expect_ok(vfs.resolve_dir_with_budget("/etc/remove-case/a/leaf", None, budget), "retain leaf");
+        let other_wrapper = expect_ok(vfs.resolve_dir_with_budget("/etc/remove-case/a/leaf", None, budget), "second wrapper");
+        let first = expect_ok(vfs.protect_directory_path(retained.clone()), "first guard");
+        let second = expect_ok(vfs.protect_directory_path(other_wrapper.clone()), "second guard");
+        for path in ["/etc/remove-case", "/etc/remove-case/a", "/etc/remove-case/a/leaf"] {
+            expect_err(vfs.remove_directory(path, None), FileSystemError::ResourceBusy, "guarded removal");
+            expect_err(vfs.rename(path, "/etc/guard-moved", None), FileSystemError::ResourceBusy, "guarded rename");
+            expect_err(vfs.mount("stubfs", Arc::new(StubBlockDevice), path, None),
+                FileSystemError::ResourceBusy, "guarded mount");
+        }
+        expect_ok(vfs.rename("/etc/remove-case/a/leaf", "/etc/remove-case/a/leaf", None), "guarded no-op");
+        expect_ok(vfs.create_file("/etc/remove-case/a/leaf/child", permissions.clone(), None), "guard allows content creation");
+        expect_ok(vfs.rename("/etc/remove-case/a/leaf/child", "/etc/remove-case/a/leaf/renamed", None), "guard allows child rename");
+        expect_ok(vfs.unlink("/etc/remove-case/a/leaf/renamed", None), "guard allows child unlink");
+        drop(first);
+        expect_err(vfs.remove_directory("/etc/remove-case/a/leaf", None), FileSystemError::ResourceBusy, "second guard remains");
+        drop(second);
+
+        // Move before reacquiring protection: stale wrapper parents must not
+        // protect the old ancestry or allow mutation of the new ancestry.
+        expect_ok(vfs.rename("/etc/remove-case/a/leaf", "/etc/remove-case/b/leaf", None), "move unprotected leaf");
+        let moved_guard = expect_ok(vfs.protect_directory_path(retained.clone()), "guard moved wrapper");
+        expect_err(vfs.rename("/etc/remove-case/b", "/etc/remove-case/b2", None), FileSystemError::ResourceBusy, "new ancestor protected");
+        expect_ok(vfs.remove_directory("/etc/remove-case/a", None), "old ancestor unprotected");
+        drop(moved_guard);
+        expect_ok(vfs.remove_directory("/etc/remove-case/b/leaf///", None), "remove retained leaf");
+        assert_eq!(retained.inode.stat().link_count, 0);
+        assert!(expect_ok(retained.inode.filesystem.read_dir(&retained.inode), "detached listing").is_empty());
+        expect_err(vfs.resolve("/etc/remove-case/b/leaf", None, false), FileSystemError::NotFound, "name detached");
+        expect_err(vfs.protect_directory_path(retained.clone()), FileSystemError::NotFound, "cannot guard detached leaf");
+        expect_err(vfs.create_file("new", permissions.clone(), Some(retained.clone())), FileSystemError::NotFound, "cannot create in detached leaf");
+        expect_err(vfs.create_directory("new", permissions.clone(), Some(retained.clone())), FileSystemError::NotFound, "cannot mkdir in detached leaf");
+        expect_err(vfs.create_symlink("new", "/etc", Some(retained.clone())), FileSystemError::NotFound, "cannot symlink in detached leaf");
+        expect_err(vfs.create_hard_link("/etc/remove-case/file", "new", Some(retained.clone()), false), FileSystemError::NotFound, "cannot link into detached leaf");
+        expect_err(vfs.rename("/etc/remove-case/file", "new", Some(retained.clone())), FileSystemError::NotFound, "cannot move into detached leaf");
+        expect_err(vfs.mount("stubfs", Arc::new(StubBlockDevice), ".", Some(retained.clone())), FileSystemError::NotFound, "cannot mount detached leaf");
+        let parent = expect_ok(vfs.resolve("..", Some(retained.clone()), false), "former parent traversal");
+        let b = expect_ok(vfs.resolve("/etc/remove-case/b", None, false), "current former parent");
+        assert!(Arc::ptr_eq(&parent, &b));
+        let leaf_inode = retained.inode.clone();
+        drop(retained);
+        expect_ok(vfs.reclaim_removed_directories(), "cleanup while second wrapper remains");
+        expect_ok(leaf_inode.filesystem.load_inode(leaf_inode.inode_number), "second wrapper retains storage");
+        drop(other_wrapper);
+        expect_ok(vfs.reclaim_removed_directories(), "cleanup after final wrapper");
+        expect_err(leaf_inode.filesystem.load_inode(leaf_inode.inode_number), FileSystemError::NotFound, "detached storage reclaimed");
+        expect_ok(vfs.unlink("/etc/remove-case/b/../file", None), "intermediate traversal");
+        expect_ok(vfs.unlink("/etc/remove-case/link", None), "unlink directory symlink itself");
+        expect_ok(vfs.unlink("/etc/remove-case/dangling", None), "unlink dangling symlink");
+
+        expect_ok(vfs.mount("stubfs", Arc::new(StubBlockDevice), "/etc/remove-case/b", None), "mount guard fixture");
+        let inside = expect_ok(vfs.resolve_dir_with_budget("/etc/remove-case/b/etc", None, budget), "mounted directory");
+        let mount_guard = expect_ok(vfs.protect_directory_path(inside.clone()), "guard across mount");
+        expect_err(vfs.unmount("/etc/remove-case/b", None), FileSystemError::ResourceBusy, "guard blocks unmount");
+        expect_err(vfs.rename("/etc/remove-case", "/etc/remove-case-moved", None), FileSystemError::ResourceBusy, "guard crosses host ancestry");
+        expect_err(vfs.unlink("/etc/remove-case/b", None), FileSystemError::OperationNotAllowed, "unlink mount host");
+        expect_err(vfs.remove_directory("/etc/remove-case/b", None), FileSystemError::ResourceBusy, "rmdir mount host");
+        drop(mount_guard);
+        drop(inside);
+        expect_ok(vfs.unmount("/etc/remove-case/b", None), "unmount after guard release");
+        expect_err(vfs.remove_directory("/etc/remove-case/b/../b/.", None), FileSystemError::OperationNotAllowed, "final dot remains rejected");
+        expect_ok(vfs.remove_directory("/etc/remove-case/b/../b///", None), "intermediate rmdir traversal");
+        expect_ok(vfs.remove_directory("/etc/remove-case", None), "remove fixture root");
+        drop(parent);
+        drop(b);
+        expect_ok(vfs.reclaim_removed_directories(), "reclaim fixture ancestry");
+    });
+    sprintln!("[VFS TEST] directory removal and path guards ... PASS");
 }

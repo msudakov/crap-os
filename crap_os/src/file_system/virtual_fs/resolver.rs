@@ -65,6 +65,19 @@ use super::inode::Inode;
 use super::types::{DirectoryEntryType, FileSystemError, OpenFileKey};
 use super::vfs::VirtualFileSystem;
 
+/// Resolution result retaining the actual parent of a final regular file.
+///
+/// The parent comes from the same traversal and shared symlink budget that
+/// selected the inode. It is not the lexical parent of the original pathname.
+pub(super) struct ResolvedEntry {
+    /// Canonical inode selected by path resolution.
+    pub(super) inode: Arc<Inode>,
+
+    /// Actual containing directory for a regular-file result. Directories and
+    /// unfollowed symlinks use `None`; protected opens reject those types.
+    pub(super) file_parent: Option<Arc<Directory>>,
+}
+
 /// The maximum number of symlink hops the resolver will follow before
 /// returning [`super::types::FileSystemError::TooManySymlinks`].
 ///
@@ -173,7 +186,38 @@ impl VirtualFileSystem {
         self.walk_to_directory(path, working_directory, symlink_budget)
     }
 
-    /// The recursive core of the path resolver.
+    /// Resolves a path and discards its final regular-file parent context.
+    ///
+    /// Existing inode-only callers share the same traversal and symlink budget
+    /// as protected opens. No second lookup is needed to discard context.
+    ///
+    /// # Arguments
+    ///
+    /// * `path`              - Absolute or relative pathname to resolve.
+    /// * `working_directory` - Relative-path base, or root when absent.
+    /// * `follow_symlinks`   - Whether to follow a final symlink.
+    /// * `symlink_budget`    - Remaining permitted symlink traversals.
+    ///
+    /// # Returns
+    ///
+    /// Returns the canonical inode or the underlying resolution error.
+    fn resolve_with_budget(
+        &self,
+        path: &str,
+        working_directory: Option<Arc<Directory>>,
+        follow_symlinks: bool,
+        symlink_budget: u8,
+    ) -> Result<Arc<Inode>, FileSystemError> {
+        Ok(self.resolve_entry_with_budget(
+            path, working_directory, follow_symlinks, symlink_budget,
+        )?.inode)
+    }
+
+    /// Resolves a path while retaining final regular-file parent context.
+    ///
+    /// Symlink recursion returns the target's parent context directly, using
+    /// the same decremented budget. Existing inode-only resolution delegates
+    /// here and discards the parent rather than maintaining another walker.
     ///
     /// Called by [`VirtualFileSystem::resolve`] with [`MAX_SYMLINK_DEPTH`] as
     /// the initial budget, and called recursively by itself each time a
@@ -196,15 +240,16 @@ impl VirtualFileSystem {
     ///
     /// # Returns
     ///
-    /// Returns `Ok(Arc<Inode>)` for the resolved inode, or
-    /// `Err(FileSystemError)` on any resolution failure.
-    fn resolve_with_budget(
+    /// Returns the canonical inode with `Some(parent)` for a regular file,
+    /// or with `None` for a directory or unfollowed symlink. Returns the
+    /// underlying error if resolution fails.
+    pub(super) fn resolve_entry_with_budget(
         &self,
         path: &str,
         working_directory: Option<Arc<Directory>>,
         follow_symlinks: bool,
         symlink_budget: u8,
-    ) -> Result<Arc<Inode>, FileSystemError> {
+    ) -> Result<ResolvedEntry, FileSystemError> {
         if path.is_empty() {
             return Err(FileSystemError::InvalidPath);
         }
@@ -243,7 +288,10 @@ impl VirtualFileSystem {
         // If after filtering there are no components (e.g., path was `/` or
         // `///`), the path refers to the current directory itself.
         if components.is_empty() {
-            return Ok(Arc::clone(&current.inode));
+            return Ok(ResolvedEntry {
+                inode: Arc::clone(&current.inode),
+                file_parent: None,
+            });
         }
 
         let last_index = components.len() - 1;
@@ -256,7 +304,10 @@ impl VirtualFileSystem {
             // component, the current directory's inode is the result.
             if component == "." {
                 if is_last {
-                    return Ok(Arc::clone(&current.inode));
+                    return Ok(ResolvedEntry {
+                        inode: Arc::clone(&current.inode),
+                        file_parent: None,
+                    });
                 }
                 continue;
             }
@@ -266,7 +317,10 @@ impl VirtualFileSystem {
                 if current.is_root() {
                     // We are already at the global root; `..` is a no-op.
                     if is_last {
-                        return Ok(Arc::clone(&current.inode));
+                        return Ok(ResolvedEntry {
+                            inode: Arc::clone(&current.inode),
+                            file_parent: None,
+                        });
                     }
                     continue;
                 }
@@ -292,7 +346,10 @@ impl VirtualFileSystem {
                     current = Arc::clone(&mount_point.host_directory);
 
                     if is_last {
-                        return Ok(Arc::clone(&current.inode));
+                        return Ok(ResolvedEntry {
+                            inode: Arc::clone(&current.inode),
+                            file_parent: None,
+                        });
                     }
                     continue;
                 }
@@ -306,7 +363,10 @@ impl VirtualFileSystem {
                 };
 
                 if is_last {
-                    return Ok(Arc::clone(&current.inode));
+                    return Ok(ResolvedEntry {
+                        inode: Arc::clone(&current.inode),
+                        file_parent: None,
+                    });
                 }
                 continue;
             }
@@ -332,7 +392,11 @@ impl VirtualFileSystem {
                     let inode = self.get_or_load_inode(
                         &current.inode.filesystem, inode_number,
                     )?;
-                    return Ok(inode);
+                    // Capture the actual target parent, including after
+                    // final-symlink recursion. No second path walk is needed.
+                    return Ok(ResolvedEntry {
+                        inode, file_parent: Some(Arc::clone(&current)),
+                    });
                 }
 
                 DirectoryEntryType::Directory => {
@@ -359,7 +423,10 @@ impl VirtualFileSystem {
                     }
 
                     if is_last {
-                        return Ok(Arc::clone(&current.inode));
+                        return Ok(ResolvedEntry {
+                            inode: Arc::clone(&current.inode),
+                            file_parent: None,
+                        });
                     }
                 }
 
@@ -370,7 +437,7 @@ impl VirtualFileSystem {
                         let inode = self.get_or_load_inode(
                             &current.inode.filesystem, inode_number,
                         )?;
-                        return Ok(inode);
+                        return Ok(ResolvedEntry { inode, file_parent: None });
                     }
 
                     // We need to follow the symlink. Deduct one hop from the
@@ -412,7 +479,7 @@ impl VirtualFileSystem {
                     };
 
                     // Recurse with the spliced path and decremented budget.
-                    return self.resolve_with_budget(
+                    return self.resolve_entry_with_budget(
                         &effective_path,
                         symlink_base,
                         follow_symlinks,
@@ -426,7 +493,10 @@ impl VirtualFileSystem {
         // happens only when `components` is non-empty but all components were
         // consumed via the continue paths (i.e., the path consisted entirely
         // of "." components). Return the current directory's inode.
-        Ok(Arc::clone(&current.inode))
+        Ok(ResolvedEntry {
+            inode: Arc::clone(&current.inode),
+            file_parent: None,
+        })
     }
 
     /// Walks `path` through the directory tree and returns the

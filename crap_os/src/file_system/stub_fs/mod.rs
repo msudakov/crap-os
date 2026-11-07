@@ -4,7 +4,8 @@
 //! development to exercise the VFS layer before a real on-disk filesystem is
 //! available. It implements [`FileSystemDriver`] and [`FileSystemInstance`]
 //! with a hardcoded directory tree and no disk interaction.
-//! The VFS test harness can inject one unmount error to check retry behavior.
+//! The VFS test harness can inject one-shot unmount and inode-free errors
+//! to check retry behavior without changing backing state on failure.
 //!
 //! ## Hardcoded Tree
 //!
@@ -108,6 +109,24 @@ static FAIL_UNMOUNT_ONCE_FOR: SpinLock<Option<u64>> = SpinLock::new(None);
 /// * `instance_id` - Identifier of the mounted stub instance to target.
 fn fail_next_unmount_for(instance_id: u64) {
     *FAIL_UNMOUNT_ONCE_FOR.lock() = Some(instance_id);
+}
+
+/// One-shot free failure keyed by filesystem instance and inode number.
+/// Untargeted frees leave the request armed, so independent mounts cannot
+/// accidentally consume another test's failure.
+static FAIL_FREE_ONCE_FOR: SpinLock<Option<(u64, u64)>> = SpinLock::new(None);
+
+/// Arms a single backing-storage free failure without modifying the target.
+///
+/// The boot harness runs these injections serially. Arm only one request at
+/// a time and ensure the targeted free is attempted before the fixture ends.
+///
+/// # Arguments
+///
+/// * `instance_id` - Mounted stub instance that owns the target inode.
+/// * `inode_number` - Inode whose next free should return `DiskWriteError`.
+fn fail_next_free_for(instance_id: u64, inode_number: u64) {
+    *FAIL_FREE_ONCE_FOR.lock() = Some((instance_id, inode_number));
 }
 
 // ----------------------------------------------------------------------------
@@ -465,7 +484,29 @@ impl FileSystemInstance for StubFsInstance {
         Ok(())
     }
 
+    /// Frees backing records, unless the harness armed a one-shot failure.
+    ///
+    /// Injection is checked before acquiring storage locks or removing any
+    /// record. A simulated error preserves metadata and contents for retry.
+    /// The VFS, not the driver, enforces namespace protection and lifetime.
+    ///
+    /// # Arguments
+    ///
+    /// * `inode` - Inode owned by this instance and eligible for reclamation
+    ///   under the VFS lifetime contract.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` after removal, `DiskWriteError` once for the armed
+    /// identity, or `NotFound` if its backing inode record does not exist.
     fn free_inode(&self, inode: &Inode) -> Result<(), FileSystemError> {
+        {
+            let mut fail_for = FAIL_FREE_ONCE_FOR.lock();
+            if *fail_for == Some((self.id, inode.inode_number)) {
+                *fail_for = None;
+                return Err(FileSystemError::DiskWriteError);
+            }
+        }
         let mut inodes = self.inodes.lock();
         let idx = Self::find_inode_index(&inodes, inode.inode_number)?;
         inodes.remove(idx);

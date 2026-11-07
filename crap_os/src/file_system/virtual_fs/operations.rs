@@ -44,89 +44,135 @@ use alloc::sync::Arc;
 use core::sync::atomic::Ordering;
 
 use super::directory::Directory;
-use super::file::{File, FileHandle};
+use super::file::{File, FileHandle, OpenNamespaceProtection};
+use super::inode::Inode;
 use super::types::{
     AccessMode, FileSystemError, InodeStat, OpenFileKey,
-    Permissions, Timestamps,
+    Permissions, Timestamps, NamespaceProtection,
 };
 use super::vfs::VirtualFileSystem;
 use crate::globals;
 
 impl VirtualFileSystem {
-    /// Opens the file at `path` and returns a registered [`FileHandle`].
+    /// Opens a regular file without contributing namespace restrictions.
     ///
-    /// Resolves `path` to an inode, verifies it is a regular file, then
-    /// either retrieves the existing [`super::file::File`] master record from
-    /// the open-file table or creates a new one. A new [`FileHandle`] is
-    /// created for this open call, registered with the master record, and
-    /// returned to the caller.
-    ///
-    /// The VFS wraps the handle in an [`Arc`] and registers it before
-    /// returning. The caller owns that registered handle and must close it
-    /// explicitly.
-    ///
-    /// If `path` resolves to a symlink, the symlink is followed and the
-    /// target file is opened. To open the symlink inode itself, use a path
-    /// that does not require following the final symlink, which is not a
-    /// supported operation for `open`, as symlink inodes are not openable as
-    /// files.
+    /// Other handles' protection still applies. The caller holds global VFS
+    /// serialization and explicitly closes the returned registration.
     ///
     /// # Arguments
     ///
-    /// * `path`              - The path of the file to open.
-    /// * `access_mode`       - The access rights to grant the new handle.
-    /// * `working_directory` - The starting directory for relative paths.
-    ///   `None` means use the global root.
+    /// * `path`              - File pathname; final symlinks are followed.
+    /// * `access_mode`       - Content access rights requested.
+    /// * `working_directory` - Relative-path base, or root when absent.
     ///
     /// # Returns
     ///
-    /// Returns `Ok(Arc<FileHandle>)` on success. Returns
-    /// `Err(FileSystemError::NotFound)` if the path does not exist,
-    /// `Err(FileSystemError::NotAFile)` if it resolves to a non-file inode,
-    /// or other `Err(FileSystemError)` variants for I/O and resolution
-    /// failures.
+    /// Returns a registered handle or the underlying open/resolution error.
     pub fn open(
         &mut self,
         path: &str,
         access_mode: AccessMode,
         working_directory: Option<Arc<Directory>>,
     ) -> Result<Arc<FileHandle>, FileSystemError> {
-        // Resolve the path, following symlinks so the caller gets the target
-        // file rather than the symlink inode.
-        let inode = self.resolve(path, working_directory, true)?;
+        self.open_with_namespace_protection(
+            path, access_mode, working_directory, NamespaceProtection::NONE,
+        )
+    }
 
-        // Only regular files can be opened through this method.
+    /// Opens a regular file and atomically acquires namespace protection.
+    ///
+    /// The caller holds global VFS serialization throughout resolution, token
+    /// acquisition, and registration. No namespace mutation can interleave.
+    /// Prefer `PROTECT_FULL` for namespace stability. Ancestor-only protection
+    /// stays on captured directories if the file later moves. All hard-link
+    /// names share name protection, but only this resolved path's ancestors
+    /// are captured. Symlink entries used to reach the target are not guarded.
+    ///
+    /// Reads, writes, timestamps, and write locking keep their own contracts.
+    /// Protection does not prevent additional opens. The caller must close
+    /// the registration before dropping its last Arc; a failed close retains
+    /// protection for retry. Arc clones do not acquire independent tokens.
+    ///
+    /// # Arguments
+    ///
+    /// * `path`              - File pathname; final symlinks are followed.
+    /// * `access_mode`       - Content access rights requested.
+    /// * `working_directory` - Relative-path base, or root when absent.
+    /// * `protection`        - Independent namespace restrictions, or `NONE`.
+    ///
+    /// # Returns
+    ///
+    /// Returns a registered handle owning the contributions. Returns `NotAFile`
+    /// for other inode types, `NotFound` for a detached target, `ResourceBusy`
+    /// for protection-counter exhaustion, `InternalError` for exhausted handle
+    /// IDs or missing regular-file parent context, or a resolution error.
+    /// A returned error publishes no handle and retains no new protection.
+    pub fn open_with_namespace_protection(
+        &mut self,
+        path: &str,
+        access_mode: AccessMode,
+        working_directory: Option<Arc<Directory>>,
+        protection: NamespaceProtection,
+    ) -> Result<Arc<FileHandle>, FileSystemError> {
+        let resolved = self.resolve_entry_with_budget(
+            path, working_directory, true, super::resolver::MAX_SYMLINK_DEPTH,
+        )?;
+        let inode = resolved.inode;
+
         if !inode.is_file() {
             return Err(FileSystemError::NotAFile);
         }
 
         let key = OpenFileKey::new(inode.filesystem.instance_id(),
             inode.inode_number);
-
-        // A retained directory wrapper may still name an unlinked inode.
-        // Its open-file master records the deletion while handles remain.
-        if self.open_files.get(&key)
-            .is_some_and(|master| master.is_pending_deletion())
+        if inode.metadata.lock().link_count == 0
+            || self.open_files.get(&key)
+                .is_some_and(|master| master.is_pending_deletion())
         {
             return Err(FileSystemError::NotFound);
         }
 
-        // Refuse ID exhaustion rather than reusing the identity of a handle
-        // that could still hold an exclusive write lock.
+        // Validate ID availability before acquiring tokens. Commit advancement
+        // only when this open is ready to register.
         let handle_id = self.next_handle_id;
-        self.next_handle_id = handle_id
-            .checked_add(1)
+        let next_handle_id = handle_id.checked_add(1)
             .ok_or(FileSystemError::InternalError)?;
+        let ancestor_guard = if protection.contains(
+            NamespaceProtection::PROTECT_ANCESTORS)
+        {
+            let parent = resolved.file_parent
+                .ok_or(FileSystemError::InternalError)?;
+            Some(self.protect_directory_path(parent)?)
+        } else {
+            None
+        };
 
-        // Retrieve the existing master record or create a new one.
-        let master = self.open_files
-            .entry(key)
+        // A failed name acquisition drops the local ancestor token, rolling
+        // back its contribution without a separate error-prone undo sequence.
+        let name_guard = if protection.contains(
+            NamespaceProtection::PROTECT_NAMES)
+        {
+            Some(inode.protect_names()?)
+        } else {
+            None
+        };
+
+        let namespace_protection = OpenNamespaceProtection {
+            flags: protection, name_guard, ancestor_guard,
+        };
+
+        let master = self.open_files.entry(key)
             .or_insert_with(|| Arc::new(File::new(Arc::clone(&inode))));
 
         let handle = Arc::new(FileHandle::new(
-            Arc::clone(master), handle_id, access_mode,
+            Arc::clone(master), handle_id, access_mode, namespace_protection,
         ));
+
+        // Allocations retain the existing kernel contract: allocation failure
+        // is not represented as a returned filesystem error.
         master.register_handle(&handle);
+        self.next_handle_id = next_handle_id;
+
         Ok(handle)
     }
 
@@ -263,7 +309,9 @@ impl VirtualFileSystem {
     ///
     /// If the closing handle owns the exclusive write lock, unregistering it
     /// releases that lock. A failed deferred free leaves the handle open and
-    /// registered so its owner can retry close.
+    /// registered so its owner can retry close. Namespace protection also
+    /// remains effective on failure. Successful close releases this handle's
+    /// contributions even if Arc clones remain; other opens keep their tokens.
     ///
     /// After success, the caller removes and drops its handle-table entry.
     ///
@@ -312,7 +360,12 @@ impl VirtualFileSystem {
 
         let remaining = master.unregister_handle(handle)?;
         handle_state.closed = true;
+        let namespace_protection = handle_state.namespace_protection.take();
         drop(handle_state);
+
+        // Release only after all fallible close work succeeds. Destructors
+        // run outside the handle-state lock and perform no driver I/O.
+        drop(namespace_protection);
 
         if remaining == 0 {
             self.open_files.remove(&key);
@@ -680,6 +733,7 @@ impl VirtualFileSystem {
     /// The caller holds the global VFS lock throughout this operation.
     /// Other hard links and registered open handles preserve file lifetime.
     /// Directories, including mount hosts, return `OperationNotAllowed`.
+    /// Name-protected regular files return `ResourceBusy` for every alias.
     /// Trailing slashes on files or symlinks return `NotADirectory`, even if a
     /// symlink targets a directory. This is an intentional contract.
     ///
@@ -800,9 +854,7 @@ impl VirtualFileSystem {
             return Err(FileSystemError::OperationNotAllowed);
         }
 
-        if target_inode.directory_path_guards.load(Ordering::Acquire) != 0 {
-            return Err(FileSystemError::ResourceBusy);
-        }
+        ensure_namespace_mutation_allowed(&target_inode)?;
 
         // Reject deletion of a mount point directory.
         let target_key = OpenFileKey::new(
@@ -887,11 +939,12 @@ impl VirtualFileSystem {
     /// [`FileSystemError::InvalidPath`].
     ///
     /// If both names refer to the same inode, returns success without changing
-    /// either entry. Otherwise, moving or renaming a path-protected directory
-    /// returns `ResourceBusy`. Child entries remain mutable even when their
-    /// parent is protected. Moving into a removed directory returns `NotFound`.
-    /// An existing destination for a different inode returns
-    /// [`FileSystemError::AlreadyExists`]; replacement is not implemented.
+    /// either entry, even when protected. Otherwise, a name-protected source
+    /// or destination, or a path-protected directory, returns `ResourceBusy`.
+    /// Directory protection alone allows changes to child entries. Moving into
+    /// a removed directory returns `NotFound`. An existing unprotected
+    /// destination for a different inode returns `AlreadyExists`; replacement
+    /// is not implemented.
     ///
     /// # Arguments
     ///
@@ -969,12 +1022,19 @@ impl VirtualFileSystem {
             if destination.inode_number == moved_inode.inode_number {
                 return Ok(());
             }
+
+            let destination_inode = self.get_or_load_inode(
+                &new_parent.inode.filesystem, destination.inode_number,
+            )?;
+            ensure_namespace_mutation_allowed(&moved_inode)?;
+            ensure_namespace_mutation_allowed(&destination_inode)?;
+
+            // Replacement remains a separate VFS/driver change. Its future
+            // commit must follow both protection checks above.
             return Err(FileSystemError::AlreadyExists);
         }
 
-        if moved_inode.directory_path_guards.load(Ordering::Acquire) != 0 {
-            return Err(FileSystemError::ResourceBusy);
-        }
+        ensure_namespace_mutation_allowed(&moved_inode)?;
 
         if new_parent.inode.metadata.lock().link_count == 0 {
             return Err(FileSystemError::NotFound);
@@ -1059,6 +1119,30 @@ impl VirtualFileSystem {
 
         Ok(())
     }
+}
+
+/// Checks protection before changing an inode's existing namespace attachment.
+///
+/// The caller holds global VFS serialization and checks before driver mutation.
+/// There is no holder bypass. Same-inode rename no-ops are handled before this
+/// check because they change no namespace state. Hard-link creation does not
+/// remove or change an existing attachment and does not use this check.
+///
+/// # Arguments
+///
+/// * `inode` - Canonical inode whose entry would be removed or changed.
+///
+/// # Returns
+///
+/// Returns `ResourceBusy` if name protection or directory path protection
+/// blocks the operation; otherwise returns `Ok(())`.
+fn ensure_namespace_mutation_allowed(inode: &Inode) -> Result<(), FileSystemError> {
+    if inode.names_are_protected()
+        || inode.directory_path_guards.load(Ordering::Acquire) != 0
+    {
+        return Err(FileSystemError::ResourceBusy);
+    }
+    Ok(())
 }
 
 /// Splits a path string into the parent directory path and the terminal

@@ -45,8 +45,11 @@ use alloc::vec::Vec;
 
 use crate::spinlock::SpinLock;
 
-use super::inode::Inode;
-use super::types::{AccessMode, FileLockState, FileSystemError};
+use super::directory::DirectoryPathGuard;
+use super::inode::{Inode, InodeNameGuard};
+use super::types::{
+    AccessMode, FileLockState, FileSystemError, NamespaceProtection
+};
 
 /// The master record for a file that has at least one open handle.
 ///
@@ -343,6 +346,22 @@ pub struct FileHandle {
     pub access_mode: AccessMode,
 }
 
+/// Namespace contributions owned by one open-handle registration.
+///
+/// Successful VFS close releases these tokens even when Arc clones remain.
+/// Failed close retains them. Abandoning an incompletely constructed open
+/// rolls back acquired protection through ordinary token destruction.
+pub(super) struct OpenNamespaceProtection {
+    /// Immutable options selected when this handle was opened.
+    pub(super) flags: NamespaceProtection,
+
+    /// One contribution protecting all names of the opened inode, if requested.
+    pub(super) name_guard: Option<InodeNameGuard>,
+
+    /// Captured parent and ancestor protection, if requested.
+    pub(super) ancestor_guard: Option<DirectoryPathGuard>,
+}
+
 /// State shared by references to one open handle, not by separate opens.
 pub(super) struct FileHandleState {
     /// Byte offset for the next read or write through this handle.
@@ -350,21 +369,37 @@ pub(super) struct FileHandleState {
 
     /// Set after successful close so every remaining `Arc` clone is invalid.
     pub(super) closed: bool,
+
+    /// Contributions owned by this registration until successful close.
+    /// Unprotected opens have a value with both tokens absent. Closed handles
+    /// contain `None`; retained Arc clones do not extend released protection.
+    pub(super) namespace_protection: Option<OpenNamespaceProtection>,
 }
 
 impl FileHandle {
     /// Constructs a new [`FileHandle`] for the given master record with the
-    /// specified access mode.
+    /// specified access mode and prepared namespace protection.
     ///
     /// The initial position is `0`, and the handle starts open. The VFS wraps
     /// it in an [`Arc`] and registers it before returning from `open`.
     ///
     /// # Arguments
     ///
-    /// * `file`        - The master record for the file being opened.
-    /// * `id`          - Identifier assigned by the VFS to this open handle.
-    /// * `access_mode` - The access rights granted to this handle.
-    pub(super) fn new(file: Arc<File>, id: u64, access_mode: AccessMode
+    /// * `file`                 - The master record for the file being opened.
+    /// * `id`                   - Identifier assigned by the VFS to this open
+    ///   handle.
+    /// * `access_mode`          - The access rights granted to this handle.
+    /// * `namespace_protection` - Tokens acquired under VFS serialization.
+    ///   Abandoning construction releases them without driver I/O.
+    ///
+    /// # Returns
+    ///
+    /// Returns an open handle that must be registered before publication.
+    pub(super) fn new(
+        file: Arc<File>,
+        id: u64,
+        access_mode: AccessMode,
+        namespace_protection: OpenNamespaceProtection,
     ) -> Self {
         Self {
             file,
@@ -372,6 +407,7 @@ impl FileHandle {
             state: SpinLock::new(FileHandleState {
                 position: 0,
                 closed: false,
+                namespace_protection: Some(namespace_protection),
             }),
             access_mode,
         }

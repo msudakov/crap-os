@@ -37,7 +37,10 @@
 //!     rejected mutations, rename between aliases, and final reclamation.
 //! 19. **Directory removal and guards** - checks removal contracts, retained
 //!     directory reclamation, ancestor protection, and mount boundaries.
-//! 20. **Teardown** - drops the root volume cleanly.
+//! 20. **File namespace protection** - checks alias-wide restrictions,
+//!     additive handles, captured ancestry, symlinks, mount boundaries, and
+//!     protection retention across a failed final close.
+//! 21. **Teardown** - drops the root volume cleanly.
 
 extern crate alloc;
 
@@ -47,7 +50,7 @@ use crate::file_system::stub_fs::stub_block_device::StubBlockDevice;
 use crate::file_system::stub_fs::StubFileSystemDriver;
 use crate::file_system::virtual_fs::directory::Directory;
 use crate::file_system::virtual_fs::types::{
-    AccessMode, FileSystemError, InodeType, Permissions,
+    AccessMode, FileSystemError, InodeType, Permissions, NamespaceProtection,
 };
 use crate::file_system::virtual_fs::vfs::VirtualFileSystem;
 use crate::file_system::virtual_fs::file::FileHandle;
@@ -92,6 +95,10 @@ pub fn run_vfs_tests() {
     test_trailing_slash_paths();
     test_hard_links();
     test_directory_removal_and_guards();
+    test_namespace_name_protection();
+    test_namespace_combined_protection();
+    test_namespace_symlinks_and_mounts();
+    test_namespace_close_retry();
     expect_ok(with_vfs(|vfs| vfs.reclaim_removed_directories()), "final directory cleanup");
     test_unmount();
 
@@ -2007,4 +2014,218 @@ fn test_directory_removal_and_guards() {
         expect_ok(vfs.reclaim_removed_directories(), "reclaim fixture ancestry");
     });
     sprintln!("[VFS TEST] directory removal and path guards ... PASS");
+}
+
+
+/// Creates an isolated VFS for a namespace-protection regression.
+///
+/// Each fixture has its own instance identity and original stub tree. Tests
+/// have exclusive ownership of the local VFS and explicitly close every open
+/// registration before dropping it. No global VFS state is replaced.
+///
+/// # Returns
+///
+/// Returns a fresh VFS with the stub driver registered for additional mounts.
+///
+/// # Panics
+///
+/// Panics if the stub instance or its root cannot be acquired.
+fn namespace_fixture() -> VirtualFileSystem {
+    let driver = Arc::new(StubFileSystemDriver);
+    let instance = expect_ok(driver.mount(Arc::new(StubBlockDevice)), "namespace fixture mount");
+    let root = expect_ok(instance.load_inode(1), "namespace fixture root");
+    let mut vfs = VirtualFileSystem::new(Arc::new(Directory::new_root(root)));
+    vfs.register_driver(driver);
+    vfs
+}
+
+/// Checks name protection across aliases, independent opens, and Arc clones.
+///
+/// Rejected mutations must preserve both names, backing link counts, and inode
+/// identity. Content transfers and creation of additional aliases remain legal.
+/// Closing one registration invalidates its clones and releases only its own
+/// protection; an ordinary open does not override another holder's restriction.
+///
+/// # Panics
+///
+/// Panics on an unexpected result, identity change, count, or content transfer.
+fn test_namespace_name_protection() {
+    sprintln!("[VFS TEST] namespace name protection ...");
+    let mut vfs = namespace_fixture();
+    let file = expect_ok(vfs.create_file("/etc/protected", Permissions::all_permissive(), None), "create protected file");
+    expect_ok(vfs.create_hard_link("/etc/protected", "/var/alias", None, false), "create alias");
+    let first = expect_ok(vfs.open_with_namespace_protection("/etc/protected", AccessMode::ReadWrite,
+        None, NamespaceProtection::PROTECT_NAMES), "first protected open");
+    let clone = first.clone();
+    let second = expect_ok(vfs.open_with_namespace_protection("/var/alias", AccessMode::ReadOnly,
+        None, NamespaceProtection::PROTECT_NAMES), "independent alias open");
+    let ordinary = expect_ok(vfs.open("/var/alias", AccessMode::ReadWrite, None), "ordinary open alongside protection");
+    assert_eq!(expect_ok(vfs.write(&ordinary, b"shared"), "ordinary write remains allowed"), 6);
+    let mut buffer = [0u8; 6];
+    assert_eq!(expect_ok(vfs.read(&first, &mut buffer), "protected read remains allowed"), 6);
+    assert_eq!(&buffer, b"shared");
+    expect_ok(vfs.create_hard_link("/etc/protected", "/etc/new-alias", None, false), "alias creation under protection");
+    for path in ["/etc/protected", "/var/alias", "/etc/new-alias"] {
+        expect_err(vfs.unlink(path, None), FileSystemError::ResourceBusy, "every alias protected against unlink");
+        expect_err(vfs.rename(path, "/etc/moved", None), FileSystemError::ResourceBusy, "every alias protected against rename or move");
+        let observed = expect_ok(vfs.resolve(path, None, false), "rejected mutation preserves name");
+        assert!(Arc::ptr_eq(&observed, &file));
+    }
+    assert_eq!(file.stat().link_count, 3);
+    assert_eq!(expect_ok(file.filesystem.load_inode(file.inode_number), "backing count after rejected mutations").stat().link_count, 3);
+    expect_ok(vfs.rename("/etc/protected", "/var/alias", None), "protected same-inode no-op");
+    expect_ok(vfs.create_file("/etc/other", Permissions::all_permissive(), None), "create competing source");
+    expect_err(vfs.rename("/etc/other", "/etc/protected", None), FileSystemError::ResourceBusy, "protected replacement destination preflight");
+    expect_ok(vfs.resolve("/etc/other", None, false), "replacement rejection preserves source");
+    expect_ok(vfs.close(&first), "close first registration");
+    expect_err(vfs.close(&clone), FileSystemError::InvalidHandle, "clone does not own another registration");
+    expect_err(vfs.unlink("/var/alias", None), FileSystemError::ResourceBusy, "second registration still protects aliases");
+    expect_ok(vfs.close(&second), "close independent registration");
+    // The closed Arc clone still exists, but cannot retain protection.
+    expect_ok(vfs.rename("/etc/protected", "/etc/renamed", None), "final protected close releases names");
+    expect_ok(vfs.unlink("/etc/new-alias", None), "unlink new alias after release");
+    expect_ok(vfs.unlink("/var/alias", None), "unlink original alias after release");
+    expect_ok(vfs.unlink("/etc/renamed", None), "ordinary handle permits final unlink");
+    expect_ok(file.filesystem.load_inode(file.inode_number), "ordinary handle retains unlinked backing inode");
+    expect_ok(vfs.close(&ordinary), "close ordinary final handle");
+    expect_err(file.filesystem.load_inode(file.inode_number), FileSystemError::NotFound, "last close reclaims backing inode");
+    sprintln!("[VFS TEST] namespace name protection ... PASS");
+}
+
+/// Checks independent name and ancestor contributions and the FULL combination.
+///
+/// Name-only protection permits ancestor renames. Ancestor-only protection
+/// permits direct file movement and remains on its captured chain. Full
+/// protection covers all names but only the selected alias's ancestor chain.
+///
+/// # Panics
+///
+/// Panics if a restriction is missing, overbroad, or survives successful close.
+fn test_namespace_combined_protection() {
+    sprintln!("[VFS TEST] namespace combined protection ...");
+    let mut vfs = namespace_fixture();
+    let p = Permissions::all_permissive();
+    expect_ok(vfs.create_file("/etc/protected", p, None), "create additive fixture");
+    let names = expect_ok(vfs.open_with_namespace_protection("/etc/protected", AccessMode::ReadOnly,
+        None, NamespaceProtection::PROTECT_NAMES), "name-only open");
+    expect_ok(vfs.rename("/etc", "/settings", None), "name-only permits ancestor rename");
+    let ancestors = expect_ok(vfs.open_with_namespace_protection("/settings/protected", AccessMode::ReadOnly,
+        None, NamespaceProtection::PROTECT_ANCESTORS), "ancestor-only independent open");
+    expect_err(vfs.rename("/settings/protected", "/var/moved", None), FileSystemError::ResourceBusy, "name holder blocks direct movement");
+    expect_err(vfs.rename("/settings", "/settings2", None), FileSystemError::ResourceBusy, "ancestor holder blocks parent movement");
+    expect_ok(vfs.close(&names), "release only names");
+    expect_ok(vfs.rename("/settings/protected", "/var/moved", None), "ancestor-only permits direct move");
+    expect_ok(vfs.rename("/var", "/storage", None), "protection does not follow moved file");
+    expect_err(vfs.rename("/settings", "/settings2", None), FileSystemError::ResourceBusy, "captured ancestor remains protected");
+    expect_ok(vfs.close(&ancestors), "release captured chain");
+    expect_ok(vfs.rename("/settings", "/settings2", None), "ancestor release permits rename");
+    expect_ok(vfs.create_hard_link("/storage/moved", "/settings2/alias", None, false), "create alias on another chain");
+    assert_eq!(NamespaceProtection::PROTECT_FULL,
+        NamespaceProtection::PROTECT_NAMES | NamespaceProtection::PROTECT_ANCESTORS);
+    let full = expect_ok(vfs.open_with_namespace_protection("/storage/moved", AccessMode::ReadOnly,
+        None, NamespaceProtection::PROTECT_FULL), "full open");
+    expect_err(vfs.rename("/storage", "/storage2", None), FileSystemError::ResourceBusy, "full protects opened ancestry");
+    expect_err(vfs.unlink("/settings2/alias", None), FileSystemError::ResourceBusy, "full protects other alias name");
+    expect_ok(vfs.rename("/settings2", "/settings3", None), "full does not protect other alias ancestry");
+    expect_ok(vfs.close(&full), "release full protection");
+    expect_ok(vfs.rename("/storage", "/storage2", None), "full ancestor release");
+    expect_ok(vfs.unlink("/settings3/alias", None), "full name release");
+    sprintln!("[VFS TEST] namespace combined protection ... PASS");
+}
+
+/// Checks actual target ancestry through symlinks and across mounted volumes.
+///
+/// Lexical symlink parents must remain mutable. Mount-host and unmount checks
+/// must observe the target's captured ancestry, while unrelated filesystem
+/// instances remain independent even when their inode numbers coincide.
+/// Failed resolution must not publish handles or leave ancestor protection.
+///
+/// # Panics
+///
+/// Panics if target selection, protection scope, failure cleanup, or unmount
+/// results differ from the contract.
+fn test_namespace_symlinks_and_mounts() {
+    sprintln!("[VFS TEST] namespace symlinks and mounts ...");
+    let mut vfs = namespace_fixture();
+    let p = Permissions::all_permissive();
+    let target = expect_ok(vfs.create_file("/var/log/target", p.clone(), None), "create symlink target");
+    expect_ok(vfs.create_symlink("/etc/entry", "../var/log/target", None), "relative final symlink");
+    let handle = expect_ok(vfs.open_with_namespace_protection("/etc/entry", AccessMode::ReadOnly,
+        None, NamespaceProtection::PROTECT_FULL), "protected open through final symlink");
+    assert!(Arc::ptr_eq(&handle.file.inode, &target));
+    expect_err(vfs.rename("/var/log", "/var/log2", None), FileSystemError::ResourceBusy, "actual target parent protected");
+    expect_err(vfs.mount("stubfs", Arc::new(StubBlockDevice), "/var", None), FileSystemError::ResourceBusy, "actual ancestor cannot be covered");
+    expect_ok(vfs.unlink("/etc/entry", None), "symlink entry itself not protected");
+    expect_ok(vfs.rename("/etc", "/settings", None), "lexical parent not protected");
+    expect_ok(vfs.close(&handle), "close symlink-resolved handle");
+    expect_ok(vfs.rename("/var/log", "/var/log2", None), "target parent released");
+    expect_ok(vfs.create_symlink("/settings/loop", "loop", None), "create loop");
+    expect_err(vfs.open_with_namespace_protection("/settings/loop", AccessMode::ReadOnly,
+        None, NamespaceProtection::PROTECT_FULL), FileSystemError::TooManySymlinks, "failed protected symlink open");
+    expect_err(vfs.open_with_namespace_protection("/settings", AccessMode::ReadOnly,
+        None, NamespaceProtection::PROTECT_FULL), FileSystemError::NotAFile, "directory open rejected");
+    expect_ok(vfs.rename("/settings", "/settings2", None), "failed opens leave ancestry unprotected");
+
+    // Relative resolution through an intermediate symlink must capture the
+    // same target ancestry as the final-symlink case, not the caller's base.
+    expect_ok(vfs.create_symlink("/settings2/bridge", "/var/log2", None), "intermediate directory symlink");
+    let base = expect_ok(vfs.resolve_dir_with_budget("/settings2", None,
+        crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH), "relative open base");
+    let relative = expect_ok(vfs.open_with_namespace_protection("bridge/target", AccessMode::ReadOnly,
+        Some(base), NamespaceProtection::PROTECT_FULL), "relative intermediate-symlink open");
+    assert!(Arc::ptr_eq(&relative.file.inode, &target));
+    expect_err(vfs.rename("/var/log2", "/var/log3", None), FileSystemError::ResourceBusy, "relative target ancestry protected");
+    expect_err(vfs.unlink("/var/log2/target", None), FileSystemError::ResourceBusy, "relative target name protected");
+    expect_ok(vfs.close(&relative), "close relative protected open");
+
+    expect_ok(vfs.mount("stubfs", Arc::new(StubBlockDevice), "/bin/tools", None), "mount protected-open fixture");
+    let mounted = expect_ok(vfs.open_with_namespace_protection("/bin/tools/etc/config.txt", AccessMode::ReadOnly,
+        None, NamespaceProtection::PROTECT_FULL), "full open inside mount");
+    let host_file = expect_ok(vfs.resolve("/settings2/config.txt", None, false), "host inode-number peer");
+    assert_eq!(host_file.inode_number, mounted.file.inode.inode_number);
+    assert_ne!(host_file.filesystem.instance_id(), mounted.file.inode.filesystem.instance_id());
+    expect_ok(vfs.unlink("/settings2/config.txt", None), "same inode number on other instance remains unprotected");
+    expect_err(vfs.unmount("/bin/tools", None), FileSystemError::ResourceBusy, "full open blocks unmount");
+    expect_err(vfs.rename("/bin", "/programs", None), FileSystemError::ResourceBusy, "captured ancestry crosses mount host");
+    expect_ok(vfs.close(&mounted), "release mounted protection");
+    expect_ok(vfs.unmount("/bin/tools", None), "unmount after protected close");
+    sprintln!("[VFS TEST] namespace symlinks and mounts ... PASS");
+}
+
+/// Checks preservation of an ancestor-only token after failed final close.
+///
+/// Ancestor-only protection permits unlinking the file, making the last close
+/// reclaim storage. A targeted driver failure must leave the handle readable,
+/// its captured ancestors protected, and its contents intact for a close retry.
+///
+/// # Panics
+///
+/// Panics if failure commits any close state or successful retry fails to
+/// release storage and protection. The armed failure is consumed in this test.
+fn test_namespace_close_retry() {
+    sprintln!("[VFS TEST] namespace close retry ...");
+    let mut vfs = namespace_fixture();
+    let inode = expect_ok(vfs.create_file("/etc/retry", Permissions::all_permissive(), None), "create retry file");
+    let handle = expect_ok(vfs.open_with_namespace_protection("/etc/retry", AccessMode::ReadWrite,
+        None, NamespaceProtection::PROTECT_ANCESTORS), "open ancestor-only retry file");
+    let clone = handle.clone();
+    assert_eq!(expect_ok(vfs.write(&handle, b"keep"), "write before unlink"), 4);
+    expect_ok(vfs.unlink("/etc/retry", None), "ancestor-only permits unlink");
+    super::fail_next_free_for(inode.filesystem.instance_id(), inode.inode_number);
+    // An unrelated immediate free must neither fail nor consume the request.
+    expect_ok(vfs.create_file("/etc/other", Permissions::all_permissive(), None), "create unrelated free target");
+    expect_ok(vfs.unlink("/etc/other", None), "unrelated free preserves armed failure");
+    expect_err(vfs.close(&handle), FileSystemError::DiskWriteError, "inject final-close free failure");
+    expect_err(vfs.rename("/etc", "/settings", None), FileSystemError::ResourceBusy, "failed close retains ancestors");
+    expect_err(vfs.remove_directory("/etc", None), FileSystemError::ResourceBusy, "failed close retains removal protection");
+    expect_ok(inode.filesystem.load_inode(inode.inode_number), "failed free preserves backing inode");
+    expect_ok(vfs.seek(&clone, 0), "failed close leaves clone usable");
+    let mut buffer = [0u8; 4];
+    assert_eq!(expect_ok(vfs.read(&clone, &mut buffer), "read after failed close"), 4);
+    assert_eq!(&buffer, b"keep");
+    expect_ok(vfs.close(&clone), "retry close through clone");
+    expect_err(vfs.read(&handle, &mut buffer), FileSystemError::InvalidHandle, "successful retry invalidates all clones");
+    expect_err(inode.filesystem.load_inode(inode.inode_number), FileSystemError::NotFound, "successful retry reclaims storage");
+    expect_ok(vfs.rename("/etc", "/settings", None), "successful retry releases ancestry");
+    sprintln!("[VFS TEST] namespace close retry ... PASS");
 }

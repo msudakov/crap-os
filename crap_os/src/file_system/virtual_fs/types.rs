@@ -245,6 +245,74 @@ impl AccessMode {
     }
 }
 
+/// Optional namespace restrictions contributed by one registered open handle.
+///
+/// Ordinary opens request `NONE`. These options do not affect reads, writes,
+/// timestamps, or write locks. Prefer `PROTECT_FULL` for namespace stability;
+/// the individual options intentionally provide narrower guarantees.
+///
+/// Separate opens contribute independently. Any contribution blocks conflicting
+/// mutations, including requests by its holder. An unprotected open cannot
+/// override another handle's protection. Closing a handle releases only its own
+/// contributions; cloning its Arc does not acquire another contribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NamespaceProtection(u8);
+
+impl NamespaceProtection {
+    /// Contributes no namespace restrictions.
+    pub const NONE: Self = Self(0);
+
+    /// Rejects unlink, rename, direct move, and replacement of every entry
+    /// naming the opened inode. Additional hard links remain permitted and
+    /// immediately share this protection. Ancestors remain independently
+    /// mutable.
+    pub const PROTECT_NAMES: Self = Self(1);
+
+    /// Protects the resolved file's parent and captured ancestors through root,
+    /// including mount hosts. Symlink entries used to reach the target are not
+    /// protected. This option alone allows changing the file's own names. If
+    /// it moves, the captured protection does not follow it to new ancestors.
+    pub const PROTECT_ANCESTORS: Self = Self(2);
+
+    /// Combines name and ancestor protection. All hard-link names are
+    /// protected, but only the ancestor chain selected by this open is
+    /// captured, not the ancestor chains of every alias. Prefer this
+    /// combination when requesting protection unless the narrower behavior is
+    /// specifically required.
+    pub const PROTECT_FULL: Self =
+        Self(Self::PROTECT_NAMES.0 | Self::PROTECT_ANCESTORS.0);
+
+    /// Checks whether all requested restrictions are present.
+    ///
+    /// # Arguments
+    ///
+    /// * `requested` - Individual restriction or combination to inspect.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` if every requested bit is present. `NONE` always matches.
+    pub const fn contains(self, requested: Self) -> bool {
+        self.0 & requested.0 == requested.0
+    }
+}
+
+impl core::ops::BitOr for NamespaceProtection {
+    type Output = Self;
+
+    /// Combines two sets of namespace restrictions without modifying them.
+    ///
+    /// # Arguments
+    ///
+    /// * `rhs` - Additional restrictions to include (right-hand-side of `OR`).
+    ///
+    /// # Returns
+    ///
+    /// Returns the union of both sets.
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
+    }
+}
+
 /// Tracks the current write-lock state of an open file's master record.
 ///
 /// Write locking is a dynamic, per-master-record concern, independent of how

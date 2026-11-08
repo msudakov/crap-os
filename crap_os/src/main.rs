@@ -197,7 +197,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
 
 
-    // Initialie kernel heap and pre-map 16 pages (64 KB)
+    // Initialize kernel heap and pre-map 16 pages (64 KB)
     globals::KERNEL_HEAP.heap.lock().init(16);
 
     // Initialize Global Descriptor Table

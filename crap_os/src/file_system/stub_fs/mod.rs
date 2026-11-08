@@ -151,7 +151,7 @@ fn fail_next_rename_for(instance_id: u64) {
 ///
 /// Stored in [`StubFsInstance::inodes`], keyed by inode number. Holds
 /// everything the stub needs to service VFS trait calls for a given inode:
-/// its type, its directory parent number, its backing link count, its
+/// its type, its backing link count, its
 /// children's directory entries (for directories), and its symlink target
 /// (for symlinks). File content is stored separately in
 /// [`StubFsInstance::file_data`].
@@ -166,12 +166,6 @@ struct StubInode {
     /// as the stub's namespace anchor. Link and unlink update this backing
     /// count independently of the VFS's canonical in-memory metadata.
     link_count: u32,
-
-    /// The parent inode number for a directory; `0` for the root.
-    ///
-    /// For files and symlinks this retains the creation parent only and is
-    /// not authoritative: those inodes may have names in several directories.
-    parent_inode_number: u64,
 
     /// The direct children of this inode, if it is a directory.
     ///
@@ -196,66 +190,73 @@ struct StubInode {
 }
 
 impl StubInode {
-    /// Constructs a new directory `StubInode`.
+    /// Constructs an empty directory record with one namespace link.
+    ///
+    /// Parent traversal belongs to the VFS directory wrappers and relocated
+    /// parent table. The stub stores child entries without duplicating that
+    /// parent relationship in an unused backing field.
     ///
     /// # Arguments
     ///
-    /// * `inode_number`        - The inode's unique identifier.
-    /// * `parent_inode_number` - The parent directory's inode number. Pass
-    ///   `0` for the root inode.
-    fn new_directory(inode_number: u64, parent_inode_number: u64) -> Self {
+    /// * `inode_number` - Unique inode number within this instance.
+    ///
+    /// # Returns
+    ///
+    /// Returns a directory record with an empty child list and zero data size.
+    fn new_directory(inode_number: u64) -> Self {
         Self {
             inode_number,
             inode_type: InodeType::Directory,
             link_count: 1,
-            parent_inode_number,
             children: Vec::new(),
             symlink_target: String::new(),
             size: 0,
         }
     }
 
-    /// Constructs a new file `StubInode` with the given initial size.
+    /// Constructs regular-file metadata with one namespace link.
+    ///
+    /// Contents are stored separately in the instance's file-data table. Names
+    /// in directory child lists supply all backing namespace attachments.
     ///
     /// # Arguments
     ///
-    /// * `inode_number`        - The inode's unique identifier.
-    /// * `parent_inode_number` - The parent directory's inode number.
-    /// * `size`                - The initial content size in bytes.
-    fn new_file(
-        inode_number: u64,
-        parent_inode_number: u64,
-        size: u64,
-    ) -> Self {
+    /// * `inode_number` - Unique inode number within this instance.
+    /// * `size` - Initial content length in bytes, matching the backing data.
+    ///
+    /// # Returns
+    ///
+    /// Returns file metadata with the supplied size and no directory children.
+    fn new_file(inode_number: u64, size: u64) -> Self {
         Self {
             inode_number,
             inode_type: InodeType::File,
             link_count: 1,
-            parent_inode_number,
             children: Vec::new(),
             symlink_target: String::new(),
             size,
         }
     }
 
-    /// Constructs a new symlink `StubInode` pointing to `target`.
+    /// Constructs a symlink record containing an owned copy of its target.
+    ///
+    /// The target stays in this record, not the regular-file data table. Its
+    /// byte length becomes the initial size, and its link count starts at one.
     ///
     /// # Arguments
     ///
-    /// * `inode_number`        - The inode's unique identifier.
-    /// * `parent_inode_number` - The parent directory's inode number.
-    /// * `target`              - The path this symlink points to.
-    fn new_symlink(
-        inode_number: u64,
-        parent_inode_number: u64,
-        target: &str,
-    ) -> Self {
+    /// * `inode_number` - Unique inode number within this instance.
+    /// * `target` - Path text to store without resolving it.
+    ///
+    /// # Returns
+    ///
+    /// Returns a symlink record with owned target text and no child entries.
+    fn new_symlink(inode_number: u64, target: &str) -> Self {
         let size = target.len() as u64;
         Self {
             inode_number,
             inode_type: InodeType::Symlink,
             link_count: 1,
-            parent_inode_number,
             children: Vec::new(),
             symlink_target: target.to_string(),
             size,
@@ -272,9 +273,10 @@ impl StubInode {
 /// Owns two flat tables protected by a [`SpinLock`]:
 ///
 /// - `inodes` - all [`StubInode`] metadata records, indexed by position in
-///   the `Vec` (not by inode number; use `find_inode` for lookup).
-/// - `file_data` - all file and symlink content, as `(inode_number, Vec<u8>)`
-///   pairs. Looked up by inode number.
+///   the `Vec` (not by inode number; use
+///   [`StubFsInstance::find_inode_index`] for lookup).
+/// - `file_data` - regular-file contents as `(inode_number, Vec<u8>)` pairs,
+///   looked up by inode number. Symlink targets stay in their inode records.
 ///
 /// A monotonic `next_inode` counter is used to assign inode numbers to
 /// inodes created at runtime via `create_file`, `create_directory`, and
@@ -286,7 +288,7 @@ pub struct StubFsInstance {
     /// All inode metadata records for this instance.
     inodes: SpinLock<Vec<StubInode>>,
 
-    /// File and symlink content, keyed by inode number.
+    /// Regular-file contents, keyed by inode number.
     file_data: SpinLock<Vec<(u64, Vec<u8>)>>,
 
     /// The next inode number to assign on dynamic creation.
@@ -305,7 +307,7 @@ impl StubFsInstance {
         let mut inodes: Vec<StubInode> = Vec::new();
 
         // Root directory
-        let mut root = StubInode::new_directory(INO_ROOT, 0);
+        let mut root = StubInode::new_directory(INO_ROOT);
         root.children.push(("etc".to_string(), INO_ETC,  DirectoryEntryType::Directory));
         root.children.push(("bin".to_string(), INO_BIN,  DirectoryEntryType::Directory));
         root.children.push(("var".to_string(), INO_VAR,  DirectoryEntryType::Directory));
@@ -313,7 +315,7 @@ impl StubFsInstance {
         inodes.push(root);
 
         // /etc
-        let mut etc = StubInode::new_directory(INO_ETC, INO_ROOT);
+        let mut etc = StubInode::new_directory(INO_ETC);
         etc.children.push(("config.txt".to_string(), INO_ETC_CONFIG, DirectoryEntryType::File));
         etc.children.push(("hosts.txt".to_string(),  INO_ETC_HOSTS,  DirectoryEntryType::File));
         inodes.push(etc);
@@ -321,17 +323,17 @@ impl StubFsInstance {
         // /etc/config.txt
         let config_content = b"kernel=1\nversion=0.1\n";
         inodes.push(StubInode::new_file(
-            INO_ETC_CONFIG, INO_ETC, config_content.len() as u64,
+            INO_ETC_CONFIG, config_content.len() as u64,
         ));
 
         // /etc/hosts.txt
         let hosts_content = b"127.0.0.1 localhost\n";
         inodes.push(StubInode::new_file(
-            INO_ETC_HOSTS, INO_ETC, hosts_content.len() as u64,
+            INO_ETC_HOSTS, hosts_content.len() as u64,
         ));
 
         // /bin
-        let mut bin = StubInode::new_directory(INO_BIN, INO_ROOT);
+        let mut bin = StubInode::new_directory(INO_BIN);
         bin.children.push(("shell".to_string(), INO_BIN_SHELL, DirectoryEntryType::File));
         bin.children.push(("tools".to_string(), INO_BIN_TOOLS, DirectoryEntryType::Directory));
         inodes.push(bin);
@@ -339,34 +341,34 @@ impl StubFsInstance {
         // /bin/shell
         let shell_content = b"STUB_BINARY";
         inodes.push(StubInode::new_file(
-            INO_BIN_SHELL, INO_BIN, shell_content.len() as u64,
+            INO_BIN_SHELL, shell_content.len() as u64,
         ));
 
         // /bin/tools
-        let mut tools = StubInode::new_directory(INO_BIN_TOOLS, INO_BIN);
+        let mut tools = StubInode::new_directory(INO_BIN_TOOLS);
         tools.children.push(("debug".to_string(), INO_BIN_TOOLS_DBG, DirectoryEntryType::File));
         inodes.push(tools);
 
         // /bin/tools/debug
         inodes.push(StubInode::new_file(
-            INO_BIN_TOOLS_DBG, INO_BIN_TOOLS, shell_content.len() as u64,
+            INO_BIN_TOOLS_DBG, shell_content.len() as u64,
         ));
 
         // /var
-        let mut var = StubInode::new_directory(INO_VAR, INO_ROOT);
+        let mut var = StubInode::new_directory(INO_VAR);
         var.children.push(("log".to_string(), INO_VAR_LOG, DirectoryEntryType::Directory));
         inodes.push(var);
 
         // /var/log
-        let mut log = StubInode::new_directory(INO_VAR_LOG, INO_VAR);
+        let mut log = StubInode::new_directory(INO_VAR_LOG);
         log.children.push(("kernel.log".to_string(), INO_VAR_LOG_KERNEL, DirectoryEntryType::File));
         inodes.push(log);
 
         // /var/log/kernel.log  (empty)
-        inodes.push(StubInode::new_file(INO_VAR_LOG_KERNEL, INO_VAR_LOG, 0));
+        inodes.push(StubInode::new_file(INO_VAR_LOG_KERNEL, 0));
 
         // /lib -> /etc  (symlink)
-        inodes.push(StubInode::new_symlink(INO_LIB, INO_ROOT, "/etc"));
+        inodes.push(StubInode::new_symlink(INO_LIB, "/etc"));
 
         // Build the file data table.
         let mut file_data: Vec<(u64, Vec<u8>)> = Vec::new();
@@ -479,12 +481,11 @@ impl FileSystemInstance for StubFsInstance {
     ) -> Result<Arc<Inode>, FileSystemError> {
         let inodes = self.inodes.lock();
         let idx    = Self::find_inode_index(&inodes, inode_number)?;
-        // We need an Arc<dyn FileSystemInstance> pointing to self. We cannot
-        // construct one here directly, so we store a pre-built Arc in the
-        // instance and clone it. Since StubFsInstance is always heap-allocated
-        // inside an Arc by the driver's mount(), we access it via a raw
-        // pointer cast. This is safe because the Arc that owns self is alive
-        // for the duration of this call.
+        // The returned inode needs an owning reference to this instance.
+        // The private constructor is used only by mount(), which puts the
+        // instance in an Arc. The caller keeps that allocation alive during
+        // this method. Increment its strong count before reconstructing one
+        // owned Arc from the pointer; the new Arc consumes that increment.
         let instance_arc: Arc<dyn FileSystemInstance> = unsafe {
             let raw = self as *const StubFsInstance;
             Arc::increment_strong_count(raw);
@@ -660,7 +661,7 @@ impl FileSystemInstance for StubFsInstance {
                 new_ino,
                 DirectoryEntryType::File,
             ));
-            inodes.push(StubInode::new_file(new_ino, parent.inode_number, 0));
+            inodes.push(StubInode::new_file(new_ino, 0));
         }
 
         {
@@ -696,7 +697,7 @@ impl FileSystemInstance for StubFsInstance {
                 new_ino,
                 DirectoryEntryType::Directory,
             ));
-            inodes.push(StubInode::new_directory(new_ino, parent.inode_number));
+            inodes.push(StubInode::new_directory(new_ino));
         }
 
         self.load_inode(new_ino)
@@ -728,9 +729,7 @@ impl FileSystemInstance for StubFsInstance {
                 DirectoryEntryType::Symlink,
             ));
             inodes.push(StubInode::new_symlink(
-                new_ino,
-                parent.inode_number,
-                target,
+                new_ino, target,
             ));
         }
 
@@ -740,7 +739,7 @@ impl FileSystemInstance for StubFsInstance {
     /// Adds a name and increments its backing count under the inode-table lock.
     ///
     /// All returned-error checks precede insertion. No inode or data record is
-    /// created, and the source's creation-parent field remains unchanged.
+    /// created; the new child entry shares the existing inode and data.
     ///
     /// # Arguments
     ///
@@ -873,7 +872,9 @@ impl FileSystemInstance for StubFsInstance {
         let (_, source_number, source_type) = &inodes[old_idx].children[source_pos];
         let source_number = *source_number;
         let source_type = *source_type;
-        let source_idx = Self::find_inode_index(&inodes, source_number)?;
+        // Validate backing source existence before staging, even though no
+        // separate parent record needs to be updated by this driver.
+        Self::find_inode_index(&inodes, source_number)?;
         let displaced = match inodes[new_idx].children.iter()
             .find(|(name, _, _)| name == new_name)
         {
@@ -922,9 +923,6 @@ impl FileSystemInstance for StubFsInstance {
         inodes[old_idx].children = old_children;
         if let Some(children) = new_children { inodes[new_idx].children = children; }
         if let Some((idx, remaining)) = displaced { inodes[idx].link_count = remaining; }
-        if source_type == DirectoryEntryType::Directory {
-            inodes[source_idx].parent_inode_number = new_parent.inode_number;
-        }
         Ok(())
     }
 

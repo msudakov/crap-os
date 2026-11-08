@@ -231,45 +231,41 @@ impl VirtualFileSystem {
         Ok(DirectoryPathGuard { protected_inodes })
     }
 
-    /// Reclaims detached directories whose last wrapper has been dropped.
+    /// Reclaims zero-link inodes without registered handles or directory
+    /// wrappers.
     ///
-    /// Call under VFS serialization after releasing retained working-directory
-    /// references, periodically from a kernel owner, and before unmount. Drop
-    /// never performs driver I/O. Until this method runs, detached storage
-    /// remains allocated and its inode number cannot be reused. A successful
-    /// removal stays successful even if a later cleanup attempt fails.
+    /// Call under VFS serialization after releasing retained references and
+    /// periodically for overwritten files/symlinks without open handles.
+    /// Unmount invokes this cleanup before teardown. Until success, backing
+    /// storage and inode identity stay allocated. Driver errors cannot undo
+    /// prior renames.
     ///
-    /// Each pass releases former-parent records after successful frees. This
-    /// may release another detached parent's last wrapper, requiring a new
-    /// pass. Failed frees keep their inode and parent records for retry.
+    /// Open displaced files use their pending-deletion master's final close.
+    /// Directory former-parent records persist until successful free; releasing
+    /// them can make another directory eligible, so passes repeat as needed.
+    /// No driver call runs under the inode-table lock.
     ///
     /// # Returns
     ///
-    /// Returns the number reclaimed, or the first driver error. Earlier frees
-    /// remain committed and are not repeated when the caller retries.
-    pub fn reclaim_removed_directories(&mut self
-    ) -> Result<usize, FileSystemError> {
+    /// Returns the number reclaimed, or the first driver error. A failed inode
+    /// and its parent record remain available for retry. Earlier frees stay
+    /// committed and are not repeated on a subsequent call.
+    pub fn reclaim_unlinked_inodes(&mut self) -> Result<usize, FileSystemError>
+    {
         let mut reclaimed = 0;
 
         loop {
-            let candidates: Vec<(OpenFileKey, Arc<Inode>)> = self.inodes
-                .lock()
+            let candidates: Vec<(OpenFileKey, Arc<Inode>)> = self.inodes.lock()
                 .iter()
-                .filter(|(_, inode)| inode.is_directory()
-                    && inode.metadata.lock().link_count == 0
+                .filter(|(_, inode)| inode.metadata.lock().link_count == 0
                     && inode.directory_wrappers.load(Ordering::Acquire) == 0
-                    && inode.directory_path_guards.load(Ordering::Acquire) == 0)
+                    && inode.directory_path_guards.load(Ordering::Acquire) == 0
+                    && !inode.names_are_protected())
                 .map(|(key, inode)| (*key, Arc::clone(inode)))
                 .collect();
 
-            if candidates.is_empty() {
-                return Ok(reclaimed);
-            }
-
             let before = reclaimed;
             for (key, inode) in candidates {
-                // Directory opens are currently rejected by open(). Retain
-                // this check so reclamation cannot bypass registered handles.
                 if self.open_files.get(&key).is_some() {
                     continue;
                 }
@@ -534,7 +530,8 @@ impl VirtualFileSystem {
     ///
     /// The sequence of operations is:
     ///
-    /// 1. Resolve `mount_path` to a directory inode.
+    /// 1. Reclaim eligible unlinked inodes, then resolve `mount_path` to a
+    ///    directory inode. A free error leaves the mount attached for retry.
     /// 2. Verify a filesystem is currently mounted there.
     /// 3. Verify no open file handles exist on the mounted volume.
     /// 4. Sync dirty VFS inodes, then call
@@ -561,7 +558,7 @@ impl VirtualFileSystem {
     /// cannot be resolved, the directory is not a mount point, open handles
     /// remain on the volume, or an inode or driver flush fails. Path guards
     /// inside the mount and retained detached directories return
-    /// `ResourceBusy`. Eligible detached directories are reclaimed first; free
+    /// `ResourceBusy`. Eligible unlinked inodes are reclaimed first; free
     /// errors leave their records available for retry and do not detach the
     /// mount.
     pub fn unmount(
@@ -569,8 +566,8 @@ impl VirtualFileSystem {
         mount_path: &str,
         working_directory: Option<Arc<Directory>>,
     ) -> Result<(), FileSystemError> {
-        // Retry eligible detached-directory frees before driver teardown.
-        self.reclaim_removed_directories()?;
+        // Retry eligible unlinked-inode frees before driver teardown.
+        self.reclaim_unlinked_inodes()?;
 
         // Resolve the path to the host directory inode.
         let host_dir = self.resolve_mount_host(

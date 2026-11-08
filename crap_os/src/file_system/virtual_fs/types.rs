@@ -73,6 +73,10 @@ pub enum FileSystemError {
     /// A path component that was expected to be a directory is not one.
     NotADirectory,
 
+    /// A directory was supplied where a non-directory destination is required
+    /// (e.g., renaming a regular file or symlink over a directory).
+    IsADirectory,
+
     /// A path component that was expected to be a file is not one (e.g.,
     /// attempting to `read` a directory inode directly).
     NotAFile,

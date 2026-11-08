@@ -4,8 +4,9 @@
 //! development to exercise the VFS layer before a real on-disk filesystem is
 //! available. It implements [`FileSystemDriver`] and [`FileSystemInstance`]
 //! with a hardcoded directory tree and no disk interaction.
-//! The VFS test harness can inject one-shot unmount and inode-free errors
-//! to check retry behavior without changing backing state on failure.
+//! The VFS test harness can inject one-shot unmount, inode-free, and staged
+//! rename errors to check retry behavior without changing backing state on
+//! failure. Namespace protection is enforced by the VFS, not this driver.
 //!
 //! ## Hardcoded Tree
 //!
@@ -127,6 +128,19 @@ static FAIL_FREE_ONCE_FOR: SpinLock<Option<(u64, u64)>> = SpinLock::new(None);
 /// * `inode_number` - Inode whose next free should return `DiskWriteError`.
 fn fail_next_free_for(instance_id: u64, inode_number: u64) {
     *FAIL_FREE_ONCE_FOR.lock() = Some((instance_id, inode_number));
+}
+
+/// One-shot rename failure for a mounted instance, consumed after staging and
+/// before commit. Same-inode no-ops do not consume it because they do no work.
+static FAIL_RENAME_ONCE_FOR: SpinLock<Option<u64>> = SpinLock::new(None);
+
+/// Arms one pre-commit rename error without changing backing state.
+///
+/// # Arguments
+///
+/// * `instance_id` - Mounted instance whose next actual rename should fail.
+fn fail_next_rename_for(instance_id: u64) {
+    *FAIL_RENAME_ONCE_FOR.lock() = Some(instance_id);
 }
 
 // ----------------------------------------------------------------------------
@@ -824,53 +838,93 @@ impl FileSystemInstance for StubFsInstance {
         Ok(())
     }
 
+    /// Stages directory listings, then commits replacement under one table lock.
+    ///
+    /// All returned-error checks and allocations precede mutation. The trusted
+    /// VFS caller enforces protection, mount, and ancestry rules. Backing type
+    /// and emptiness checks also precede staging. Displaced storage remains
+    /// allocated for the VFS's handle lifetime and explicit reclamation rules.
+    ///
+    /// # Arguments
+    ///
+    /// * `old_parent` - Existing source directory in this instance.
+    /// * `old_name` - Source name to move.
+    /// * `new_parent` - Destination directory in this instance.
+    /// * `new_name` - Destination name, replacing a compatible entry if present.
+    ///
+    /// # Returns
+    ///
+    /// Returns success after commit, a backing lookup/type/count error before
+    /// mutation, or one injected `DiskWriteError` after staging. Allocation
+    /// failure follows the existing kernel allocator contract.
     fn rename(
-        &self,
-        old_parent: &Inode,
-        old_name: &str,
-        new_parent: &Inode,
-        new_name: &str,
+        &self, old_parent: &Inode, old_name: &str,
+        new_parent: &Inode, new_name: &str,
     ) -> Result<(), FileSystemError> {
         let mut inodes = self.inodes.lock();
-
-        // Find and remove the entry from old_parent.
-        let old_parent_idx = Self::find_inode_index(&inodes, old_parent.inode_number)?;
-        let pos = inodes[old_parent_idx]
-            .children
-            .iter()
-            .position(|(n, _, _)| n == old_name)
+        let old_idx = Self::find_inode_index(&inodes, old_parent.inode_number)?;
+        let new_idx = Self::find_inode_index(&inodes, new_parent.inode_number)?;
+        if inodes[old_idx].inode_type != InodeType::Directory
+            || inodes[new_idx].inode_type != InodeType::Directory
+        { return Err(FileSystemError::NotADirectory); }
+        let source_pos = inodes[old_idx].children.iter()
+            .position(|(name, _, _)| name == old_name)
             .ok_or(FileSystemError::NotFound)?;
-
-        let (_, child_ino, child_type) = inodes[old_parent_idx].children.remove(pos);
-
-        // Add the entry to new_parent under the new name.
-        let new_parent_idx = Self::find_inode_index(&inodes, new_parent.inode_number)?;
-
-        if inodes[new_parent_idx].children.iter().any(|(n, _, _)| n == new_name) {
-            // Put the entry back before returning the error so the inode
-            // table stays consistent.
-            inodes[old_parent_idx].children.push((
-                old_name.to_string(),
-                child_ino,
-                child_type,
-            ));
-            return Err(FileSystemError::AlreadyExists);
-        }
-
-        inodes[new_parent_idx].children.push((
-            new_name.to_string(),
-            child_ino,
-            child_type,
-        ));
-
-        // Only directories have one authoritative parent. Files and symlinks
-        // can have names in several directories.
-        if child_type == DirectoryEntryType::Directory {
-            if let Ok(child_idx) = Self::find_inode_index(&inodes, child_ino) {
-                inodes[child_idx].parent_inode_number = new_parent.inode_number;
+        let (_, source_number, source_type) = &inodes[old_idx].children[source_pos];
+        let source_number = *source_number;
+        let source_type = *source_type;
+        let source_idx = Self::find_inode_index(&inodes, source_number)?;
+        let displaced = match inodes[new_idx].children.iter()
+            .find(|(name, _, _)| name == new_name)
+        {
+            Some((_, number, _)) if *number == source_number => return Ok(()),
+            Some((_, number, _)) => {
+                let idx = Self::find_inode_index(&inodes, *number)?;
+                let source_directory = source_type == DirectoryEntryType::Directory;
+                let destination_directory = inodes[idx].inode_type == InodeType::Directory;
+                if source_directory && !destination_directory {
+                    return Err(FileSystemError::NotADirectory);
+                }
+                if !source_directory && destination_directory {
+                    return Err(FileSystemError::IsADirectory);
+                }
+                if destination_directory && !inodes[idx].children.is_empty() {
+                    return Err(FileSystemError::DirectoryNotEmpty);
+                }
+                let remaining = inodes[idx].link_count.checked_sub(1)
+                    .ok_or(FileSystemError::InternalError)?;
+                Some((idx, remaining))
+            }
+            None => None,
+        };
+        let new_entry = (new_name.to_string(), source_number, source_type);
+        let mut old_children = inodes[old_idx].children.clone();
+        old_children.remove(source_pos);
+        let new_children = if old_idx == new_idx {
+            old_children.retain(|(name, _, _)| name != new_name);
+            old_children.push(new_entry);
+            None
+        } else {
+            let mut children = inodes[new_idx].children.clone();
+            children.retain(|(name, _, _)| name != new_name);
+            children.push(new_entry);
+            Some(children)
+        };
+        {
+            let mut fail_for = FAIL_RENAME_ONCE_FOR.lock();
+            if *fail_for == Some(self.id) {
+                *fail_for = None;
+                return Err(FileSystemError::DiskWriteError);
             }
         }
-
+        // No fallible operation follows. Backing inode indices stay valid:
+        // only child vectors and metadata are changed, not the inode table.
+        inodes[old_idx].children = old_children;
+        if let Some(children) = new_children { inodes[new_idx].children = children; }
+        if let Some((idx, remaining)) = displaced { inodes[idx].link_count = remaining; }
+        if source_type == DirectoryEntryType::Directory {
+            inodes[source_idx].parent_inode_number = new_parent.inode_number;
+        }
         Ok(())
     }
 

@@ -40,7 +40,9 @@
 //! 20. **File namespace protection** - checks alias-wide restrictions,
 //!     additive handles, captured ancestry, symlinks, mount boundaries, and
 //!     protection retention across a failed final close.
-//! 21. **Teardown** - drops the root volume cleanly.
+//! 21. **Replacement rename** - checks displaced lifetimes, compatible types,
+//!     pathname and protection rules, pre-commit failure, and cleanup retry.
+//! 22. **Teardown** - drops the root volume cleanly.
 
 extern crate alloc;
 
@@ -54,6 +56,7 @@ use crate::file_system::virtual_fs::types::{
 };
 use crate::file_system::virtual_fs::vfs::VirtualFileSystem;
 use crate::file_system::virtual_fs::file::FileHandle;
+use crate::file_system::virtual_fs::inode::Inode;
 use crate::globals;
 use crate::file_system::virtual_fs::driver::FileSystemDriver;
 
@@ -99,7 +102,12 @@ pub fn run_vfs_tests() {
     test_namespace_combined_protection();
     test_namespace_symlinks_and_mounts();
     test_namespace_close_retry();
-    expect_ok(with_vfs(|vfs| vfs.reclaim_removed_directories()), "final directory cleanup");
+    test_replacement_file_lifetimes();
+    test_replacement_directory_lifetimes();
+    test_replacement_rejections();
+    test_replacement_failure_atomicity();
+    test_replacement_reclamation();
+    expect_ok(with_vfs(|vfs| vfs.reclaim_unlinked_inodes()), "final unlinked inode cleanup");
     test_unmount();
 
     sprintln!("[VFS TEST] ----------------------------------------");
@@ -1987,10 +1995,10 @@ fn test_directory_removal_and_guards() {
         assert!(Arc::ptr_eq(&parent, &b));
         let leaf_inode = retained.inode.clone();
         drop(retained);
-        expect_ok(vfs.reclaim_removed_directories(), "cleanup while second wrapper remains");
+        expect_ok(vfs.reclaim_unlinked_inodes(), "cleanup while second wrapper remains");
         expect_ok(leaf_inode.filesystem.load_inode(leaf_inode.inode_number), "second wrapper retains storage");
         drop(other_wrapper);
-        expect_ok(vfs.reclaim_removed_directories(), "cleanup after final wrapper");
+        expect_ok(vfs.reclaim_unlinked_inodes(), "cleanup after final wrapper");
         expect_err(leaf_inode.filesystem.load_inode(leaf_inode.inode_number), FileSystemError::NotFound, "detached storage reclaimed");
         expect_ok(vfs.unlink("/etc/remove-case/b/../file", None), "intermediate traversal");
         expect_ok(vfs.unlink("/etc/remove-case/link", None), "unlink directory symlink itself");
@@ -2011,7 +2019,7 @@ fn test_directory_removal_and_guards() {
         expect_ok(vfs.remove_directory("/etc/remove-case", None), "remove fixture root");
         drop(parent);
         drop(b);
-        expect_ok(vfs.reclaim_removed_directories(), "reclaim fixture ancestry");
+        expect_ok(vfs.reclaim_unlinked_inodes(), "reclaim fixture ancestry");
     });
     sprintln!("[VFS TEST] directory removal and path guards ... PASS");
 }
@@ -2228,4 +2236,376 @@ fn test_namespace_close_retry() {
     expect_err(inode.filesystem.load_inode(inode.inode_number), FileSystemError::NotFound, "successful retry reclaims storage");
     expect_ok(vfs.rename("/etc", "/settings", None), "successful retry releases ancestry");
     sprintln!("[VFS TEST] namespace close retry ... PASS");
+}
+
+
+/// Creates a regular file with known contents for replacement regressions.
+///
+/// The temporary writer is explicitly closed before returning the inode.
+///
+/// # Arguments
+///
+/// * `vfs` - Exclusively owned isolated fixture.
+/// * `path` - Unoccupied pathname below an existing directory.
+/// * `contents` - Initial bytes to write from offset zero.
+///
+/// # Returns
+///
+/// Returns the canonical inode with no registered open handle.
+///
+/// # Panics
+///
+/// Panics if creation, the complete write, or close fails.
+fn replacement_file(vfs: &mut VirtualFileSystem, path: &str, contents: &[u8]) -> Arc<Inode> {
+    let inode = expect_ok(vfs.create_file(path, Permissions::all_permissive(), None), "replacement create file");
+    let handle = expect_ok(vfs.open(path, AccessMode::ReadWrite, None), "replacement initial writer");
+    assert_eq!(expect_ok(vfs.write(&handle, contents), "replacement initial contents"), contents.len());
+    expect_ok(vfs.close(&handle), "replacement close initial writer");
+    inode
+}
+
+/// Verifies a pathname still resolves to the expected canonical inode.
+///
+/// # Arguments
+///
+/// * `vfs` - Isolated fixture whose namespace is inspected.
+/// * `path` - Entry to resolve without following a final symlink.
+/// * `inode` - Canonical identity expected at that name.
+///
+/// # Panics
+///
+/// Panics if lookup fails or the name identifies another inode.
+fn replacement_identity(vfs: &VirtualFileSystem, path: &str, inode: &Arc<Inode>) {
+    let found = expect_ok(vfs.resolve(path, None, false), "replacement lookup identity");
+    assert!(Arc::ptr_eq(&found, inode), "[VFS TEST] replacement changed unexpected identity: {}", path);
+}
+
+/// Reads the whole expected file through an existing handle from offset zero.
+///
+/// # Arguments
+///
+/// * `vfs` - Exclusively owned fixture servicing the handle.
+/// * `handle` - Registered readable handle whose offset may change.
+/// * `contents` - Exact expected bytes; an extra read byte detects excess data.
+///
+/// # Panics
+///
+/// Panics if seek, read, byte count, or contents are incorrect.
+fn replacement_contents(vfs: &mut VirtualFileSystem, handle: &Arc<FileHandle>, contents: &[u8]) {
+    expect_ok(vfs.seek(handle, 0), "replacement seek");
+    let mut bytes = alloc::vec![0u8; contents.len() + 1];
+    let length = expect_ok(vfs.read(handle, &mut bytes), "replacement read");
+    assert_eq!(length, contents.len());
+    assert_eq!(&bytes[..length], contents);
+}
+
+/// Checks unchanged source links and displaced files with aliases and opens.
+///
+/// Independent old handles must keep accessing the displaced inode. New opens
+/// see the source inode at the destination, and writes to the displaced file
+/// must not modify it. Both replacement and later unlink respect final close.
+///
+/// # Panics
+///
+/// Panics on unexpected identity, content, count, or storage lifetime.
+fn test_replacement_file_lifetimes() {
+    sprintln!("[VFS TEST] replacement file lifetimes ...");
+    let mut vfs = namespace_fixture();
+    let source = replacement_file(&mut vfs, "/etc/source", b"SOURCE");
+    let victim = replacement_file(&mut vfs, "/var/log/destination", b"VICTIM");
+    expect_ok(vfs.create_hard_link("/etc/source", "/bin/source-alias", None, false), "source alias");
+    expect_ok(vfs.create_hard_link("/var/log/destination", "/etc/victim-alias", None, false), "victim alias");
+    let source_handle = expect_ok(vfs.open("/etc/source", AccessMode::ReadOnly, None), "open rename source");
+    let first = expect_ok(vfs.open("/var/log/destination", AccessMode::ReadWrite, None), "first victim open");
+    let second = expect_ok(vfs.open("/etc/victim-alias", AccessMode::ReadOnly, None), "second victim open");
+    expect_ok(vfs.rename("/etc/source", "/var/log/destination", None), "cross-parent replacement");
+    expect_err(vfs.resolve("/etc/source", None, false), FileSystemError::NotFound, "source name removed");
+    replacement_identity(&vfs, "/var/log/destination", &source);
+    replacement_identity(&vfs, "/bin/source-alias", &source);
+    replacement_identity(&vfs, "/etc/victim-alias", &victim);
+    assert_eq!(source.stat().link_count, 2);
+    assert_eq!(victim.stat().link_count, 1);
+    assert_eq!(expect_ok(victim.filesystem.load_inode(victim.inode_number), "backing victim count").stat().link_count, 1);
+    expect_ok(vfs.seek(&first, 0), "seek displaced writer");
+    assert_eq!(expect_ok(vfs.write(&first, b"CHANGED"), "write displaced inode"), 7);
+    replacement_contents(&mut vfs, &second, b"CHANGED");
+    replacement_contents(&mut vfs, &source_handle, b"SOURCE");
+    let fresh = expect_ok(vfs.open("/var/log/destination", AccessMode::ReadOnly, None), "fresh destination open");
+    assert!(Arc::ptr_eq(&fresh.file.inode, &source));
+    replacement_contents(&mut vfs, &fresh, b"SOURCE");
+    expect_ok(vfs.unlink("/etc/victim-alias", None), "remove displaced final alias");
+    expect_ok(vfs.close(&first), "first victim close");
+    expect_ok(vfs.reclaim_unlinked_inodes(), "cleanup skips registered displaced inode");
+    expect_ok(victim.filesystem.load_inode(victim.inode_number), "second open preserves storage");
+    expect_ok(vfs.close(&second), "last displaced close");
+    expect_err(victim.filesystem.load_inode(victim.inode_number), FileSystemError::NotFound, "final close frees displaced inode");
+    expect_ok(vfs.close(&fresh), "close fresh destination");
+    expect_ok(vfs.close(&source_handle), "close moved source");
+
+    // With no surviving alias, rename itself must mark the old open master
+    // pending deletion. No later unlink is available to perform that step.
+    let incoming = replacement_file(&mut vfs, "/etc/incoming", b"new");
+    let old = replacement_file(&mut vfs, "/etc/old", b"old");
+    let old_handle = expect_ok(vfs.open("/etc/old", AccessMode::ReadOnly, None), "open last-name victim");
+    expect_ok(vfs.rename("/etc/incoming", "/etc/old", None), "replace last-name open victim");
+    replacement_identity(&vfs, "/etc/old", &incoming);
+    assert_eq!(old.stat().link_count, 0);
+    replacement_contents(&mut vfs, &old_handle, b"old");
+    expect_ok(vfs.reclaim_unlinked_inodes(), "cleanup skips pending master");
+    super::fail_next_free_for(old.filesystem.instance_id(), old.inode_number);
+    expect_err(vfs.close(&old_handle), FileSystemError::DiskWriteError, "replacement final-close free failure");
+    replacement_identity(&vfs, "/etc/old", &incoming);
+    replacement_contents(&mut vfs, &old_handle, b"old");
+    expect_ok(vfs.close(&old_handle), "replacement pending-deletion final close retry");
+    expect_err(old.filesystem.load_inode(old.inode_number), FileSystemError::NotFound, "rename marked final-close reclamation");
+    sprintln!("[VFS TEST] replacement file lifetimes ... PASS");
+}
+
+/// Checks replacement of empty directories while old wrappers remain live.
+///
+/// Both a moved source wrapper and an overwritten destination wrapper must
+/// observe their correct parent. The destination wrapper predates an earlier
+/// move, exercising replacement's actual former-parent record rather than
+/// accidentally relying on its original stored parent.
+///
+/// # Panics
+///
+/// Panics on incorrect traversal, detached mutation, or premature reclamation.
+fn test_replacement_directory_lifetimes() {
+    sprintln!("[VFS TEST] replacement directory lifetimes ...");
+    let mut vfs = namespace_fixture();
+    let p = Permissions::all_permissive();
+    let source = expect_ok(vfs.create_directory("/etc/incoming", p.clone(), None), "incoming directory");
+    replacement_file(&mut vfs, "/etc/incoming/child", b"child");
+    let victim = expect_ok(vfs.create_directory("/etc/old-location", p.clone(), None), "destination directory");
+    let budget = crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH;
+    let old_wrapper = expect_ok(vfs.resolve_dir_with_budget("/etc/old-location", None, budget), "retain old destination");
+    let source_wrapper = expect_ok(vfs.resolve_dir_with_budget("/etc/incoming", None, budget), "retain source directory");
+    expect_ok(vfs.rename("/etc/old-location", "/var/log/target", None), "move destination before replacement");
+    expect_ok(vfs.rename("/etc/incoming///", "/var/log/target///", None), "replace retained empty directory");
+    replacement_identity(&vfs, "/var/log/target", &source);
+    expect_ok(vfs.resolve("/var/log/target/child", None, false), "incoming directory contents survive");
+    assert_eq!(source.stat().link_count, 1);
+    assert_eq!(victim.stat().link_count, 0);
+    let parent = expect_ok(vfs.resolve("/var/log", None, false), "replacement parent");
+    for wrapper in [&old_wrapper, &source_wrapper] {
+        let actual = expect_ok(vfs.resolve("..", Some(Arc::clone(wrapper)), false), "retained wrapper parent");
+        assert!(Arc::ptr_eq(&actual, &parent));
+    }
+    assert!(expect_ok(victim.filesystem.read_dir(&victim), "detached directory listing").is_empty());
+    expect_err(vfs.create_file("new", p.clone(), Some(old_wrapper.clone())), FileSystemError::NotFound, "no creation in displaced directory");
+    expect_err(vfs.protect_directory_path(old_wrapper.clone()), FileSystemError::NotFound, "no guard on displaced directory");
+    expect_ok(vfs.reclaim_unlinked_inodes(), "retained directory cleanup");
+    expect_ok(victim.filesystem.load_inode(victim.inode_number), "wrapper preserves displaced directory storage");
+    drop(old_wrapper);
+    expect_ok(vfs.reclaim_unlinked_inodes(), "final displaced wrapper cleanup");
+    expect_err(victim.filesystem.load_inode(victim.inode_number), FileSystemError::NotFound, "displaced directory reclaimed");
+    expect_ok(vfs.create_directory("/etc/a", p.clone(), None), "same-parent source directory");
+    expect_ok(vfs.create_directory("/etc/b", p, None), "same-parent destination directory");
+    expect_ok(vfs.rename("/etc/a", "/etc/b", None), "same-parent directory replacement");
+    expect_ok(vfs.reclaim_unlinked_inodes(), "cleanup unopened directory replacement");
+    drop(source_wrapper);
+    sprintln!("[VFS TEST] replacement directory lifetimes ... PASS");
+}
+
+/// Exercises type, path, subtree, mount, and optional protection rejection.
+///
+/// Rejections preserve source/destination identities. Same-inode aliases are
+/// still successful no-ops, and failed special spellings never normalize into
+/// a different directory entry and mutate it.
+///
+/// # Panics
+///
+/// Panics if an operation returns the wrong error or changes rejected names.
+fn test_replacement_rejections() {
+    sprintln!("[VFS TEST] replacement rejections ...");
+    let mut vfs = namespace_fixture();
+    let p = Permissions::all_permissive();
+    let file = replacement_file(&mut vfs, "/etc/file", b"file");
+    for path in ["/etc/tree", "/etc/tree/sub", "/etc/empty", "/etc/nonempty"] {
+        expect_ok(vfs.create_directory(path, p.clone(), None), "rejection directory");
+    }
+    replacement_file(&mut vfs, "/etc/nonempty/child", b"keep");
+    expect_ok(vfs.create_symlink("/etc/link", "/missing", None), "dangling rejection link");
+    for (old, new, error) in [
+        ("/etc/file", "/etc/empty", FileSystemError::IsADirectory),
+        ("/etc/link", "/etc/empty", FileSystemError::IsADirectory),
+        ("/etc/empty", "/etc/file", FileSystemError::NotADirectory),
+        ("/etc/empty", "/etc/link", FileSystemError::NotADirectory),
+        ("/etc/empty", "/etc/nonempty", FileSystemError::DirectoryNotEmpty),
+        ("/etc/tree", "/etc/tree/sub/new", FileSystemError::InvalidPath),
+        ("/etc/tree", "/etc/tree/new", FileSystemError::InvalidPath),
+        ("/etc/file/", "/etc/new", FileSystemError::NotADirectory),
+        ("/etc/link/", "/etc/new", FileSystemError::NotADirectory),
+        ("/etc/file", "/etc/new/", FileSystemError::NotADirectory),
+        ("/etc/link", "/etc/new/", FileSystemError::NotADirectory),
+        ("/etc/file", "/etc/link/", FileSystemError::NotADirectory),
+        ("/etc/empty", "/etc/absent/", FileSystemError::NotFound),
+    ] {
+        let before = expect_ok(vfs.resolve(old.trim_end_matches('/'), None, false), "rejection source before");
+        let destination_before = vfs.resolve(new.trim_end_matches('/'), None, false).ok();
+        expect_err(vfs.rename(old, new, None), error, "replacement preflight rejection");
+        replacement_identity(&vfs, old.trim_end_matches('/'), &before);
+        if let Some(inode) = destination_before {
+            replacement_identity(&vfs, new.trim_end_matches('/'), &inode);
+        } else {
+            expect_err(vfs.resolve(new.trim_end_matches('/'), None, false), FileSystemError::NotFound, "rejected destination remains absent");
+        }
+    }
+    for path in ["", "/", "////", ".", "..", "/etc/empty/.", "/etc/empty/..///"] {
+        let error = if path.is_empty() { FileSystemError::NotFound }
+            else if path.trim_matches('/').is_empty() { FileSystemError::ResourceBusy }
+            else { FileSystemError::OperationNotAllowed };
+        expect_err(vfs.rename(path, "/etc/new", None), error.clone(), "special source rejected");
+        expect_err(vfs.rename("/etc/file", path, None), error, "special destination rejected");
+        replacement_identity(&vfs, "/etc/file", &file);
+    }
+    expect_err(vfs.rename("/etc/file\0", "/etc/new", None), FileSystemError::InvalidPath, "NUL source rejected");
+    expect_err(vfs.rename("/etc/file", "/etc/new\0", None), FileSystemError::InvalidPath, "NUL destination rejected");
+    let protected = expect_ok(vfs.open_with_namespace_protection("/etc/file", AccessMode::ReadOnly,
+        None, NamespaceProtection::PROTECT_NAMES), "protected replacement source");
+    let other = replacement_file(&mut vfs, "/etc/other", b"other");
+    expect_err(vfs.rename("/etc/file", "/etc/other", None), FileSystemError::ResourceBusy, "source protection");
+    expect_err(vfs.rename("/etc/other", "/etc/file", None), FileSystemError::ResourceBusy, "destination protection");
+    replacement_identity(&vfs, "/etc/other", &other);
+    replacement_identity(&vfs, "/etc/file", &file);
+    expect_ok(vfs.create_hard_link("/etc/file", "/etc/alias", None, false), "protected no-op alias");
+    expect_ok(vfs.rename("/etc/file", "/etc/alias", None), "protected same-inode no-op");
+    assert_eq!(file.stat().link_count, 2);
+    expect_ok(vfs.close(&protected), "release file protection");
+    let wrapper = expect_ok(vfs.resolve_dir_with_budget("/etc/empty", None,
+        crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH), "protected directory wrapper");
+    let guard = expect_ok(vfs.protect_directory_path(wrapper), "protected directory destination");
+    expect_err(vfs.rename("/etc/tree", "/etc/empty", None), FileSystemError::ResourceBusy, "directory destination protection");
+    expect_err(vfs.rename("/etc/empty", "/etc/new", None), FileSystemError::ResourceBusy, "directory source protection");
+    drop(guard);
+    expect_ok(vfs.mount("stubfs", Arc::new(StubBlockDevice), "/bin/tools", None), "mount rename boundary");
+    expect_err(vfs.rename("/etc/file", "/bin/tools/etc/config.txt", None), FileSystemError::CrossFileSystemOperation, "cross-instance replacement");
+    expect_err(vfs.rename("/bin/tools", "/bin/new", None), FileSystemError::ResourceBusy, "mount source rejection");
+    expect_err(vfs.rename("/etc/empty", "/bin/tools", None), FileSystemError::ResourceBusy, "mount destination rejection");
+    expect_ok(vfs.unmount("/bin/tools", None), "unmount rejected replacement fixture");
+
+    // A relative destination may start from a wrapper retained before a move.
+    // The subtree walk must consult relocated parents or it could create a
+    // cycle by moving the new ancestor into that retained descendant.
+    for path in ["/etc/retained", "/etc/retained/leaf", "/var/log/container"] {
+        expect_ok(vfs.create_directory(path, p.clone(), None), "relocated ancestry fixture");
+    }
+    let leaf = expect_ok(vfs.resolve_dir_with_budget("/etc/retained/leaf", None,
+        crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH), "retain descendant before move");
+    expect_ok(vfs.rename("/etc/retained", "/var/log/container/retained", None), "move retained subtree");
+    expect_err(vfs.rename("/var/log/container", "new", Some(leaf)), FileSystemError::InvalidPath, "relocated ancestry rejects cycle");
+    expect_ok(vfs.resolve("/var/log/container/retained/leaf", None, false), "rejected cycle preserves namespace");
+    sprintln!("[VFS TEST] replacement rejections ... PASS");
+}
+
+/// Injects failure after driver staging for same-parent and cross-parent cases.
+///
+/// Both listings, link counts, contents, and retained-directory parents must
+/// survive the returned error. A retry must perform the same replacement and
+/// must not leave duplicate entries or change the source's link count.
+///
+/// # Panics
+///
+/// Panics on a mutation before successful commit or incorrect retry behavior.
+fn test_replacement_failure_atomicity() {
+    sprintln!("[VFS TEST] replacement failure atomicity ...");
+    for (directory, cross_parent) in [(false, false), (false, true), (true, false), (true, true)] {
+        let mut vfs = namespace_fixture();
+        let destination = if cross_parent { "/var/log/destination" } else { "/etc/destination" };
+        let (source, victim) = if directory {
+            let p = Permissions::all_permissive();
+            (expect_ok(vfs.create_directory("/etc/source", p.clone(), None), "atomic source directory"),
+             expect_ok(vfs.create_directory(destination, p, None), "atomic destination directory"))
+        } else {
+            (replacement_file(&mut vfs, "/etc/source", b"source"),
+             replacement_file(&mut vfs, destination, b"victim"))
+        };
+        let wrapper = if directory {
+            Some(expect_ok(vfs.resolve_dir_with_budget("/etc/source", None,
+                crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH), "atomic retained source"))
+        } else { None };
+        super::fail_next_rename_for(source.filesystem.instance_id());
+        expect_err(vfs.rename("/etc/source", destination, None), FileSystemError::DiskWriteError, "staged driver failure");
+        replacement_identity(&vfs, "/etc/source", &source);
+        replacement_identity(&vfs, destination, &victim);
+        for inode in [&source, &victim] {
+            assert_eq!(inode.stat().link_count, 1);
+            assert_eq!(expect_ok(inode.filesystem.load_inode(inode.inode_number), "atomic backing count").stat().link_count, 1);
+        }
+        assert_eq!(expect_ok(vfs.reclaim_unlinked_inodes(), "no premature orphan after rename error"), 0);
+        if let Some(wrapper) = wrapper.as_ref() {
+            let parent = expect_ok(vfs.resolve("..", Some(wrapper.clone()), false), "source parent after failed move");
+            let etc = expect_ok(vfs.resolve("/etc", None, false), "old parent identity");
+            assert!(Arc::ptr_eq(&parent, &etc));
+        } else {
+            for (path, contents) in [("/etc/source", &b"source"[..]), (destination, &b"victim"[..])] {
+                let handle = expect_ok(vfs.open(path, AccessMode::ReadOnly, None), "atomic content open");
+                replacement_contents(&mut vfs, &handle, contents);
+                expect_ok(vfs.close(&handle), "atomic content close");
+            }
+        }
+        expect_ok(vfs.rename("/etc/source", destination, None), "retry staged replacement");
+        replacement_identity(&vfs, destination, &source);
+        let (parent_path, name) = if cross_parent { ("/var/log", "destination") } else { ("/etc", "destination") };
+        let parent_inode = expect_ok(vfs.resolve(parent_path, None, false), "retry destination parent");
+        let listing = expect_ok(parent_inode.filesystem.read_dir(&parent_inode), "retry backing listing");
+        assert_eq!(listing.iter().filter(|entry| entry.name == name).count(), 1);
+        expect_err(vfs.resolve("/etc/source", None, false), FileSystemError::NotFound, "source absent after retry");
+        assert_eq!(source.stat().link_count, 1);
+        assert_eq!(victim.stat().link_count, 0);
+        expect_ok(vfs.reclaim_unlinked_inodes(), "reclaim displaced inode after retry");
+        expect_err(victim.filesystem.load_inode(victim.inode_number), FileSystemError::NotFound, "retry victim reclaimed");
+        drop(wrapper);
+    }
+    sprintln!("[VFS TEST] replacement failure atomicity ... PASS");
+}
+
+/// Checks compatible symlink replacement and retryable post-commit cleanup.
+///
+/// Unopened displaced files and symlinks keep backing storage until explicit
+/// cleanup. Injected free failures must not affect the committed namespace.
+/// Unmount also retries cleanup before detaching its instance.
+///
+/// # Panics
+///
+/// Panics if rename follows a final symlink, reclamation changes a committed
+/// name, or successful cleanup/unmount fails to release displaced storage.
+fn test_replacement_reclamation() {
+    sprintln!("[VFS TEST] replacement reclamation ...");
+    for (source_link, victim_link) in [(false, false), (true, false), (false, true), (true, true)] {
+        let mut vfs = namespace_fixture();
+        let source = if source_link {
+            expect_ok(vfs.create_symlink("/etc/source", "/etc/config.txt", None), "replacement source symlink")
+        } else { replacement_file(&mut vfs, "/etc/source", b"source") };
+        let victim = if victim_link {
+            expect_ok(vfs.create_symlink("/etc/destination", "/dangling", None), "replacement dangling destination")
+        } else { replacement_file(&mut vfs, "/etc/destination", b"victim") };
+        let unaffected = expect_ok(vfs.resolve("/etc/config.txt", None, false), "symlink target before replacement");
+        super::fail_next_free_for(victim.filesystem.instance_id(), victim.inode_number);
+        expect_ok(vfs.rename("/etc/source", "/etc/destination", None), "rename succeeds without freeing victim");
+        replacement_identity(&vfs, "/etc/destination", &source);
+        assert_eq!(victim.stat().link_count, 0);
+        expect_ok(victim.filesystem.load_inode(victim.inode_number), "unopened displaced storage retained");
+        expect_err(vfs.reclaim_unlinked_inodes(), FileSystemError::DiskWriteError, "post-commit free error");
+        replacement_identity(&vfs, "/etc/destination", &source);
+        replacement_identity(&vfs, "/etc/config.txt", &unaffected);
+        expect_ok(victim.filesystem.load_inode(victim.inode_number), "failed free stays retryable");
+        assert_eq!(expect_ok(vfs.reclaim_unlinked_inodes(), "post-commit free retry"), 1);
+        expect_err(victim.filesystem.load_inode(victim.inode_number), FileSystemError::NotFound, "unopened victim reclaimed");
+        if source_link {
+            assert_eq!(expect_ok(source.filesystem.read_symlink(&source), "moved symlink contents"), "/etc/config.txt");
+        }
+    }
+    let mut vfs = namespace_fixture();
+    expect_ok(vfs.mount("stubfs", Arc::new(StubBlockDevice), "/bin/tools", None), "mount cleanup fixture");
+    let source = replacement_file(&mut vfs, "/bin/tools/etc/source", b"new");
+    let victim = replacement_file(&mut vfs, "/bin/tools/etc/destination", b"old");
+    expect_ok(vfs.rename("/bin/tools/etc/source", "/bin/tools/etc/destination", None), "mounted replacement");
+    super::fail_next_free_for(victim.filesystem.instance_id(), victim.inode_number);
+    expect_err(vfs.unmount("/bin/tools", None), FileSystemError::DiskWriteError, "unmount preserves mount on cleanup error");
+    replacement_identity(&vfs, "/bin/tools/etc/destination", &source);
+    expect_ok(vfs.unmount("/bin/tools", None), "retry unmount reclaims displaced inode");
+    expect_err(victim.filesystem.load_inode(victim.inode_number), FileSystemError::NotFound, "unmount freed displaced storage");
+    sprintln!("[VFS TEST] replacement reclamation ... PASS");
 }

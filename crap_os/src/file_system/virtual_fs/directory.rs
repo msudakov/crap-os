@@ -210,7 +210,7 @@ impl Drop for Directory {
     /// Releases this wrapper's lifetime registration without calling a driver.
     ///
     /// The VFS must later call
-    /// [`super::vfs::VirtualFileSystem::reclaim_removed_directories`] to
+    /// [`super::vfs::VirtualFileSystem::reclaim_unlinked_inodes`] to
     /// reclaim an unlinked directory. Parent references drop after this method
     /// returns.
     ///

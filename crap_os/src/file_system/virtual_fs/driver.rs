@@ -592,11 +592,18 @@ pub trait FileSystemInstance: Send + Sync {
     /// link count. After success, the VFS decrements its retained inode's
     /// in-memory link count. The driver must leave the inode's storage intact;
     /// the VFS calls [`FileSystemInstance::free_inode`] separately when the
-    /// count reaches zero.
+    /// count reaches zero and the VFS lifetime conditions are satisfied.
+    ///
+    /// This driver primitive serves both VFS `unlink` and `remove_directory`.
+    /// The VFS checks type, empty-directory, special-name, mount, and
+    /// path-guard rules before invoking it. A returned error must leave both
+    /// the name and backing link count unchanged.
     ///
     /// The removed name disappears immediately. Other hard links and existing
-    /// open handles remain usable. The inode is freed only after its last
-    /// directory entry is removed and its last open handle is closed.
+    /// file handles remain usable. Directories also retain backing storage
+    /// while directory wrappers exist. Only an explicit VFS `free_inode` call
+    /// authorizes reclamation; `unlink` itself must never reuse the inode
+    /// number.
     ///
     /// # Arguments
     ///
@@ -613,34 +620,32 @@ pub trait FileSystemInstance: Send + Sync {
         name: &str,
     ) -> Result<(), FileSystemError>;
 
-    /// Moves a directory entry from one parent directory to another, optionally
-    /// changing its name.
+    /// Atomically moves an entry and replaces a compatible destination if
+    /// present.
     ///
-    /// The driver removes the entry named `old_name` from `old_parent`,
-    /// creates a new entry named `new_name` in `new_parent` pointing to the
-    /// same inode, and updates the driver's backing namespace. The VFS
-    /// preflights both names, but does not roll back a partial driver mutation.
-    /// `old_parent` and `new_parent` may refer to the same directory (i.e., an
-    /// in-place rename).
+    /// Under VFS serialization, the caller validates pathname, protection,
+    /// mount, type, emptiness, and ancestry rules. The driver commits backing
+    /// namespace and link counts as one operation. Source link count stays
+    /// unchanged; a different destination loses one backing link. Its storage
+    /// remains intact until a separate VFS [`FileSystemInstance::free_inode`]
+    /// call.
     ///
-    /// If an entry named `new_name` already exists in `new_parent`, the
-    /// driver returns [`FileSystemError::AlreadyExists`]. The VFS handles a
-    /// same-inode destination as a successful no-op without calling this method.
-    /// Replacing a different destination inode is not implemented.
+    /// Every returned error leaves listings, directory-parent records, and
+    /// backing link counts unchanged. The VFS performs no rollback. Crash
+    /// recovery and durable transaction mechanisms belong to the driver.
+    /// Same-inode destinations are successful no-ops handled by the VFS.
     ///
     /// # Arguments
     ///
-    /// * `old_parent` - The directory inode currently containing the entry.
-    /// * `old_name`   - The current name of the entry within `old_parent`.
-    /// * `new_parent` - The directory inode that will contain the entry after
-    ///   the rename.
-    /// * `new_name`   - The new name of the entry within `new_parent`.
+    /// * `old_parent` - Source directory owned by this instance.
+    /// * `old_name`   - Existing source entry name.
+    /// * `new_parent` - Destination directory owned by this instance.
+    /// * `new_name`   - Destination name, possibly already occupied.
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` on success, or `Err(FileSystemError)` if the source
-    /// entry does not exist, the destination name already exists, or a disk
-    /// write fails.
+    /// Returns success after commit, or a driver error with no changes
+    /// committed.
     fn rename(
         &self,
         old_parent: &Inode,

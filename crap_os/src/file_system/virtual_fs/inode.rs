@@ -19,19 +19,21 @@
 //! - Regular-file and symlink inodes may be referenced by multiple directory
 //!   entries through hard links. Directories retain a single parent.
 //! - Removing a directory entry (unlinking) does not immediately destroy the
-//!   inode; the inode survives until its link count reaches zero and all open
-//!   handles are closed.
+//!   inode. File storage survives until its link count reaches zero and all
+//!   registered handles close. Directory storage also survives every live
+//!   directory wrapper and is reclaimed by explicit VFS cleanup.
 //! - The path resolver works with directory entries during traversal and only
 //!   loads the full inode when it is needed.
 
 #![allow(dead_code)]
 
 use alloc::sync::Arc;
+use core::sync::atomic::{AtomicUsize, Ordering};
 use alloc::string::String;
 use crate::spinlock::SpinLock;
 
 use super::types::{
-    InodeType, DirectoryEntryType, Permissions, Timestamps,
+    InodeType, DirectoryEntryType, Permissions, Timestamps, FileSystemError,
 };
 use super::driver::FileSystemInstance;
 
@@ -85,6 +87,44 @@ pub struct Inode {
     /// Hold the guard only while reading or changing fields, and release it
     /// before calling a filesystem driver.
     pub(crate) metadata: SpinLock<InodeMetadata>,
+
+    /// Number of live directory wrappers, including wrappers retained by
+    /// children. Arc clones of one wrapper share a single registration.
+    /// Destructors only decrement this counter; VFS cleanup frees storage.
+    pub(super) directory_wrappers: AtomicUsize,
+
+    /// Number of path guards protecting this directory identity. Each guard
+    /// contributes once for this directory and once for each ancestor.
+    /// Acquisition is serialized by the VFS; release may occur independently.
+    pub(super) directory_path_guards: AtomicUsize,
+
+    /// Runtime count of tokens protecting all names of this canonical inode.
+    /// Separate protected opens contribute once each; Arc clones of a handle
+    /// do not. Acquisition is serialized with VFS mutations. Release may run
+    /// independently and therefore uses atomic accounting. Never persisted.
+    pub(super) namespace_name_guards: AtomicUsize,
+}
+
+/// One owned contribution protecting every name of a canonical inode.
+///
+/// Only VFS acquisition constructs tokens. Drop releases the contribution
+/// without driver I/O or the global VFS lock, including failed-open rollback.
+pub(super) struct InodeNameGuard {
+    /// Canonical inode whose existing namespace entries are protected.
+    inode: Arc<Inode>,
+}
+
+impl Drop for InodeNameGuard {
+    /// Releases this token's contribution without changing namespace state.
+    ///
+    /// # Panics
+    ///
+    /// Panics if an internal accounting bug releases an unacquired token.
+    fn drop(&mut self) {
+        let previous = self.inode.namespace_name_guards.fetch_sub(
+            1, Ordering::AcqRel);
+        assert!(previous != 0, "Inode name guard count underflow");
+    }
 }
 
 /// Metadata fields that can change while an [`Inode`] is shared.
@@ -117,9 +157,9 @@ pub(crate) struct InodeMetadata {
     ///
     /// Starts at `1` when the inode is created. Incremented when a hard link
     /// is created, and decremented when a directory entry is removed. When
-    /// `link_count` reaches `0` and no open file handles remain, the VFS
-    /// instructs the filesystem driver to free the inode's data blocks and
-    /// release the inode slot.
+    /// `link_count` reaches `0`, files await their last registered handle.
+    /// Directories additionally await their last wrapper and explicit VFS
+    /// cleanup before the driver frees storage and releases the inode slot.
     pub(crate) link_count: u32,
 
     /// Indicates that this inode has been modified in memory but not yet
@@ -163,6 +203,9 @@ impl Inode {
             inode_number,
             filesystem,
             inode_type,
+            directory_wrappers: AtomicUsize::new(0),
+            directory_path_guards: AtomicUsize::new(0),
+            namespace_name_guards: AtomicUsize::new(0),
             metadata: SpinLock::new(InodeMetadata {
                 size,
                 permissions,
@@ -171,6 +214,36 @@ impl Inode {
                 dirty: false,
             }),
         }
+    }
+
+    /// Acquires one contribution protecting all existing names of this inode.
+    ///
+    /// The caller holds VFS serialization and uses the canonical inode of a
+    /// live regular file. Existing handles and tokens do not conflict with
+    /// acquisition. A token is runtime state, not persistent inode metadata.
+    ///
+    /// # Returns
+    ///
+    /// Returns the owned token, or `ResourceBusy` on count exhaustion. A
+    /// returned error leaves the count unchanged.
+    pub(super) fn protect_names(
+        self: &Arc<Self>,
+    ) -> Result<InodeNameGuard, FileSystemError> {
+        self.namespace_name_guards.try_update(
+            Ordering::AcqRel, Ordering::Acquire,
+            |count| count.checked_add(1),
+        ).map_err(|_| FileSystemError::ResourceBusy)?;
+
+        Ok(InodeNameGuard { inode: Arc::clone(self) })
+    }
+
+    /// Checks protection of this inode's own names, independently of ancestors.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` while at least one name-protection token exists.
+    pub(super) fn names_are_protected(&self) -> bool {
+        self.namespace_name_guards.load(Ordering::Acquire) != 0
     }
 
     /// Checks if this inode represents a regular file.

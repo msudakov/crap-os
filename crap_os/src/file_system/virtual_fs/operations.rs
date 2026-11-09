@@ -41,91 +41,138 @@
 #![allow(dead_code)]
 
 use alloc::sync::Arc;
+use core::sync::atomic::Ordering;
 
 use super::directory::Directory;
-use super::file::{File, FileHandle};
+use super::file::{File, FileHandle, OpenNamespaceProtection};
+use super::inode::Inode;
 use super::types::{
     AccessMode, FileSystemError, InodeStat, OpenFileKey,
-    Permissions, Timestamps,
+    Permissions, Timestamps, NamespaceProtection,
 };
 use super::vfs::VirtualFileSystem;
 use crate::globals;
 
 impl VirtualFileSystem {
-    /// Opens the file at `path` and returns a registered [`FileHandle`].
+    /// Opens a regular file without contributing namespace restrictions.
     ///
-    /// Resolves `path` to an inode, verifies it is a regular file, then
-    /// either retrieves the existing [`super::file::File`] master record from
-    /// the open-file table or creates a new one. A new [`FileHandle`] is
-    /// created for this open call, registered with the master record, and
-    /// returned to the caller.
-    ///
-    /// The VFS wraps the handle in an [`Arc`] and registers it before
-    /// returning. The caller owns that registered handle and must close it
-    /// explicitly.
-    ///
-    /// If `path` resolves to a symlink, the symlink is followed and the
-    /// target file is opened. To open the symlink inode itself, use a path
-    /// that does not require following the final symlink, which is not a
-    /// supported operation for `open`, as symlink inodes are not openable as
-    /// files.
+    /// Other handles' protection still applies. The caller holds global VFS
+    /// serialization and explicitly closes the returned registration.
     ///
     /// # Arguments
     ///
-    /// * `path`              - The path of the file to open.
-    /// * `access_mode`       - The access rights to grant the new handle.
-    /// * `working_directory` - The starting directory for relative paths.
-    ///   `None` means use the global root.
+    /// * `path`              - File pathname; final symlinks are followed.
+    /// * `access_mode`       - Content access rights requested.
+    /// * `working_directory` - Relative-path base, or root when absent.
     ///
     /// # Returns
     ///
-    /// Returns `Ok(Arc<FileHandle>)` on success. Returns
-    /// `Err(FileSystemError::NotFound)` if the path does not exist,
-    /// `Err(FileSystemError::NotAFile)` if it resolves to a non-file inode,
-    /// or other `Err(FileSystemError)` variants for I/O and resolution
-    /// failures.
+    /// Returns a registered handle or the underlying open/resolution error.
     pub fn open(
         &mut self,
         path: &str,
         access_mode: AccessMode,
         working_directory: Option<Arc<Directory>>,
     ) -> Result<Arc<FileHandle>, FileSystemError> {
-        // Resolve the path, following symlinks so the caller gets the target
-        // file rather than the symlink inode.
-        let inode = self.resolve(path, working_directory, true)?;
+        self.open_with_namespace_protection(
+            path, access_mode, working_directory, NamespaceProtection::NONE,
+        )
+    }
 
-        // Only regular files can be opened through this method.
+    /// Opens a regular file and atomically acquires namespace protection.
+    ///
+    /// The caller holds global VFS serialization throughout resolution, token
+    /// acquisition, and registration. No namespace mutation can interleave.
+    /// Prefer `PROTECT_FULL` for namespace stability. Ancestor-only protection
+    /// stays on captured directories if the file later moves. All hard-link
+    /// names share name protection, but only this resolved path's ancestors
+    /// are captured. Symlink entries used to reach the target are not guarded.
+    ///
+    /// Reads, writes, timestamps, and write locking keep their own contracts.
+    /// Protection does not prevent additional opens. The caller must close
+    /// the registration before dropping its last Arc; a failed close retains
+    /// protection for retry. Arc clones do not acquire independent tokens.
+    ///
+    /// # Arguments
+    ///
+    /// * `path`              - File pathname; final symlinks are followed.
+    /// * `access_mode`       - Content access rights requested.
+    /// * `working_directory` - Relative-path base, or root when absent.
+    /// * `protection`        - Independent namespace restrictions, or `NONE`.
+    ///
+    /// # Returns
+    ///
+    /// Returns a registered handle owning the contributions. Returns `NotAFile`
+    /// for other inode types, `NotFound` for a detached target, `ResourceBusy`
+    /// for protection-counter exhaustion, `InternalError` for exhausted handle
+    /// IDs or missing regular-file parent context, or a resolution error.
+    /// A returned error publishes no handle and retains no new protection.
+    pub fn open_with_namespace_protection(
+        &mut self,
+        path: &str,
+        access_mode: AccessMode,
+        working_directory: Option<Arc<Directory>>,
+        protection: NamespaceProtection,
+    ) -> Result<Arc<FileHandle>, FileSystemError> {
+        let resolved = self.resolve_entry_with_budget(
+            path, working_directory, true, super::resolver::MAX_SYMLINK_DEPTH,
+        )?;
+        let inode = resolved.inode;
+
         if !inode.is_file() {
             return Err(FileSystemError::NotAFile);
         }
 
         let key = OpenFileKey::new(inode.filesystem.instance_id(),
             inode.inode_number);
-
-        // A retained directory wrapper may still name an unlinked inode.
-        // Its open-file master records the deletion while handles remain.
-        if self.open_files.get(&key)
-            .is_some_and(|master| master.is_pending_deletion())
+        if inode.metadata.lock().link_count == 0
+            || self.open_files.get(&key)
+                .is_some_and(|master| master.is_pending_deletion())
         {
             return Err(FileSystemError::NotFound);
         }
 
-        // Refuse ID exhaustion rather than reusing the identity of a handle
-        // that could still hold an exclusive write lock.
+        // Validate ID availability before acquiring tokens. Commit advancement
+        // only when this open is ready to register.
         let handle_id = self.next_handle_id;
-        self.next_handle_id = handle_id
-            .checked_add(1)
+        let next_handle_id = handle_id.checked_add(1)
             .ok_or(FileSystemError::InternalError)?;
+        let ancestor_guard = if protection.contains(
+            NamespaceProtection::PROTECT_ANCESTORS)
+        {
+            let parent = resolved.file_parent
+                .ok_or(FileSystemError::InternalError)?;
+            Some(self.protect_directory_path(parent)?)
+        } else {
+            None
+        };
 
-        // Retrieve the existing master record or create a new one.
-        let master = self.open_files
-            .entry(key)
+        // A failed name acquisition drops the local ancestor token, rolling
+        // back its contribution without a separate error-prone undo sequence.
+        let name_guard = if protection.contains(
+            NamespaceProtection::PROTECT_NAMES)
+        {
+            Some(inode.protect_names()?)
+        } else {
+            None
+        };
+
+        let namespace_protection = OpenNamespaceProtection {
+            flags: protection, name_guard, ancestor_guard,
+        };
+
+        let master = self.open_files.entry(key)
             .or_insert_with(|| Arc::new(File::new(Arc::clone(&inode))));
 
         let handle = Arc::new(FileHandle::new(
-            Arc::clone(master), handle_id, access_mode,
+            Arc::clone(master), handle_id, access_mode, namespace_protection,
         ));
+
+        // Allocations retain the existing kernel contract: allocation failure
+        // is not represented as a returned filesystem error.
         master.register_handle(&handle);
+        self.next_handle_id = next_handle_id;
+
         Ok(handle)
     }
 
@@ -262,7 +309,9 @@ impl VirtualFileSystem {
     ///
     /// If the closing handle owns the exclusive write lock, unregistering it
     /// releases that lock. A failed deferred free leaves the handle open and
-    /// registered so its owner can retry close.
+    /// registered so its owner can retry close. Namespace protection also
+    /// remains effective on failure. Successful close releases this handle's
+    /// contributions even if Arc clones remain; other opens keep their tokens.
     ///
     /// After success, the caller removes and drops its handle-table entry.
     ///
@@ -311,7 +360,12 @@ impl VirtualFileSystem {
 
         let remaining = master.unregister_handle(handle)?;
         handle_state.closed = true;
+        let namespace_protection = handle_state.namespace_protection.take();
         drop(handle_state);
+
+        // Release only after all fallible close work succeeds. Destructors
+        // run outside the handle-state lock and perform no driver I/O.
+        drop(namespace_protection);
 
         if remaining == 0 {
             self.open_files.remove(&key);
@@ -426,6 +480,10 @@ impl VirtualFileSystem {
             return Err(FileSystemError::AlreadyExists);
         }
 
+        if parent_dir.inode.metadata.lock().link_count == 0 {
+            return Err(FileSystemError::NotFound);
+        }
+
         let now = current_timestamp();
         let timestamps = Timestamps::new(now);
 
@@ -480,6 +538,10 @@ impl VirtualFileSystem {
 
         if parent_dir.lookup_child(dir_name)?.is_some() {
             return Err(FileSystemError::AlreadyExists);
+        }
+
+        if parent_dir.inode.metadata.lock().link_count == 0 {
+            return Err(FileSystemError::NotFound);
         }
 
         let now = current_timestamp();
@@ -549,6 +611,10 @@ impl VirtualFileSystem {
 
         if parent_dir.lookup_child(link_name)?.is_some() {
             return Err(FileSystemError::AlreadyExists);
+        }
+
+        if parent_dir.inode.metadata.lock().link_count == 0 {
+            return Err(FileSystemError::NotFound);
         }
 
         let now = current_timestamp();
@@ -662,43 +728,104 @@ impl VirtualFileSystem {
         Ok(())
     }
 
-    /// Removes the directory entry for the filesystem object at `path`.
+    /// Removes one name for a regular file or symlink without following it.
     ///
-    /// Resolves `path` to its parent directory and terminal name, then calls
-    /// [`super::driver::FileSystemInstance::unlink`] to remove the on-disk
-    /// directory entry and decrement the inode's link count. The next lookup
-    /// reads the driver's updated directory state. Deleting a moved directory
-    /// also removes its relocated parent entry.
-    ///
-    /// If the inode's link count reaches zero, and no open handles exist for
-    /// it, [`super::driver::FileSystemInstance::free_inode`] is called
-    /// immediately to release the inode's data blocks. If open handles exist,
-    /// the open-file master is marked for deferred reclamation, and the data
-    /// blocks are freed when the last handle closes via
-    /// [`VirtualFileSystem::close`].
-    ///
-    /// Deleting a non-empty directory returns
-    /// [`FileSystemError::DirectoryNotEmpty`]. Deleting a directory that is
-    /// currently a mount point returns [`FileSystemError::AlreadyMounted`].
+    /// The caller holds the global VFS lock throughout this operation.
+    /// Other hard links and registered open handles preserve file lifetime.
+    /// Directories, including mount hosts, return `OperationNotAllowed`.
+    /// Name-protected regular files return `ResourceBusy` for every alias.
+    /// Trailing slashes on files or symlinks return `NotADirectory`, even if a
+    /// symlink targets a directory. This is an intentional contract.
     ///
     /// # Arguments
     ///
-    /// * `path`              - The path of the entry to delete.
-    /// * `working_directory` - The starting directory for relative paths.
-    ///   `None` means use the global root.
+    /// * `path` - Entry to unlink. Empty paths return `NotFound`, root-only
+    ///   paths return `ResourceBusy`, and final `.` or `..` components return
+    ///   `OperationNotAllowed`, including with trailing separators.
+    /// * `working_directory` - Base for relative paths; `None` uses root.
+    ///   Intermediate `.` and `..` retain ordinary traversal semantics.
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` on success, `Err(FileSystemError::NotFound)` if the
-    /// path does not exist, `Err(FileSystemError::DirectoryNotEmpty)` if the
-    /// target is a non-empty directory, or other `Err(FileSystemError)`
-    /// variants for resolution and I/O failures.
-    pub fn delete(
+    /// Returns `Ok(())` after removal, or a pathname, type, or driver error.
+    /// File reclamation retains the existing final-close behavior. Immediate
+    /// file-free failures can still be reported after unlink has committed.
+    pub fn unlink(
         &mut self,
         path: &str,
         working_directory: Option<Arc<Directory>>,
     ) -> Result<(), FileSystemError> {
+        self.remove_directory_entry(path, working_directory, false)
+    }
+
+    /// Removes an empty directory's name while preserving retained wrappers.
+    ///
+    /// The caller holds the global VFS lock throughout this operation.
+    /// Real directories permit trailing separators. Final symlinks are never
+    /// followed, including with trailing separators. Protected directories and
+    /// active mount hosts return `ResourceBusy` before any driver mutation.
+    /// Removed wrappers retain their former parent for `..`, permit inspection,
+    /// and cannot be used to create children, acquire guards, or mount volumes.
+    /// Call [`super::vfs::VirtualFileSystem::reclaim_unlinked_inodes`]
+    /// after releasing retained references to reclaim detached storage; removal
+    /// itself performs no directory free.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Directory name. Empty paths return `NotFound`, root-only
+    ///   paths return `ResourceBusy`, and final `.` or `..` return
+    ///   `OperationNotAllowed`, including with trailing separators.
+    /// * `working_directory` - Base for relative paths; `None` uses root.
+    ///   Intermediate `.` and `..` retain normal traversal semantics.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` after detachment, `NotADirectory` for files or symlinks,
+    /// `DirectoryNotEmpty` for nonempty directories, or the applicable path,
+    /// protection, mount, or driver error. Rejections leave the entry intact.
+    pub fn remove_directory(
+        &mut self,
+        path: &str,
+        working_directory: Option<Arc<Directory>>,
+    ) -> Result<(), FileSystemError> {
+        self.remove_directory_entry(path, working_directory, true)
+    }
+
+    /// Applies the common preflight and commit sequence for namespace removal.
+    ///
+    /// All type, protection, mount, and emptiness checks precede driver unlink.
+    /// Directory reclamation is deferred to explicit VFS cleanup; file lifetime
+    /// continues to use link counts and registered open-file masters.
+    ///
+    /// # Arguments
+    ///
+    /// * `path` - Unnormalized pathname whose final spelling is validated.
+    /// * `working_directory` - Relative-path base, or root when absent.
+    /// * `directory_only` - Selects directory removal rather than file unlink.
+    ///
+    /// # Returns
+    ///
+    /// Returns success after detachment or the applicable validation or driver
+    /// error. File free errors may occur after the namespace commit.
+    fn remove_directory_entry(
+        &mut self,
+        path: &str,
+        working_directory: Option<Arc<Directory>>,
+        directory_only: bool,
+    ) -> Result<(), FileSystemError> {
+        if path.is_empty() {
+            return Err(FileSystemError::NotFound);
+        }
+
+        let trimmed = path.trim_end_matches('/');
+        if trimmed.is_empty() {
+            return Err(FileSystemError::ResourceBusy);
+        }
+
         let (parent_path, entry_name) = split_parent_and_name(path)?;
+        if entry_name == "." || entry_name == ".." {
+            return Err(FileSystemError::OperationNotAllowed);
+        }
 
         let parent_dir = self.resolve_dir_with_budget(
             parent_path,
@@ -719,11 +846,21 @@ impl VirtualFileSystem {
             return Err(FileSystemError::NotADirectory);
         }
 
+        if directory_only && !target_inode.is_directory() {
+            return Err(FileSystemError::NotADirectory);
+        }
+
+        if !directory_only && target_inode.is_directory() {
+            return Err(FileSystemError::OperationNotAllowed);
+        }
+
+        ensure_namespace_mutation_allowed(&target_inode)?;
+
         // Reject deletion of a mount point directory.
         let target_key = OpenFileKey::new(
             target_inode.filesystem.instance_id(), target_inode.inode_number);
         if self.mounts.get(&target_key).is_some() {
-            return Err(FileSystemError::AlreadyMounted);
+            return Err(FileSystemError::ResourceBusy);
         }
 
         // Reject deletion of a non-empty directory.
@@ -757,9 +894,10 @@ impl VirtualFileSystem {
         // Remove the on-disk directory entry and decrement the link count.
         target_inode.filesystem.unlink(&parent_dir.inode, entry_name)?;
 
-        // A deleted directory's inode number may later be reused.
+        // Preserve the actual former parent even when retained wrappers were
+        // created before a move. This record is released only after free.
         if target_inode.is_directory() && remaining_links == 0 {
-            self.relocated_parents.remove(&target_key);
+            self.relocated_parents.insert(target_key, Arc::clone(&parent_dir));
         }
 
         // Decrement this in-memory inode's link count after the driver commits.
@@ -770,7 +908,7 @@ impl VirtualFileSystem {
 
         // If the link count has reached zero, decide whether to free
         // immediately or defer until the last handle closes.
-        if remaining_links == 0 {
+        if remaining_links == 0 && !target_inode.is_directory() {
             if let Some(master) = open_master {
                 // The master retains the unlinked inode until the last close.
                 master.mark_pending_deletion();
@@ -784,124 +922,261 @@ impl VirtualFileSystem {
         Ok(())
     }
 
-    /// Moves the directory entry at `old_path` to `new_path`, optionally
-    /// changing its name.
+    /// Renames an entry, replacing an existing compatible destination.
     ///
-    /// Resolves both parents and validates source and destination names before
-    /// calling [`super::driver::FileSystemInstance::rename`]. After the driver
-    /// succeeds, later lookups read the driver's new directory state. A
-    /// cross-directory move also records the directory's new parent for
-    /// retained wrappers. The caller must hold the global VFS lock throughout
-    /// the operation.
+    /// Regular files and symlinks may replace either non-directory type.
+    /// Directories may replace empty directories only. Final symlinks are not
+    /// followed. A same-inode destination is a successful no-op, even
+    /// protected. The caller holds global VFS serialization throughout
+    /// preflight, driver commit, and publication of canonical metadata. Driver
+    /// errors must leave both names and backing link counts unchanged.
     ///
-    /// `old_path` and `new_path` may share the same parent directory, in
-    /// which case both sides use the same directory wrapper for this operation.
-    /// Cross-filesystem renames, where the two paths reside on different
-    /// mounted volumes, are not supported and return
-    /// [`FileSystemError::InvalidPath`].
-    ///
-    /// If both names refer to the same inode, returns success without changing
-    /// either entry. An existing destination for a different inode returns
-    /// [`FileSystemError::AlreadyExists`]; replacement is not implemented.
+    /// Replaced inodes retain their other hard links and registered handles.
+    /// Detached directories retain their actual former parent for retained
+    /// wrapper traversal. Unopened displaced files and symlinks remain in the
+    /// canonical table until explicit
+    /// [`super::vfs::VirtualFileSystem::reclaim_unlinked_inodes`] succeeds.
+    /// Cleanup failure is separate from an already successful rename.
     ///
     /// # Arguments
     ///
-    /// * `old_path`          - The current path of the entry to rename.
-    /// * `new_path`          - The desired path after the rename.
-    /// * `working_directory` - The starting directory for relative paths.
-    ///   `None` means use the global root.
+    /// * `old_path` - Existing source entry. Empty paths return `NotFound`,
+    ///   root-only paths return `ResourceBusy`, and final `.` or `..` return
+    ///   `OperationNotAllowed`. Intermediate special components still traverse.
+    /// * `new_path` - Destination subject to the same special-name rules.
+    ///   Trailing separators require an existing real directory. A missing
+    ///   destination returns `NotADirectory` for a non-directory source and
+    ///   `NotFound` for a directory source. Final symlinks with trailing
+    ///   separators return `NotADirectory`, even for directory targets. This
+    ///   is a deliberate CrapOS pathname contract.
+    /// * `working_directory` - Relative-path base, or global root when absent.
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` on success, including a same-inode no-op,
-    /// `Err(FileSystemError::NotFound)` if `old_path` does not exist,
-    /// `Err(FileSystemError::AlreadyExists)` if `new_path` names a different
-    /// inode, `Err(FileSystemError::InvalidPath)` if the two paths are on
-    /// different filesystems, or other `Err(FileSystemError)` variants for
-    /// resolution, allocation, and I/O failures. No VFS lookup occurs after
-    /// a successful driver rename.
+    /// Returns success after commit, `CrossFileSystemOperation` across
+    /// instances,`ResourceBusy` for protected entries or active mount hosts,
+    /// `IsADirectory` or `NotADirectory` for type mismatches,
+    /// `DirectoryNotEmpty` for nonempty destination directories, `InvalidPath`
+    /// for moving a directory into its subtree or embedded NUL, or a pathname/
+    /// driver error before commit. Kernel allocation failure follows the
+    /// existing allocator contract and is not represented as a returned
+    /// filesystem error.
     pub fn rename(
         &mut self,
         old_path: &str,
         new_path: &str,
         working_directory: Option<Arc<Directory>>,
     ) -> Result<(), FileSystemError> {
-        let (old_parent_path, old_name) = split_parent_and_name(old_path)?;
-        let (new_parent_path, new_name) = split_parent_and_name(new_path)?;
+        let (old_parent_path, old_name) = rename_parent_and_name(old_path)?;
+        let (new_parent_path, new_name) = rename_parent_and_name(new_path)?;
 
         let old_parent = self.resolve_dir_with_budget(
-            old_parent_path,
-            working_directory.clone(),
+            old_parent_path, working_directory.clone(),
             super::resolver::MAX_SYMLINK_DEPTH,
         )?;
 
-        let resolved_new_parent = self.resolve_dir_with_budget(
-            new_parent_path,
-            working_directory,
+        let new_parent = self.resolve_dir_with_budget(
+            new_parent_path, working_directory,
             super::resolver::MAX_SYMLINK_DEPTH,
         )?;
 
-        // Reject cross-filesystem renames.
-        let old_filesystem_id = old_parent.inode.filesystem.instance_id();
-        let new_filesystem_id =
-            resolved_new_parent.inode.filesystem.instance_id();
-        if old_filesystem_id != new_filesystem_id {
-            return Err(FileSystemError::InvalidPath);
+        if old_parent.inode.filesystem.instance_id()
+            != new_parent.inode.filesystem.instance_id()
+        {
+            return Err(FileSystemError::CrossFileSystemOperation);
         }
 
-        // Two path walks can produce different wrappers for the same directory.
-        // Use one wrapper for both sides of an in-place rename.
-        let same_parent = old_parent.inode.inode_number ==
-            resolved_new_parent.inode.inode_number;
-        let new_parent = if same_parent {
-            Arc::clone(&old_parent)
-        } else {
-            resolved_new_parent
-        };
+        // Read separately so same-parent operands never require two guards
+        // on the same metadata lock in a single expression.
+        let old_attached = old_parent.inode.metadata.lock().link_count != 0;
+        let new_attached = new_parent.inode.metadata.lock().link_count != 0;
 
-        // Check the source before asking the driver to rename it. Retain its
-        // identity, so a successful directory move can update `..` traversal.
-        let moved_entry = old_parent.lookup_child(old_name)?
+        if !old_attached || !new_attached {
+            return Err(FileSystemError::NotFound);
+        }
+
+        let source_entry = old_parent.lookup_child(old_name)?
             .ok_or(FileSystemError::NotFound)?;
-        let moved_inode = self.get_or_load_inode(
-            &old_parent.inode.filesystem, moved_entry.inode_number,
+
+        let source = self.get_or_load_inode(
+            &old_parent.inode.filesystem, source_entry.inode_number,
         )?;
 
-        // Either path may end in `/` only when moving a directory.
-        if (old_path.ends_with('/') || new_path.ends_with('/'))
-            && !moved_inode.is_directory()
-        {
+        let destination = match new_parent.lookup_child(new_name)? {
+            Some(entry) => Some(self.get_or_load_inode(
+                &new_parent.inode.filesystem, entry.inode_number,
+            )?),
+            None => None,
+        };
+
+        // Validate spelling before accepting a same-inode no-op. A destination
+        // ending in slash must already denote a real directory, not just have
+        // a directory source that could be moved to this name.
+        if old_path.ends_with('/') && !source.is_directory() {
             return Err(FileSystemError::NotADirectory);
         }
 
-        // Renaming between names of one inode is a successful no-op. Keep
-        // both directory entries and their shared link count unchanged.
-        if let Some(destination) = new_parent.lookup_child(new_name)? {
-            if destination.inode_number == moved_inode.inode_number {
-                return Ok(());
+        if new_path.ends_with('/') {
+            match destination.as_ref() {
+                Some(inode) if inode.is_directory() => {}
+                Some(_) => return Err(FileSystemError::NotADirectory),
+                None if !source.is_directory() => {
+                    return Err(FileSystemError::NotADirectory);
+                }
+                None => return Err(FileSystemError::NotFound),
             }
-            return Err(FileSystemError::AlreadyExists);
         }
 
-        // Only the driver operation can now return a filesystem error.
-        old_parent.inode.filesystem.rename(
-            &old_parent.inode,
-            old_name,
-            &new_parent.inode,
-            new_name,
+        if destination
+            .as_ref().is_some_and(|inode| Arc::ptr_eq(inode, &source))
+        {
+            return Ok(());
+        }
+
+        self.ensure_rename_target_available(&source)?;
+
+        if let Some(inode) = destination.as_ref() {
+            self.ensure_rename_target_available(inode)?;
+
+            if source.is_directory() && !inode.is_directory() {
+                return Err(FileSystemError::NotADirectory);
+            }
+
+            if !source.is_directory() && inode.is_directory() {
+                return Err(FileSystemError::IsADirectory);
+            }
+
+            if inode.is_directory() && !inode.filesystem.read_dir(inode)?
+                .is_empty()
+            {
+                return Err(FileSystemError::DirectoryNotEmpty);
+            }
+        }
+
+        if source.is_directory() {
+            self.ensure_rename_outside_subtree(&source,
+                Arc::clone(&new_parent))?;
+        }
+
+        // Prepare every fallible VFS step before the backing namespace changes.
+        // Preserve the displaced master so publication needs no later lookup.
+        let displaced = if let Some(inode) = destination {
+            let remaining = inode.metadata.lock().link_count.checked_sub(1)
+                .ok_or(FileSystemError::InternalError)?;
+            let key = OpenFileKey::new(inode.filesystem.instance_id(),
+                inode.inode_number);
+            let master = if remaining == 0 {
+                self.open_files.get(&key).cloned()
+            } else { None };
+            Some((inode, key, remaining, master))
+        } else { None };
+
+        source.filesystem.rename(
+            &old_parent.inode, old_name, &new_parent.inode, new_name,
         )?;
 
-        // Resolve the current parent by inode identity, so retained and fresh
-        // wrappers agree after a cross-directory move.
-        if moved_inode.is_directory() && !same_parent {
-            let key = OpenFileKey::new(
-                moved_inode.filesystem.instance_id(),
-                moved_inode.inode_number,
-            );
+        // Commit succeeded. No returned-error path or driver operation follows.
+        if let Some((inode, key, remaining, master)) = displaced {
+            inode.metadata.lock().link_count = remaining;
+            if remaining == 0 {
+                if inode.is_directory() {
+                    self.relocated_parents.insert(key, Arc::clone(&new_parent));
+                } else if let Some(master) = master {
+                    master.mark_pending_deletion();
+                }
+                // Without a master, the canonical zero-link inode retains the
+                // storage identity for explicit cleanup and failed-free retry.
+            }
+        }
+
+        let same_parent =
+            old_parent.inode.inode_number == new_parent.inode.inode_number;
+
+        if source.is_directory() && !same_parent {
+            let key = OpenFileKey::new(source.filesystem.instance_id(),
+                source.inode_number);
             self.relocated_parents.insert(key, Arc::clone(&new_parent));
         }
 
+        let now = current_timestamp();
+        {
+            let mut metadata = old_parent.inode.metadata.lock();
+            metadata.timestamps.modified = now;
+            metadata.dirty = true;
+        }
+
+        if !same_parent {
+            let mut metadata = new_parent.inode.metadata.lock();
+            metadata.timestamps.modified = now;
+            metadata.dirty = true;
+        }
+
+        // The current metadata model has no POSIX status-change timestamp.
         Ok(())
+    }
+
+    /// Checks protection and mount status before changing an attachment.
+    ///
+    /// # Arguments
+    ///
+    /// * `inode` - Canonical source or displaced destination inode.
+    ///
+    /// # Returns
+    ///
+    /// Returns `ResourceBusy` for protection or an active mount host;
+    /// otherwise returns success. Same-inode no-ops bypass this check.
+    fn ensure_rename_target_available(&self, inode: &Arc<Inode>)
+        -> Result<(), FileSystemError>
+    {
+        ensure_namespace_mutation_allowed(inode)?;
+
+        let key = OpenFileKey::new(inode.filesystem.instance_id(),
+            inode.inode_number);
+
+        if self.mounts.get(&key).is_some() {
+            return Err(FileSystemError::ResourceBusy);
+        }
+
+        Ok(())
+    }
+
+    /// Rejects moving a directory into itself or one of its descendants.
+    ///
+    /// Uses current relocated parents and mount records, rather than historical
+    /// wrapper parents. The existing namespace must be acyclic; trusted callers
+    /// must not construct arbitrary wrappers or mutate drivers behind the VFS.
+    ///
+    /// # Arguments
+    ///
+    /// * `source` - Canonical directory inode being moved.
+    /// * `parent` - Proposed destination parent.
+    ///
+    /// # Returns
+    ///
+    /// Returns `InvalidPath` if ancestry contains `source`, success at global
+    /// root, or the underlying parent-resolution error.
+    fn ensure_rename_outside_subtree(
+        &self, source: &Arc<Inode>, mut parent: Arc<Directory>,
+    ) -> Result<(), FileSystemError> {
+        loop {
+            if Arc::ptr_eq(source, &parent.inode) {
+                return Err(FileSystemError::InvalidPath);
+            }
+
+            if parent.is_root() {
+                return Ok(());
+            }
+
+            let key = OpenFileKey::new(parent.inode.filesystem.instance_id(),
+                parent.inode.inode_number);
+
+            parent = if let Some(host_key) = self.mounted_root_index.get(&key) {
+                Arc::clone(&self.mounts.get(host_key)
+                    .ok_or(FileSystemError::InternalError)?.host_directory)
+            } else if let Some(current) = self.relocated_parents.get(&key) {
+                Arc::clone(current)
+            } else { parent.parent()? };
+        }
     }
 
     /// Updates the `accessed` timestamp on `inode` and marks it dirty.
@@ -962,6 +1237,65 @@ impl VirtualFileSystem {
 
         Ok(())
     }
+}
+
+/// Checks protection before changing an inode's existing namespace attachment.
+///
+/// The caller holds global VFS serialization and checks before driver mutation.
+/// There is no holder bypass. Same-inode rename no-ops are handled before this
+/// check because they change no namespace state. Hard-link creation does not
+/// remove or change an existing attachment and does not use this check.
+///
+/// # Arguments
+///
+/// * `inode` - Canonical inode whose entry would be removed or changed.
+///
+/// # Returns
+///
+/// Returns `ResourceBusy` if name protection or directory path protection
+/// blocks the operation; otherwise returns `Ok(())`.
+fn ensure_namespace_mutation_allowed(inode: &Inode) -> Result<(), FileSystemError> {
+    if inode.names_are_protected()
+        || inode.directory_path_guards.load(Ordering::Acquire) != 0
+    {
+        return Err(FileSystemError::ResourceBusy);
+    }
+    Ok(())
+}
+
+/// Splits a rename operand after checking its final lexical component.
+///
+/// Intermediate `.` and `..` retain ordinary traversal. Trailing separators
+/// are trimmed only to identify the final spelling; rename checks their type.
+///
+/// # Arguments
+///
+/// * `path` - Original source or destination pathname.
+///
+/// # Returns
+///
+/// Returns parent and name, `NotFound` for empty paths, `ResourceBusy` for
+/// root, `OperationNotAllowed` for final `.`/`..`, or `InvalidPath` for
+/// embedded NUL.
+fn rename_parent_and_name(path: &str) -> Result<(&str, &str), FileSystemError> {
+    if path.is_empty() {
+        return Err(FileSystemError::NotFound);
+    }
+
+    if path.contains('\0') {
+        return Err(FileSystemError::InvalidPath);
+    }
+
+    if path.trim_end_matches('/').is_empty() {
+        return Err(FileSystemError::ResourceBusy);
+    }
+
+    let (parent, name) = split_parent_and_name(path)?;
+    if name == "." || name == ".." {
+        return Err(FileSystemError::OperationNotAllowed);
+    }
+
+    Ok((parent, name))
 }
 
 /// Splits a path string into the parent directory path and the terminal

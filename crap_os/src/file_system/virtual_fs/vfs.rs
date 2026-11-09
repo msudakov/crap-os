@@ -38,11 +38,12 @@
 
 use alloc::sync::Arc;
 use alloc::vec::Vec;
+use core::sync::atomic::Ordering;
 
 use crate::kernel_hashmap::KernelHashMap;
 use crate::spinlock::SpinLock;
 
-use super::directory::{Directory, DirectoryParent};
+use super::directory::{Directory, DirectoryParent, DirectoryPathGuard};
 use super::driver::{BlockDevice, FileSystemDriver, FileSystemInstance};
 use super::file::File;
 use super::inode::Inode;
@@ -104,7 +105,9 @@ pub struct VirtualFileSystem {
     /// Current parents of directories moved across parent directories.
     ///
     /// A retained [`Directory`] wrapper keeps the parent it had when created.
-    /// The resolver checks this table before using that stored parent.
+    /// The resolver checks this table before using that stored parent. Removal
+    /// also records the actual former parent here until successful reclamation,
+    /// preserving `..` even for wrappers retained before a cross-parent move.
     pub(super) relocated_parents: KernelHashMap<OpenFileKey, Arc<Directory>>,
 
     /// The system-wide open-file table.
@@ -156,6 +159,126 @@ impl VirtualFileSystem {
             relocated_parents:   KernelHashMap::new(),
             open_files:          KernelHashMap::new(),
             next_handle_id:      1,
+        }
+    }
+
+    /// Protects a directory and its current namespace ancestors.
+    ///
+    /// The caller serializes this operation with all namespace mutations
+    /// using the global VFS lock, same as other VFS calls. Current relocated
+    /// parents take precedence over wrapper parents. This protects resolved
+    /// directory ancestry, not symlink entries used to reach it. Mounted roots
+    /// contribute both their own identity and their host, continuing to the
+    /// global root. No counts change until the entire ancestry is validated and
+    /// allocated. Dropping the returned token releases protection without
+    /// taking this lock.
+    ///
+    /// # Arguments
+    ///
+    /// * `directory` - VFS-produced wrapper in this namespace. Trusted callers
+    ///   must not construct wrappers around independently loaded driver inodes.
+    ///
+    /// # Returns
+    ///
+    /// Returns an owned token, `NotFound` for detached ancestry, `ResourceBusy`
+    /// on counter exhaustion, or `InvalidPath` for ancestry outside this VFS.
+    pub fn protect_directory_path(
+        &mut self,
+        directory: Arc<Directory>,
+    ) -> Result<DirectoryPathGuard, FileSystemError> {
+        let mut protected_inodes: Vec<Arc<Inode>> = Vec::new();
+        let mut current = directory;
+
+        loop {
+            if current.inode.metadata.lock().link_count == 0 {
+                return Err(FileSystemError::NotFound);
+            }
+
+            if protected_inodes.iter().any(|inode| Arc::ptr_eq(inode,
+                &current.inode))
+            {
+                return Err(FileSystemError::InvalidPath);
+            }
+
+            if current.inode.directory_path_guards.load(
+                Ordering::Acquire) == usize::MAX
+            {
+                return Err(FileSystemError::ResourceBusy);
+            }
+
+            protected_inodes.push(Arc::clone(&current.inode));
+
+            if Arc::ptr_eq(&current.inode, &self.root.inode) {
+                break;
+            }
+
+            let key = OpenFileKey::new(current.inode.filesystem.instance_id(),
+                current.inode.inode_number);
+            current = if let Some(host) = self.mounted_root_index.get(&key) {
+                Arc::clone(&self.mounts.get(host).ok_or(
+                    FileSystemError::InvalidPath)?.host_directory)
+            } else if let Some(parent) = self.relocated_parents.get(&key) {
+                Arc::clone(parent)
+            } else {
+                current.parent().map_err(|_| FileSystemError::InvalidPath)?
+            };
+        }
+
+        for inode in &protected_inodes {
+            inode.directory_path_guards.fetch_add(1, Ordering::AcqRel);
+        }
+
+        Ok(DirectoryPathGuard { protected_inodes })
+    }
+
+    /// Reclaims zero-link inodes without registered handles or directory
+    /// wrappers.
+    ///
+    /// Call under VFS serialization after releasing retained references and
+    /// periodically for overwritten files/symlinks without open handles.
+    /// Unmount invokes this cleanup before teardown. Until success, backing
+    /// storage and inode identity stay allocated. Driver errors cannot undo
+    /// prior renames.
+    ///
+    /// Open displaced files use their pending-deletion master's final close.
+    /// Directory former-parent records persist until successful free; releasing
+    /// them can make another directory eligible, so passes repeat as needed.
+    /// No driver call runs under the inode-table lock.
+    ///
+    /// # Returns
+    ///
+    /// Returns the number reclaimed, or the first driver error. A failed inode
+    /// and its parent record remain available for retry. Earlier frees stay
+    /// committed and are not repeated on a subsequent call.
+    pub fn reclaim_unlinked_inodes(&mut self) -> Result<usize, FileSystemError>
+    {
+        let mut reclaimed = 0;
+
+        loop {
+            let candidates: Vec<(OpenFileKey, Arc<Inode>)> = self.inodes.lock()
+                .iter()
+                .filter(|(_, inode)| inode.metadata.lock().link_count == 0
+                    && inode.directory_wrappers.load(Ordering::Acquire) == 0
+                    && inode.directory_path_guards.load(Ordering::Acquire) == 0
+                    && !inode.names_are_protected())
+                .map(|(key, inode)| (*key, Arc::clone(inode)))
+                .collect();
+
+            let before = reclaimed;
+            for (key, inode) in candidates {
+                if self.open_files.get(&key).is_some() {
+                    continue;
+                }
+
+                inode.filesystem.free_inode(&inode)?;
+                self.forget_inode(&key);
+                self.relocated_parents.remove(&key);
+                reclaimed += 1;
+            }
+
+            if reclaimed == before {
+                return Ok(reclaimed);
+            }
         }
     }
 
@@ -314,7 +437,9 @@ impl VirtualFileSystem {
     ///
     /// Returns `Ok(())` on success, or `Err(FileSystemError)` if the path
     /// cannot be resolved, the driver is not found, the device cannot be
-    /// mounted, or the target is already a mount point.
+    /// mounted, or the target is already a mount point. A detached target
+    /// returns `NotFound`; a path-protected target returns `ResourceBusy`.
+    /// No driver mount is attempted for either rejection.
     pub fn mount(
         &mut self,
         driver_name: &'static str,
@@ -328,6 +453,14 @@ impl VirtualFileSystem {
             mount_path,
             working_directory,
         )?;
+
+        if host_dir.inode.metadata.lock().link_count == 0 {
+            return Err(FileSystemError::NotFound);
+        }
+
+        if host_dir.inode.directory_path_guards.load(Ordering::Acquire) != 0 {
+            return Err(FileSystemError::ResourceBusy);
+        }
 
         // Reject the mount if a filesystem is already mounted here.
         let host_key = OpenFileKey::new(host_dir.inode.filesystem.instance_id(),
@@ -397,7 +530,8 @@ impl VirtualFileSystem {
     ///
     /// The sequence of operations is:
     ///
-    /// 1. Resolve `mount_path` to a directory inode.
+    /// 1. Reclaim eligible unlinked inodes, then resolve `mount_path` to a
+    ///    directory inode. A free error leaves the mount attached for retry.
     /// 2. Verify a filesystem is currently mounted there.
     /// 3. Verify no open file handles exist on the mounted volume.
     /// 4. Sync dirty VFS inodes, then call
@@ -422,12 +556,19 @@ impl VirtualFileSystem {
     ///
     /// Returns `Ok(())` on success, or `Err(FileSystemError)` if the path
     /// cannot be resolved, the directory is not a mount point, open handles
-    /// remain on the volume, or an inode or driver flush fails.
+    /// remain on the volume, or an inode or driver flush fails. Path guards
+    /// inside the mount and retained detached directories return
+    /// `ResourceBusy`. Eligible unlinked inodes are reclaimed first; free
+    /// errors leave their records available for retry and do not detach the
+    /// mount.
     pub fn unmount(
         &mut self,
         mount_path: &str,
         working_directory: Option<Arc<Directory>>,
     ) -> Result<(), FileSystemError> {
+        // Retry eligible unlinked-inode frees before driver teardown.
+        self.reclaim_unlinked_inodes()?;
+
         // Resolve the path to the host directory inode.
         let host_dir = self.resolve_mount_host(
             mount_path,
@@ -453,6 +594,23 @@ impl VirtualFileSystem {
             mount_point.mounted_root.inode.inode_number,
         );
         let filesystem_id = mount_point.filesystem_id;
+
+        // Every guard inside this mount contributes to its root, including
+        // guards in descendant mounts. Reject before syncing or driver teardown.
+        if mount_point.mounted_root.inode.directory_path_guards.load(
+            Ordering::Acquire) != 0
+        {
+            return Err(FileSystemError::ResourceBusy);
+        }
+
+        if self.inodes.lock().iter().any(
+            |(key, inode)| key.filesystem_id == filesystem_id
+            && inode.is_directory() && inode.metadata.lock().link_count == 0)
+        {
+            // Detached directories must be reclaimed explicitly before unmount;
+            // otherwise retained wrappers could outlive backing storage.
+            return Err(FileSystemError::ResourceBusy);
+        }
 
         // Reject the unmount if any open file handles exist on this volume.
         // We check the open-file table for any key whose filesystem_id matches.

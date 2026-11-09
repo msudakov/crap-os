@@ -73,6 +73,10 @@ pub enum FileSystemError {
     /// A path component that was expected to be a directory is not one.
     NotADirectory,
 
+    /// A directory was supplied where a non-directory destination is required
+    /// (e.g., renaming a regular file or symlink over a directory).
+    IsADirectory,
+
     /// A path component that was expected to be a file is not one (e.g.,
     /// attempting to `read` a directory inode directly).
     NotAFile,
@@ -94,6 +98,10 @@ pub enum FileSystemError {
     /// A directory that was expected to be empty (e.g., for removal) still
     /// contains entries.
     DirectoryNotEmpty,
+
+    /// A namespace object is protected, is an active mount point, or is the
+    /// global root. Retry after its holders release protection where possible.
+    ResourceBusy,
 
     /// Symlink resolution exceeded
     /// [`crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH`] hops,
@@ -238,6 +246,74 @@ impl AccessMode {
     /// [`AccessMode::ReadWrite`]; `false` for [`AccessMode::ReadOnly`].
     pub fn can_write(self) -> bool {
         matches!(self, AccessMode::WriteOnly | AccessMode::ReadWrite)
+    }
+}
+
+/// Optional namespace restrictions contributed by one registered open handle.
+///
+/// Ordinary opens request `NONE`. These options do not affect reads, writes,
+/// timestamps, or write locks. Prefer `PROTECT_FULL` for namespace stability;
+/// the individual options intentionally provide narrower guarantees.
+///
+/// Separate opens contribute independently. Any contribution blocks conflicting
+/// mutations, including requests by its holder. An unprotected open cannot
+/// override another handle's protection. Closing a handle releases only its own
+/// contributions; cloning its Arc does not acquire another contribution.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct NamespaceProtection(u8);
+
+impl NamespaceProtection {
+    /// Contributes no namespace restrictions.
+    pub const NONE: Self = Self(0);
+
+    /// Rejects unlink, rename, direct move, and replacement of every entry
+    /// naming the opened inode. Additional hard links remain permitted and
+    /// immediately share this protection. Ancestors remain independently
+    /// mutable.
+    pub const PROTECT_NAMES: Self = Self(1);
+
+    /// Protects the resolved file's parent and captured ancestors through root,
+    /// including mount hosts. Symlink entries used to reach the target are not
+    /// protected. This option alone allows changing the file's own names. If
+    /// it moves, the captured protection does not follow it to new ancestors.
+    pub const PROTECT_ANCESTORS: Self = Self(2);
+
+    /// Combines name and ancestor protection. All hard-link names are
+    /// protected, but only the ancestor chain selected by this open is
+    /// captured, not the ancestor chains of every alias. Prefer this
+    /// combination when requesting protection unless the narrower behavior is
+    /// specifically required.
+    pub const PROTECT_FULL: Self =
+        Self(Self::PROTECT_NAMES.0 | Self::PROTECT_ANCESTORS.0);
+
+    /// Checks whether all requested restrictions are present.
+    ///
+    /// # Arguments
+    ///
+    /// * `requested` - Individual restriction or combination to inspect.
+    ///
+    /// # Returns
+    ///
+    /// Returns `true` if every requested bit is present. `NONE` always matches.
+    pub const fn contains(self, requested: Self) -> bool {
+        self.0 & requested.0 == requested.0
+    }
+}
+
+impl core::ops::BitOr for NamespaceProtection {
+    type Output = Self;
+
+    /// Combines two sets of namespace restrictions without modifying them.
+    ///
+    /// # Arguments
+    ///
+    /// * `rhs` - Additional restrictions to include (right-hand-side of `OR`).
+    ///
+    /// # Returns
+    ///
+    /// Returns the union of both sets.
+    fn bitor(self, rhs: Self) -> Self {
+        Self(self.0 | rhs.0)
     }
 }
 
@@ -415,8 +491,9 @@ pub struct InodeStat {
     /// The number of directory entries that reference this inode.
     ///
     /// For regular files and directories this starts at `1` on creation.
-    /// When it reaches `0` and no open handles remain, the inode and its
-    /// data blocks are freed by the filesystem driver.
+    /// At `0`, files survive until their last registered handle closes.
+    /// Directories also survive retained directory wrappers and await explicit
+    /// VFS reclamation. The filesystem driver frees storage only afterward.
     pub link_count: u32,
 }
 

@@ -235,10 +235,11 @@ impl VirtualFileSystem {
     /// wrappers.
     ///
     /// Call under VFS serialization after releasing retained references and
-    /// periodically for overwritten files/symlinks without open handles.
-    /// Unmount invokes this cleanup before teardown. Until success, backing
-    /// storage and inode identity stay allocated. Driver errors cannot undo
-    /// prior renames.
+    /// periodically for overwritten files/symlinks without open handles and
+    /// unlinked files/symlinks whose eager reclamation failed. Unmount invokes
+    /// this cleanup before teardown. Until success, backing storage and inode
+    /// identity stay allocated. Driver errors cannot undo committed namespace
+    /// changes.
     ///
     /// Open displaced files use their pending-deletion master's final close.
     /// Directory former-parent records persist until successful free; releasing

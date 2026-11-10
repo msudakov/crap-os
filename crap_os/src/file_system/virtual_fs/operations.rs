@@ -747,9 +747,15 @@ impl VirtualFileSystem {
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` after removal, or a pathname, type, or driver error.
-    /// File reclamation retains the existing final-close behavior. Immediate
-    /// file-free failures can still be reported after unlink has committed.
+    /// Returns `Ok(())` after removing the name. A returned error leaves the
+    /// name and backing link count unchanged.
+    ///
+    /// After the last link is removed, storage is reclaimed eagerly when no
+    /// open-file master remains. Failed reclamation retains the zero-link
+    /// inode for retry through
+    /// [`super::vfs::VirtualFileSystem::reclaim_unlinked_inodes`].
+    /// Unlink still succeeds because the name has already been removed.
+    /// Open files retain the existing final-close reclamation behavior.
     pub fn unlink(
         &mut self,
         path: &str,
@@ -805,8 +811,9 @@ impl VirtualFileSystem {
     ///
     /// # Returns
     ///
-    /// Returns success after detachment or the applicable validation or driver
-    /// error. File free errors may occur after the namespace commit.
+    /// Returns success after detachment, or a validation or driver unlink
+    /// error before detachment. Failed eager reclamation retains the inode
+    /// for explicit cleanup and does not change the successful result.
     fn remove_directory_entry(
         &mut self,
         path: &str,
@@ -913,9 +920,12 @@ impl VirtualFileSystem {
                 // The master retains the unlinked inode until the last close.
                 master.mark_pending_deletion();
             } else {
-                // No open handles - free immediately.
-                target_inode.filesystem.free_inode(&target_inode)?;
-                self.forget_inode(&target_key);
+                // Namespace removal has committed. Forget the inode only
+                // after successful reclamation so a failed free remains
+                // available to reclaim_unlinked_inodes.
+                if target_inode.filesystem.free_inode(&target_inode).is_ok() {
+                    self.forget_inode(&target_key);
+                }
             }
         }
 

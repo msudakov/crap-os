@@ -25,7 +25,8 @@
 //! 9. **Create directory** - creates a new directory and verifies it exists.
 //! 10. **Create symlink** - creates a new symlink and verifies traversal.
 //! 11. **Rename** - verifies in-place, relative, and cross-directory renames.
-//! 12. **Unlink** - removes a file name and verifies it is gone.
+//! 12. **Unlink** - removes a file name and verifies it is gone, and checks
+//!     successful removal after eager reclamation failure with cleanup retry.
 //! 13. **POSIX deferred unlink** - checks two independent opens, lookup through
 //!     a retained wrapper after unlink, final-close reclamation, and deletion
 //!     relative to a working directory.
@@ -92,6 +93,7 @@ pub fn run_vfs_tests() {
     test_create_symlink();
     test_rename();
     test_unlink();
+    test_unlink_reclamation_retry();
     test_posix_deferred_unlink();
     test_retained_directory_namespace();
     test_mount_wrapper_consistency();
@@ -978,6 +980,85 @@ fn test_unlink() {
     );
 
     sprintln!("[VFS TEST] unlink ... PASS");
+}
+
+/// Checks successful unlink after failed eager reclamation and cleanup retry.
+///
+/// Each isolated fixture has no registered open handles. A targeted one-shot
+/// free failure must be consumed during unlink, leaving the removed inode
+/// available for explicit cleanup. Both regular files and dangling symlinks
+/// exercise the non-directory reclamation path.
+///
+/// # Panics
+///
+/// Panics if unlink reports the reclamation error, preserves the name, loses
+/// the retryable inode, skips eager reclamation, or repeats a completed free.
+fn test_unlink_reclamation_retry() {
+    sprintln!("[VFS TEST] unlink reclamation retry ...");
+
+    for symlink in [false, true] {
+        let mut vfs = new_stub_vfs();
+        let path = "/etc/unlink-retry";
+        let inode = if symlink {
+            expect_ok(
+                vfs.create_symlink(path, "/missing-unlink-target", None),
+                "create unlink retry symlink",
+            )
+        } else {
+            expect_ok(
+                vfs.create_file(path, Permissions::all_permissive(), None),
+                "create unlink retry file",
+            )
+        };
+
+        assert_eq!(inode.stat().link_count, 1);
+        super::fail_next_free_for(
+            inode.filesystem.instance_id(),
+            inode.inode_number,
+        );
+
+        expect_ok(
+            vfs.unlink(path, None),
+            "unlink succeeds despite eager free failure",
+        );
+        expect_err(
+            vfs.stat(path, None, false),
+            FileSystemError::NotFound,
+            "failed eager free leaves name removed",
+        );
+        assert_eq!(inode.stat().link_count, 0);
+
+        let backing = expect_ok(
+            inode.filesystem.load_inode(inode.inode_number),
+            "failed eager free preserves backing inode",
+        );
+        assert_eq!(backing.stat().link_count, 0);
+        drop(backing);
+
+        // This must succeed on the first cleanup call. An implementation
+        // that skipped eager free would still have the failure armed.
+        assert_eq!(
+            expect_ok(
+                vfs.reclaim_unlinked_inodes(),
+                "retry failed eager reclamation",
+            ),
+            1,
+        );
+        expect_err(
+            inode.filesystem.load_inode(inode.inode_number),
+            FileSystemError::NotFound,
+            "cleanup retry frees backing inode",
+        );
+        assert_eq!(
+            expect_ok(
+                vfs.reclaim_unlinked_inodes(),
+                "cleanup after successful retry",
+            ),
+            0,
+        );
+    }
+
+    sprintln!("[VFS TEST] unlink reclamation retry ... PASS");
 }
 
 /// Verifies that unlink preserves data for independent open handles, rejects

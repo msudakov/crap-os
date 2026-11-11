@@ -49,10 +49,9 @@
 //!   in both directions.
 //!
 //! - [`operations`] - the file operation methods on [`vfs::VirtualFileSystem`]:
-//!   `open`, `read`, `write`, `close`, `seek`, `stat`, `create_file`,
-//!   `create_directory`, `create_symlink`, `create_hard_link`, `unlink`,
-//!   `remove_directory`, and
-//!   `rename`.
+//!   `open`, `open_or_create`, `read`, `write`, `close`, `seek`, `stat`,
+//!   `create_file`, `create_directory`, `create_symlink`, `create_hard_link`,
+//!   `unlink`, `remove_directory`, and `rename`.
 //!
 //! ## Dependency Order
 //!

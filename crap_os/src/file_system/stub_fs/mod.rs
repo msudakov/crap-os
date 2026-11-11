@@ -4,9 +4,10 @@
 //! development to exercise the VFS layer before a real on-disk filesystem is
 //! available. It implements [`FileSystemDriver`] and [`FileSystemInstance`]
 //! with a hardcoded directory tree and no disk interaction.
-//! The VFS test harness can inject one-shot unmount, inode-free, and staged
-//! rename errors to check retry behavior without changing backing state on
-//! failure. Namespace protection is enforced by the VFS, not this driver.
+//! The VFS test harness can inject one-shot unmount, inode-free, staged
+//! creation, and staged rename errors to check retry behavior without changing
+//! backing state on failure. Namespace protection is enforced by the VFS, not
+//! this driver.
 //!
 //! ## Hardcoded Tree
 //!
@@ -116,6 +117,20 @@ fn fail_next_unmount_for(instance_id: u64) {
 /// Untargeted frees leave the request armed, so independent mounts cannot
 /// accidentally consume another test's failure.
 static FAIL_FREE_ONCE_FOR: SpinLock<Option<(u64, u64)>> = SpinLock::new(None);
+
+/// One-shot regular-file creation failure after validation and before commit.
+static FAIL_CREATE_ONCE_FOR: SpinLock<Option<u64>> = SpinLock::new(None);
+
+/// Arms a staged regular-file creation failure for one stub instance.
+///
+/// The serial boot harness must consume the request before its fixture ends.
+///
+/// # Arguments
+///
+/// * `instance_id` - Mounted instance whose next valid creation fails.
+fn fail_next_create_for(instance_id: u64) {
+    *FAIL_CREATE_ONCE_FOR.lock() = Some(instance_id);
+}
 
 /// Arms a single backing-storage free failure without modifying the target.
 ///
@@ -642,34 +657,42 @@ impl FileSystemInstance for StubFsInstance {
         _permissions: Permissions,
         _timestamps: Timestamps,
     ) -> Result<Arc<Inode>, FileSystemError> {
-        let new_ino = {
-            let mut counter = self.next_inode.lock();
-            let n = *counter;
-            *counter += 1;
-            n
-        };
+        let mut inodes = self.inodes.lock();
+        let parent_idx = Self::find_inode_index(&inodes, parent.inode_number)?;
+        if inodes[parent_idx].children.iter().any(|(n, _, _)| n == name) {
+            return Err(FileSystemError::AlreadyExists);
+        }
+
+        let mut counter = self.next_inode.lock();
+        let new_ino = *counter;
+        let next_ino = new_ino.checked_add(1)
+            .ok_or(FileSystemError::OutOfInodes)?;
+        let backing = StubInode::new_file(new_ino, 0);
+        let inode = Self::make_vfs_inode(
+            &backing, Arc::clone(&parent.filesystem),
+        );
+        let entry_name = name.to_string();
 
         {
-            let mut inodes = self.inodes.lock();
-            // Reject if name already exists in parent.
-            let parent_idx = Self::find_inode_index(&inodes, parent.inode_number)?;
-            if inodes[parent_idx].children.iter().any(|(n, _, _)| n == name) {
-                return Err(FileSystemError::AlreadyExists);
+            let mut fail_for = FAIL_CREATE_ONCE_FOR.lock();
+            if *fail_for == Some(self.id) {
+                *fail_for = None;
+                return Err(FileSystemError::DiskWriteError);
             }
-            inodes[parent_idx].children.push((
-                name.to_string(),
-                new_ino,
-                DirectoryEntryType::File,
-            ));
-            inodes.push(StubInode::new_file(new_ino, 0));
         }
 
-        {
-            let mut file_data = self.file_data.lock();
-            file_data.push((new_ino, Vec::new()));
-        }
+        // All returned-error checks precede publication. Allocation failure
+        // follows the kernel allocator contract.
+        inodes[parent_idx].children.push((
+            entry_name, new_ino, DirectoryEntryType::File,
+        ));
+        inodes.push(backing);
+        *counter = next_ino;
+        drop(counter);
+        drop(inodes);
+        self.file_data.lock().push((new_ino, Vec::new()));
 
-        self.load_inode(new_ino)
+        Ok(inode)
     }
 
     fn create_directory(

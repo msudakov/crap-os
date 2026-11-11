@@ -452,7 +452,10 @@ pub trait FileSystemInstance: Send + Sync {
     /// The driver allocates a new inode of type
     /// [`super::types::InodeType::File`], creates a backing record with the
     /// supplied metadata, and adds a directory entry for `name` in `parent`.
-    /// The new inode's link count starts at `1`.
+    /// The new inode's link count starts at `1`. A returned error must leave
+    /// the parent entry absent and release any staged storage. On success, the
+    /// returned inode is ready for immediate VFS retention and handle
+    /// registration without another driver lookup.
     ///
     /// # Arguments
     ///

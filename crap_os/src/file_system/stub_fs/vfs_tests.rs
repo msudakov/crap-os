@@ -44,17 +44,21 @@
 //!     protection retention across a failed final close.
 //! 21. **Replacement rename** - checks displaced lifetimes, compatible types,
 //!     pathname and protection rules, pre-commit failure, and cleanup retry.
-//! 22. **Teardown** - releases the global VFS owner after the tests.
+//! 22. **Create-and-open** - checks existing and new files, final symlinks,
+//!     shared traversal limits, and creation and registration failures.
+//! 23. **Teardown** - releases the global VFS owner after the tests.
 
 extern crate alloc;
 
 use alloc::sync::Arc;
+use alloc::format;
 
 use crate::file_system::stub_fs::stub_block_device::StubBlockDevice;
 use crate::file_system::stub_fs::StubFileSystemDriver;
 use crate::file_system::virtual_fs::directory::Directory;
 use crate::file_system::virtual_fs::types::{
-    AccessMode, FileSystemError, InodeType, Permissions, NamespaceProtection,
+    AccessMode, CreateMode, FileSystemError, InodeType, Permissions,
+    NamespaceProtection,
 };
 use crate::file_system::virtual_fs::vfs::VirtualFileSystem;
 use crate::file_system::virtual_fs::file::FileHandle;
@@ -110,6 +114,9 @@ pub fn run_vfs_tests() {
     test_replacement_rejections();
     test_replacement_failure_atomicity();
     test_replacement_reclamation();
+    test_open_or_create_basic();
+    test_open_or_create_symlinks();
+    test_open_or_create_failures();
     expect_ok(with_vfs(|vfs| vfs.reclaim_unlinked_inodes()), "final unlinked inode cleanup");
     teardown_vfs();
 
@@ -2679,4 +2686,206 @@ fn test_replacement_reclamation() {
     expect_ok(vfs.unmount("/bin/tools", None), "retry unmount reclaims displaced inode");
     expect_err(victim.filesystem.load_inode(victim.inode_number), FileSystemError::NotFound, "unmount freed displaced storage");
     sprintln!("[VFS TEST] replacement reclamation ... PASS");
+}
+
+/// Checks both create-and-open modes on new and existing regular files.
+///
+/// A second ordinary open must retain the created file's contents and
+/// canonical identity. Exclusive creation rejects every occupied final name
+/// without changing the existing file or directory.
+///
+/// # Panics
+///
+/// Panics if registration, content preservation, identity, or exclusivity
+/// differs from the stated contract.
+fn test_open_or_create_basic() {
+    sprintln!("[VFS TEST] create-and-open basic ...");
+    let mut vfs = new_stub_vfs();
+    let path = "/etc/opened-on-create";
+    let created = expect_ok(vfs.open_or_create(
+        path, AccessMode::ReadWrite, CreateMode::IfMissing,
+        Permissions::all_permissive(), None,
+    ), "create and open missing file");
+    assert_eq!(expect_ok(vfs.write(&created, b"keep"), "write created file"), 4);
+    expect_ok(vfs.close(&created), "close created file");
+
+    let reopened = expect_ok(vfs.open_or_create(
+        path, AccessMode::ReadOnly, CreateMode::IfMissing,
+        Permissions::all_permissive(), None,
+    ), "ordinary create-and-open existing file");
+    assert!(Arc::ptr_eq(&created.file.inode, &reopened.file.inode));
+    let mut contents = [0u8; 4];
+    assert_eq!(expect_ok(vfs.read(&reopened, &mut contents),
+        "read existing contents"), 4);
+    assert_eq!(&contents, b"keep");
+    expect_err(vfs.open_or_create(
+        path, AccessMode::ReadWrite, CreateMode::Exclusive,
+        Permissions::all_permissive(), None,
+    ), FileSystemError::AlreadyExists, "exclusive existing file");
+    expect_err(vfs.open_or_create(
+        "/etc", AccessMode::ReadWrite, CreateMode::Exclusive,
+        Permissions::all_permissive(), None,
+    ), FileSystemError::AlreadyExists, "exclusive existing directory");
+    expect_ok(vfs.close(&reopened), "close reopened file");
+
+    let exclusive = expect_ok(vfs.open_or_create(
+        "/etc/exclusive-new", AccessMode::ReadWrite,
+        CreateMode::Exclusive, Permissions::all_permissive(), None,
+    ), "exclusive create missing file");
+    let ordinary = expect_ok(vfs.open("/etc/exclusive-new",
+        AccessMode::ReadOnly, None), "ordinary open of exclusive creation");
+    assert!(Arc::ptr_eq(&exclusive.file.inode, &ordinary.file.inode));
+    expect_ok(vfs.close(&ordinary), "close ordinary open");
+    expect_ok(vfs.close(&exclusive), "close exclusive creation");
+    sprintln!("[VFS TEST] create-and-open basic ... PASS");
+}
+
+/// Checks final-symlink creation and one shared traversal budget.
+///
+/// Relative and absolute dangling targets are created in their resolved
+/// directories. A parent symlink and sixteen final symlinks together exceed
+/// the same budget that permits the sixteen final links alone.
+///
+/// # Panics
+///
+/// Panics if symlink creation targets, exclusive rejection, loop handling,
+/// parent resolution, or budget accounting differ from the contract.
+fn test_open_or_create_symlinks() {
+    sprintln!("[VFS TEST] create-and-open symlinks ...");
+    let mut vfs = new_stub_vfs();
+    expect_ok(vfs.create_symlink("/etc/absolute-link", "/var/created-absolute", None),
+        "absolute dangling symlink");
+    expect_err(vfs.open_or_create(
+        "/etc/absolute-link", AccessMode::ReadWrite,
+        CreateMode::Exclusive, Permissions::all_permissive(), None,
+    ), FileSystemError::AlreadyExists, "exclusive dangling symlink");
+    expect_err(vfs.stat("/var/created-absolute", None, false),
+        FileSystemError::NotFound, "exclusive did not create target");
+    let absolute = expect_ok(vfs.open_or_create(
+        "/etc/absolute-link", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), "create through absolute symlink");
+    let target = expect_ok(vfs.resolve("/var/created-absolute", None, false),
+        "resolve created absolute target");
+    assert!(Arc::ptr_eq(&absolute.file.inode, &target));
+    expect_ok(vfs.close(&absolute), "close absolute target");
+    let live = expect_ok(vfs.open_or_create(
+        "/etc/absolute-link", AccessMode::ReadOnly,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), "ordinary creation opens existing symlink target");
+    assert!(Arc::ptr_eq(&live.file.inode, &target));
+    expect_ok(vfs.close(&live), "close live symlink target");
+
+    expect_ok(vfs.create_symlink("/etc/relative-link", "../var/created-relative", None),
+        "relative dangling symlink");
+    expect_ok(vfs.create_symlink("/etc/chain-link", "relative-link", None),
+        "chained symlink");
+    let relative = expect_ok(vfs.open_or_create(
+        "/etc/chain-link", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), "create through chained relative symlinks");
+    assert!(Arc::ptr_eq(&relative.file.inode,
+        &expect_ok(vfs.resolve("/var/created-relative", None, false),
+            "resolve created relative target")));
+    expect_ok(vfs.close(&relative), "close relative target");
+    expect_err(vfs.open_or_create(
+        "/etc/relative-link", AccessMode::ReadOnly,
+        CreateMode::Exclusive, Permissions::all_permissive(), None,
+    ), FileSystemError::AlreadyExists, "exclusive live symlink");
+
+    expect_err(vfs.open_or_create(
+        "/missing-parent/file", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), FileSystemError::NotFound, "missing parent remains absent");
+    expect_err(vfs.open_or_create(
+        "/etc/config.txt/child", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), FileSystemError::NotADirectory, "non-directory parent rejected");
+    expect_err(vfs.open_or_create(
+        "/etc/trailing/", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), FileSystemError::NotADirectory, "trailing slash rejects file creation");
+
+    for index in 0..16 {
+        let link = format!("/etc/budget-{}", index);
+        let next = if index == 15 {
+            "/etc/budget-file".into()
+        } else {
+            format!("/etc/budget-{}", index + 1)
+        };
+        expect_ok(vfs.create_symlink(&link, &next, None),
+            "create symlink budget chain");
+    }
+    let budget_file = expect_ok(vfs.open_or_create(
+        "/etc/budget-0", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), "sixteen final symlinks fit budget");
+    expect_ok(vfs.close(&budget_file), "close budget chain target");
+    expect_ok(vfs.create_symlink("/etc/parent-alias", "/etc", None),
+        "symlink in parent path");
+    expect_err(vfs.open_or_create(
+        "/etc/parent-alias/budget-0", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), FileSystemError::TooManySymlinks,
+        "parent and final symlinks share budget");
+    expect_ok(vfs.create_symlink("/etc/loop-a", "/etc/loop-b", None),
+        "first loop link");
+    expect_ok(vfs.create_symlink("/etc/loop-b", "/etc/loop-a", None),
+        "second loop link");
+    expect_err(vfs.open_or_create(
+        "/etc/loop-a", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), FileSystemError::TooManySymlinks, "symlink loop is bounded");
+
+    expect_ok(vfs.mount("stubfs", Arc::new(StubBlockDevice),
+        "/bin/tools", None), "mount create-and-open target");
+    expect_ok(vfs.create_symlink("/etc/mounted-link",
+        "/bin/tools/etc/mounted-created", None),
+        "link to mounted destination");
+    let mounted = expect_ok(vfs.open_or_create(
+        "/etc/mounted-link", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), "create through link into mounted instance");
+    let mounted_target = expect_ok(vfs.resolve(
+        "/bin/tools/etc/mounted-created", None, false,
+    ), "resolve mounted created target");
+    assert!(Arc::ptr_eq(&mounted.file.inode, &mounted_target));
+    expect_ok(vfs.close(&mounted), "close mounted target");
+    expect_ok(vfs.unmount("/bin/tools", None), "unmount create-and-open target");
+    sprintln!("[VFS TEST] create-and-open symlinks ... PASS");
+}
+
+/// Checks pre-commit creation errors and successful retry.
+///
+/// A staged driver failure leaves both the directory entry and the next
+/// inode slot untouched, allowing a retry to use that same slot.
+///
+/// # Panics
+///
+/// Panics if a failed create publishes a name or inode, advances the slot,
+/// or prevents a successful retry.
+fn test_open_or_create_failures() {
+    sprintln!("[VFS TEST] create-and-open failures ...");
+    let mut vfs = new_stub_vfs();
+    let baseline = expect_ok(vfs.create_file(
+        "/etc/create-baseline", Permissions::all_permissive(), None,
+    ), "create failure baseline");
+    let next_inode_number = baseline.inode_number + 1;
+    super::fail_next_create_for(baseline.filesystem.instance_id());
+    expect_err(vfs.open_or_create(
+        "/etc/create-retry", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), FileSystemError::DiskWriteError, "staged creation failure");
+    expect_err(vfs.resolve("/etc/create-retry", None, false),
+        FileSystemError::NotFound, "failed create left name absent");
+    expect_err(baseline.filesystem.load_inode(next_inode_number),
+        FileSystemError::NotFound, "failed create left backing inode absent");
+    let retry = expect_ok(vfs.open_or_create(
+        "/etc/create-retry", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), "retry creation");
+    assert_eq!(retry.file.inode.inode_number, next_inode_number);
+    expect_ok(vfs.close(&retry), "close retry creation");
+
+    sprintln!("[VFS TEST] create-and-open failures ... PASS");
 }

@@ -183,7 +183,8 @@ impl VirtualFileSystem {
 
         // Walk the path again to obtain the Directory wrapper for the terminal
         // component. A separate wrapper may represent the same inode.
-        self.walk_to_directory(path, working_directory, symlink_budget)
+        let mut remaining_budget = symlink_budget;
+        self.walk_to_directory(path, working_directory, &mut remaining_budget)
     }
 
     /// Resolves a path and discards its final regular-file parent context.
@@ -502,12 +503,11 @@ impl VirtualFileSystem {
     /// Walks `path` through the directory tree and returns the
     /// [`Directory`] wrapper for the terminal component.
     ///
-    /// This internal helper is used by
-    /// [`VirtualFileSystem::resolve_dir_with_budget`] to obtain the
-    /// [`Directory`] wrapper when the caller needs it (e.g., for mount
-    /// and unmount operations that need the host's identity). It duplicates
-    /// part of the resolver's walking logic but returns the wrapper instead
-    /// of the inode.
+    /// [`VirtualFileSystem::resolve_dir_with_budget`] uses this helper to
+    /// obtain a [`Directory`] wrapper for mount and working-directory paths.
+    /// Create-and-open uses it to resolve a parent while retaining the
+    /// remaining symlink allowance for a possible final link. It duplicates
+    /// part of the inode resolver's walk but returns the wrapper.
     ///
     /// # Arguments
     ///
@@ -515,18 +515,19 @@ impl VirtualFileSystem {
     ///   directory.
     /// * `working_directory` - The starting directory for relative paths.
     ///   `None` means use the global root.
-    /// * `symlink_budget`    - The remaining symlink follow budget.
+    /// * `symlink_budget`    - Shared remaining symlink allowance, updated
+    ///   for every link followed during this traversal.
     ///
     /// # Returns
     ///
     /// Returns `Ok(Arc<Directory>)` for the directory at the end of `path`,
     /// or `Err(FileSystemError)` if resolution fails or the terminal component
     /// is not a directory.
-    fn walk_to_directory(
+    pub(super) fn walk_to_directory(
         &self,
         path: &str,
         working_directory: Option<Arc<Directory>>,
-        symlink_budget: u8,
+        symlink_budget: &mut u8,
     ) -> Result<Arc<Directory>, FileSystemError> {
         if path.is_empty() {
             return Err(FileSystemError::InvalidPath);
@@ -648,10 +649,10 @@ impl VirtualFileSystem {
                 }
 
                 DirectoryEntryType::Symlink => {
-                    if symlink_budget == 0 {
+                    if *symlink_budget == 0 {
                         return Err(FileSystemError::TooManySymlinks);
                     }
-                    let remaining_budget = symlink_budget - 1;
+                    *symlink_budget -= 1;
 
                     let symlink_inode = self.get_or_load_inode(
                         &current.inode.filesystem, inode_number,
@@ -677,7 +678,7 @@ impl VirtualFileSystem {
                     return self.walk_to_directory(
                         &effective_path,
                         symlink_base,
-                        remaining_budget,
+                        symlink_budget,
                     );
                 }
             }

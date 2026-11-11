@@ -19,6 +19,7 @@
 //!                              `InodeType` at the entry level.
 //!   - [`AccessMode`]         : Describes the access rights requested when
 //!                              opening a file handle.
+//!   - [`CreateMode`]         : Selects ordinary or exclusive create-and-open.
 //!   - [`FileLockState`]      : Tracks the current write-lock state of an open
 //!                              file's master record.
 //!   - [`Timestamps`]         : Wall-clock timestamps recorded on every inode.
@@ -225,6 +226,18 @@ pub enum AccessMode {
 
     /// The handle may be used for both read and write operations.
     ReadWrite,
+}
+
+/// Selects how create-and-open treats an occupied final pathname component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateMode {
+    /// Follow final symlinks and open an existing file, or create the missing
+    /// final target as a regular file.
+    IfMissing,
+
+    /// Require a new final directory entry. Any occupied name, including a
+    /// symlink, returns [`FileSystemError::AlreadyExists`].
+    Exclusive,
 }
 
 impl AccessMode {

@@ -32,8 +32,9 @@
 //!
 //! The open-file table in [`super::vfs::VirtualFileSystem`] holds one
 //! [`super::file::File`] master record per inode that has at least one open
-//! handle. [`super::vfs::VirtualFileSystem::open`] inserts a master record on
-//! the first open and registers every returned handle with its record.
+//! handle. [`super::vfs::VirtualFileSystem::open`] and
+//! [`super::vfs::VirtualFileSystem::open_or_create`] insert a master record on
+//! the first open and register every returned handle with its record.
 //! [`super::vfs::VirtualFileSystem::close`] unregisters the exact handle and
 //! removes the master record when no registrations remain, reclaiming the
 //! inode first if the master is pending deletion.
@@ -41,14 +42,15 @@
 #![allow(dead_code)]
 
 use alloc::sync::Arc;
+use alloc::string::ToString;
 use core::sync::atomic::Ordering;
 
 use super::directory::Directory;
 use super::file::{File, FileHandle, OpenNamespaceProtection};
 use super::inode::Inode;
 use super::types::{
-    AccessMode, FileSystemError, InodeStat, OpenFileKey,
-    Permissions, Timestamps, NamespaceProtection,
+    AccessMode, CreateMode, DirectoryEntryType, FileSystemError, InodeStat,
+    OpenFileKey, Permissions, Timestamps, NamespaceProtection,
 };
 use super::vfs::VirtualFileSystem;
 use crate::globals;
@@ -134,8 +136,7 @@ impl VirtualFileSystem {
 
         // Validate ID availability before acquiring tokens. Commit advancement
         // only when this open is ready to register.
-        let handle_id = self.next_handle_id;
-        let next_handle_id = handle_id.checked_add(1)
+        let next_handle_id = self.next_handle_id.checked_add(1)
             .ok_or(FileSystemError::InternalError)?;
         let ancestor_guard = if protection.contains(
             NamespaceProtection::PROTECT_ANCESTORS)
@@ -161,19 +162,183 @@ impl VirtualFileSystem {
             flags: protection, name_guard, ancestor_guard,
         };
 
+        Ok(self.register_open_handle(
+            inode, access_mode, namespace_protection, next_handle_id,
+        ))
+    }
+
+    /// Opens a regular file, creating its final target when absent.
+    ///
+    /// The caller holds global VFS serialization through traversal, creation,
+    /// and handle registration. Parent symlinks and followed final symlinks
+    /// consume one shared traversal budget. Existing contents are preserved.
+    /// Creation permissions apply only when a new file is created. The handle
+    /// contributes no namespace protection and must be closed through the VFS.
+    ///
+    /// # Arguments
+    ///
+    /// * `path`              - Absolute or relative file path. Trailing
+    ///   separators are rejected, including in a followed symlink target.
+    /// * `access_mode`       - Content access rights for the returned handle.
+    /// * `create_mode`       - Whether an existing final name is permitted.
+    /// * `permissions`       - Initial permissions if a file is created.
+    /// * `working_directory` - Relative-path base, or root when absent.
+    ///
+    /// # Returns
+    ///
+    /// Returns a registered handle. Exclusive creation returns
+    /// `AlreadyExists` for any occupied final name. Other errors include
+    /// pathname, type, symlink-budget, handle-ID, and driver errors. A
+    /// returned error publishes neither a new name nor a handle. Allocation
+    /// failure follows the kernel allocator contract.
+    pub fn open_or_create(
+        &mut self,
+        path: &str,
+        access_mode: AccessMode,
+        create_mode: CreateMode,
+        permissions: Permissions,
+        working_directory: Option<Arc<Directory>>,
+    ) -> Result<Arc<FileHandle>, FileSystemError> {
+        // No driver creation may precede this recoverable registration check.
+        let next_handle_id = self.next_handle_id.checked_add(1)
+            .ok_or(FileSystemError::InternalError)?;
+        let mut target_path = path.to_string();
+        let mut base = working_directory;
+        let mut symlink_budget = super::resolver::MAX_SYMLINK_DEPTH;
+
+        loop {
+            let (parent_path, name) = split_parent_and_name(&target_path)?;
+
+            if target_path.ends_with('/') {
+                return Err(FileSystemError::NotADirectory);
+            }
+
+            // The directory walker reports the budget left after following
+            // intermediate links. The next final link consumes that same
+            // budget instead of starting another independent traversal.
+            let parent = self.walk_to_directory(
+                parent_path, base.take(), &mut symlink_budget,
+            )?;
+
+            if name == "." || name == ".." {
+                return Err(if create_mode == CreateMode::Exclusive {
+                    FileSystemError::AlreadyExists
+                } else {
+                    FileSystemError::NotAFile
+                });
+            }
+
+            let inode = match parent.lookup_child(name)? {
+                Some(entry) => {
+                    if create_mode == CreateMode::Exclusive {
+                        return Err(FileSystemError::AlreadyExists);
+                    }
+
+                    if entry.entry_type == DirectoryEntryType::Symlink {
+                        if symlink_budget == 0 {
+                            return Err(FileSystemError::TooManySymlinks);
+                        }
+                        symlink_budget -= 1;
+
+                        let link = self.get_or_load_inode(
+                            &parent.inode.filesystem, entry.inode_number,
+                        )?;
+                        target_path = link.filesystem.read_symlink(&link)?;
+                        // Absolute targets ignore this base in the next walk.
+                        // Relative targets start in the link's parent.
+                        base = Some(parent);
+                        continue;
+                    }
+
+                    if entry.entry_type != DirectoryEntryType::File {
+                        return Err(FileSystemError::NotAFile);
+                    }
+
+                    let inode = self.get_or_load_inode(
+                        &parent.inode.filesystem, entry.inode_number,
+                    )?;
+
+                    if !inode.is_file() {
+                        return Err(FileSystemError::NotAFile);
+                    }
+
+                    let key = OpenFileKey::new(
+                        inode.filesystem.instance_id(), inode.inode_number,
+                    );
+                    if inode.metadata.lock().link_count == 0
+                        || self.open_files.get(&key)
+                            .is_some_and(|master| master.is_pending_deletion())
+                    {
+                        return Err(FileSystemError::NotFound);
+                    }
+                    inode
+                }
+                None => {
+                    if parent.inode.metadata.lock().link_count == 0 {
+                        return Err(FileSystemError::NotFound);
+                    }
+
+                    let timestamps = Timestamps::new(current_timestamp());
+                    let inode = parent.inode.filesystem.create_file(
+                        &parent.inode, name, permissions, timestamps,
+                    )?;
+
+                    // Driver creation has committed. Retention and
+                    // registration have no recoverable error return.
+                    self.retain_inode(inode)
+                }
+            };
+
+            return Ok(self.register_open_handle(
+                inode,
+                access_mode,
+                OpenNamespaceProtection {
+                    flags: NamespaceProtection::NONE,
+                    name_guard: None,
+                    ancestor_guard: None,
+                },
+                next_handle_id,
+            ));
+        }
+    }
+
+    /// Registers a checked handle without further recoverable operations.
+    ///
+    /// The caller holds global VFS serialization and has verified that
+    /// `next_handle_id` is the checked successor of the current ID. Allocation
+    /// failure follows the existing kernel allocator contract.
+    ///
+    /// # Arguments
+    ///
+    /// * `inode` - Canonical regular-file inode to hold open.
+    /// * `access_mode` - Content access rights for the handle.
+    /// * `namespace_protection` - Tokens already acquired for this handle.
+    /// * `next_handle_id` - Checked successor to commit after registration.
+    ///
+    /// # Returns
+    ///
+    /// Returns the newly registered handle.
+    fn register_open_handle(
+        &mut self,
+        inode: Arc<Inode>,
+        access_mode: AccessMode,
+        namespace_protection: OpenNamespaceProtection,
+        next_handle_id: u64,
+    ) -> Arc<FileHandle> {
+        let key = OpenFileKey::new(
+            inode.filesystem.instance_id(), inode.inode_number,
+        );
         let master = self.open_files.entry(key)
             .or_insert_with(|| Arc::new(File::new(Arc::clone(&inode))));
 
         let handle = Arc::new(FileHandle::new(
-            Arc::clone(master), handle_id, access_mode, namespace_protection,
+            Arc::clone(master), self.next_handle_id, access_mode,
+            namespace_protection,
         ));
 
-        // Allocations retain the existing kernel contract: allocation failure
-        // is not represented as a returned filesystem error.
         master.register_handle(&handle);
         self.next_handle_id = next_handle_id;
-
-        Ok(handle)
+        handle
     }
 
     /// Reads up to `buffer.len()` bytes from `handle` into `buffer`.

@@ -50,7 +50,8 @@ use super::file::{File, FileHandle, OpenNamespaceProtection};
 use super::inode::Inode;
 use super::types::{
     AccessMode, CreateMode, DirectoryEntryType, FileSystemError, InodeStat,
-    OpenContentsMode, OpenFileKey, Permissions, Timestamps, NamespaceProtection,
+    NamespaceProtection, OpenContentsMode, OpenFileKey, Permissions, SeekOrigin,
+    Timestamps,
 };
 use super::vfs::VirtualFileSystem;
 use crate::globals;
@@ -726,6 +727,56 @@ impl VirtualFileSystem {
     pub fn seek(&self, handle: &FileHandle, offset: u64
     ) -> Result<(), FileSystemError> {
         handle.seek_to(offset)
+    }
+
+    /// Repositions an open file handle by a signed byte displacement.
+    ///
+    /// The caller holds global VFS serialization. The handle state lock
+    /// covers reading the current position and publishing the new one.
+    /// Seeking from the end uses the canonical inode size. Seeking past
+    /// the end is valid and changes only the offset.
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` - Registered open handle whose position should change.
+    /// * `offset` - Signed displacement in bytes from the selected origin.
+    /// * `origin` - Whether the base is the start, current position, or end.
+    ///
+    /// # Returns
+    ///
+    /// Returns the new absolute byte position on success. A closed handle
+    /// returns `InvalidHandle`, a negative result returns `InvalidOffset`,
+    /// and a result greater than [`i64::MAX`] returns `OffsetOverflow`.
+    /// On error, the previous offset is preserved.
+    pub fn seek_signed(
+        &self,
+        handle: &FileHandle,
+        offset: i64,
+        origin: SeekOrigin,
+    ) -> Result<i64, FileSystemError> {
+        let mut state = handle.state.lock();
+        if state.closed {
+            return Err(FileSystemError::InvalidHandle);
+        }
+
+        let base = match origin {
+            SeekOrigin::Start => 0,
+            SeekOrigin::Current => state.position,
+            SeekOrigin::End => handle.file.inode.metadata.lock().size,
+        };
+
+        // Widen before adding so a negative displacement can bring a base
+        // above the signed range back within it.
+        let position = i128::from(base) + i128::from(offset);
+        if position < 0 {
+            return Err(FileSystemError::InvalidOffset);
+        }
+
+        let position = i64::try_from(position)
+            .map_err(|_| FileSystemError::OffsetOverflow)?;
+
+        state.position = position as u64;
+        Ok(position)
     }
 
     /// Returns a metadata snapshot for the inode at `path`.

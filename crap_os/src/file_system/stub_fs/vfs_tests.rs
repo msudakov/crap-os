@@ -48,7 +48,8 @@
 //!     shared traversal limits, and creation and registration failures.
 //! 23. **Truncate at open** - checks shared data and length, handle offsets,
 //!     creation modes, name protection, and pre-commit failure.
-//! 24. **Teardown** - releases the global VFS owner after the tests.
+//! 24. **Signed seek** - checks origins, shared offsets, and rejected seeks.
+//! 25. **Teardown** - releases the global VFS owner after the tests.
 
 extern crate alloc;
 
@@ -60,7 +61,7 @@ use crate::file_system::stub_fs::StubFileSystemDriver;
 use crate::file_system::virtual_fs::directory::Directory;
 use crate::file_system::virtual_fs::types::{
     AccessMode, CreateMode, FileSystemError, InodeType, Permissions,
-    NamespaceProtection, OpenContentsMode,
+    NamespaceProtection, OpenContentsMode, SeekOrigin,
 };
 use crate::file_system::virtual_fs::vfs::VirtualFileSystem;
 use crate::file_system::virtual_fs::file::FileHandle;
@@ -123,6 +124,8 @@ pub fn run_vfs_tests() {
     test_open_truncate_creation();
     test_open_truncate_protection();
     test_open_truncate_failure();
+    test_seek_signed_positions();
+    test_seek_signed_errors();
     expect_ok(with_vfs(|vfs| vfs.reclaim_unlinked_inodes()), "final unlinked inode cleanup");
     teardown_vfs();
 
@@ -3135,4 +3138,102 @@ fn test_open_truncate_failure() {
     expect_err(inode.filesystem.load_inode(inode.inode_number),
         FileSystemError::NotFound, "no leaked registration delays reclaim");
     sprintln!("[VFS TEST] truncate at open, failures ... PASS");
+}
+
+/// Checks signed seek origins, shared handle offsets, and live file length.
+///
+/// # Panics
+///
+/// Panics if a seek returns the wrong position, modifies file metadata, or
+/// fails to observe truncation through another handle.
+fn test_seek_signed_positions() {
+    sprintln!("[VFS TEST] signed seek, positions ...");
+    let mut vfs = new_stub_vfs();
+    let path = "/etc/signed-seek";
+    let handle = expect_ok(vfs.open_or_create(
+        path, AccessMode::ReadWrite, CreateMode::Exclusive,
+        Permissions::all_permissive(), None,
+    ), "create signed-seek file");
+    assert_eq!(expect_ok(vfs.write(&handle, b"abcdef"), "seed file"), 6);
+    let clone = Arc::clone(&handle);
+    let other = expect_ok(vfs.open(path, AccessMode::ReadOnly, None),
+        "open same inode independently");
+
+    assert_eq!(expect_ok(vfs.seek_signed(&handle, 2, SeekOrigin::Start),
+        "seek from start"), 2);
+    assert_eq!(expect_ok(vfs.seek_signed(&clone, -1, SeekOrigin::Current),
+        "seek backwards using shared position"), 1);
+    let mut byte = [0];
+    assert_eq!(expect_ok(vfs.read(&handle, &mut byte),
+        "read at shared position"), 1);
+    assert_eq!(byte, [b'b']);
+    assert_eq!(expect_ok(vfs.seek_signed(&other, 0, SeekOrigin::Current),
+        "independent handle retains its position"), 0);
+
+    assert_eq!(expect_ok(vfs.seek_signed(&handle, -2, SeekOrigin::End),
+        "seek backwards from end"), 4);
+    assert_eq!(expect_ok(vfs.read(&handle, &mut byte), "read near EOF"), 1);
+    assert_eq!(byte, [b'e']);
+    let before = handle.file.inode.stat();
+    assert_eq!(expect_ok(vfs.seek_signed(&handle, 3, SeekOrigin::End),
+        "seek beyond EOF"), 9);
+    assert_eq!(handle.file.inode.stat(), before);
+    assert_eq!(expect_ok(vfs.read(&handle, &mut byte), "read beyond EOF"), 0);
+
+    let truncated = expect_ok(vfs.open_with_options(
+        path, AccessMode::WriteOnly, OpenContentsMode::Truncate,
+        None, NamespaceProtection::NONE,
+    ), "truncate via separate open");
+    assert_eq!(expect_ok(vfs.seek_signed(&handle, 0, SeekOrigin::Current),
+        "existing position survives truncation"), 9);
+    assert_eq!(expect_ok(vfs.seek_signed(&other, 0, SeekOrigin::End),
+        "seek from new EOF on an existing handle"), 0);
+
+    expect_ok(vfs.close(&truncated), "close truncating handle");
+    expect_ok(vfs.close(&other), "close independent handle");
+    expect_ok(vfs.close(&handle), "close shared handle");
+    sprintln!("[VFS TEST] signed seek, positions ... PASS");
+}
+
+/// Checks signed seek errors and the signed offset range.
+///
+/// # Panics
+///
+/// Panics if an invalid seek changes the offset, a valid boundary is
+/// rejected, or a closed handle can still seek.
+fn test_seek_signed_errors() {
+    sprintln!("[VFS TEST] signed seek, errors ...");
+    let mut vfs = new_stub_vfs();
+    let handle = expect_ok(vfs.open("/etc/config.txt", AccessMode::ReadOnly, None),
+        "open nonempty file for offset boundary checks");
+    expect_ok(vfs.seek_signed(&handle, 2, SeekOrigin::Start), "set initial offset");
+
+    expect_err(vfs.seek_signed(&handle, -1, SeekOrigin::Start),
+        FileSystemError::InvalidOffset, "reject negative absolute position");
+    expect_err(vfs.seek_signed(&handle, -3, SeekOrigin::Current),
+        FileSystemError::InvalidOffset, "reject relative position before start");
+    expect_err(vfs.seek_signed(&handle, i64::MIN, SeekOrigin::End),
+        FileSystemError::InvalidOffset, "reject position before start from EOF");
+    expect_err(vfs.seek_signed(&handle, i64::MAX, SeekOrigin::End),
+        FileSystemError::OffsetOverflow, "reject position above signed limit");
+    assert_eq!(expect_ok(vfs.seek_signed(&handle, 0, SeekOrigin::Current),
+        "errors preserve position"), 2);
+
+    assert_eq!(expect_ok(vfs.seek_signed(&handle, i64::MAX, SeekOrigin::Start),
+        "seek to largest signed position"), i64::MAX);
+    expect_err(vfs.seek_signed(&handle, 1, SeekOrigin::Current),
+        FileSystemError::OffsetOverflow, "reject overflow from largest position");
+    assert_eq!(expect_ok(vfs.seek_signed(&handle, 0, SeekOrigin::Current),
+        "overflow preserves largest position"), i64::MAX);
+
+    expect_ok(vfs.seek(&handle, u64::MAX), "set full-width unsigned position");
+    expect_err(vfs.seek_signed(&handle, i64::MAX, SeekOrigin::Current),
+        FileSystemError::OffsetOverflow, "reject sum above unsigned range");
+    assert_eq!(expect_ok(vfs.seek_signed(&handle, i64::MIN, SeekOrigin::Current),
+        "move from unsigned position back into signed range"), i64::MAX);
+
+    expect_ok(vfs.close(&handle), "close boundary handle");
+    expect_err(vfs.seek_signed(&handle, 0, SeekOrigin::Start),
+        FileSystemError::InvalidHandle, "reject seek on closed handle");
+    sprintln!("[VFS TEST] signed seek, errors ... PASS");
 }

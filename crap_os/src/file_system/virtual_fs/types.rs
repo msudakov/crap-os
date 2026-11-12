@@ -135,6 +135,12 @@ pub enum FileSystemError {
     /// belong to the expected open-file master record.
     InvalidHandle,
 
+    /// A signed seek would place the file position before byte zero.
+    InvalidOffset,
+
+    /// A signed seek would place the file position above [`i64::MAX`] bytes.
+    OffsetOverflow,
+
     /// The path string was empty, contained illegal characters, or exceeded
     /// the maximum supported length.
     InvalidPath,
@@ -226,6 +232,19 @@ pub enum AccessMode {
 
     /// The handle may be used for both read and write operations.
     ReadWrite,
+}
+
+/// Selects the base position for a signed seek.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeekOrigin {
+    /// Byte zero, corresponding to POSIX `SEEK_SET`.
+    Start,
+
+    /// The open handle's current position, corresponding to POSIX `SEEK_CUR`.
+    Current,
+
+    /// The current file length, corresponding to POSIX `SEEK_END`.
+    End,
 }
 
 /// Selects what a successful open does to an existing regular file's data.

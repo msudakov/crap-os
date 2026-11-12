@@ -443,6 +443,22 @@ pub trait FileSystemInstance: Send + Sync {
         buffer: &[u8],
     ) -> Result<usize, FileSystemError>;
 
+    /// Sets a regular file's backing length to zero.
+    ///
+    /// The caller holds VFS serialization and checks write access and lock
+    /// ownership. On success, the driver exposes empty data and a zero backing
+    /// length, and the VFS updates the canonical metadata. A returned error
+    /// must preserve the backing length and contents.
+    ///
+    /// # Arguments
+    ///
+    /// * `inode` - Regular-file inode owned by this instance.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` after the backing change, or a filesystem error.
+    fn truncate_to_zero(&self, inode: &Inode) -> Result<(), FileSystemError>;
+
     // =========================================================================
     // Namespace Mutation
     // =========================================================================

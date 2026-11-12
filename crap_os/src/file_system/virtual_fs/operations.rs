@@ -50,7 +50,7 @@ use super::file::{File, FileHandle, OpenNamespaceProtection};
 use super::inode::Inode;
 use super::types::{
     AccessMode, CreateMode, DirectoryEntryType, FileSystemError, InodeStat,
-    OpenFileKey, Permissions, Timestamps, NamespaceProtection,
+    OpenContentsMode, OpenFileKey, Permissions, Timestamps, NamespaceProtection,
 };
 use super::vfs::VirtualFileSystem;
 use crate::globals;
@@ -116,6 +116,51 @@ impl VirtualFileSystem {
         working_directory: Option<Arc<Directory>>,
         protection: NamespaceProtection,
     ) -> Result<Arc<FileHandle>, FileSystemError> {
+        self.open_with_options(
+            path, access_mode, OpenContentsMode::Preserve, working_directory,
+            protection,
+        )
+    }
+
+    /// Opens an existing regular file with the requested contents and
+    /// protection modes.
+    ///
+    /// The caller holds global VFS serialization and closes the returned handle
+    /// through the VFS. On truncation, all names and handles observe the same
+    /// empty inode. Existing handle offsets are preserved. The new handle
+    /// starts at byte zero. Existing inode name protection blocks truncation
+    /// through any alias. Protection requested by this open applies after
+    /// preflight.
+    ///
+    /// # Arguments
+    ///
+    /// * `path`               - File pathname. Final symlinks are followed.
+    /// * `access_mode`        - Content access rights requested for the handle.
+    /// * `open_contents_mode` - Whether to preserve or truncate the existing
+    ///   file.
+    /// * `working_directory`  - Relative-path base, or root when absent.
+    /// * `protection`         - Namespace contributions to own for this open.
+    ///
+    /// # Returns
+    ///
+    /// Returns a registered handle on success. Resolution, protection, access,
+    /// write-lock, or driver errors preserve file contents and publish no
+    /// handle. Existing name protection returns `ResourceBusy`. Any newly
+    /// acquired protection is released on error.
+    pub fn open_with_options(
+        &mut self,
+        path: &str,
+        access_mode: AccessMode,
+        open_contents_mode: OpenContentsMode,
+        working_directory: Option<Arc<Directory>>,
+        protection: NamespaceProtection,
+    ) -> Result<Arc<FileHandle>, FileSystemError> {
+        if open_contents_mode == OpenContentsMode::Truncate
+            && !access_mode.can_write()
+        {
+            return Err(FileSystemError::InvalidAccessMode);
+        }
+
         let resolved = self.resolve_entry_with_budget(
             path, working_directory, true, super::resolver::MAX_SYMLINK_DEPTH,
         )?;
@@ -138,6 +183,13 @@ impl VirtualFileSystem {
         // only when this open is ready to register.
         let next_handle_id = self.next_handle_id.checked_add(1)
             .ok_or(FileSystemError::InternalError)?;
+
+        // Only protection from existing opens applies to this truncation.
+        // Finish fallible token acquisition before committing the change.
+        if open_contents_mode == OpenContentsMode::Truncate {
+            self.ensure_open_truncation_allowed(&inode, &key)?;
+        }
+
         let ancestor_guard = if protection.contains(
             NamespaceProtection::PROTECT_ANCESTORS)
         {
@@ -161,6 +213,10 @@ impl VirtualFileSystem {
         let namespace_protection = OpenNamespaceProtection {
             flags: protection, name_guard, ancestor_guard,
         };
+
+        if open_contents_mode == OpenContentsMode::Truncate {
+            Self::truncate_for_open(&inode)?;
+        }
 
         Ok(self.register_open_handle(
             inode, access_mode, namespace_protection, next_handle_id,
@@ -199,7 +255,52 @@ impl VirtualFileSystem {
         permissions: Permissions,
         working_directory: Option<Arc<Directory>>,
     ) -> Result<Arc<FileHandle>, FileSystemError> {
-        // No driver creation may precede this recoverable registration check.
+        self.open_or_create_with_options(
+            path, access_mode, create_mode, OpenContentsMode::Preserve,
+            permissions, working_directory,
+        )
+    }
+
+    /// Opens or creates a regular file with the requested contents mode.
+    ///
+    /// The caller holds global VFS serialization until registration completes.
+    /// A newly created file starts empty. For an existing target, truncation
+    /// changes the shared inode size and preserves existing handle offsets.
+    ///
+    /// # Arguments
+    ///
+    /// * `path`               - File pathname. Trailing separators are
+    ///   rejected.
+    /// * `access_mode`        - Content access rights requested for the handle.
+    /// * `create_mode`        - Whether an occupied final name is permitted.
+    /// * `open_contents_mode` - Whether to preserve or truncate an existing
+    ///   target.
+    /// * `permissions`        - Initial permissions when creating a file.
+    /// * `working_directory`  - Relative-path base, or root when absent.
+    ///
+    /// # Returns
+    ///
+    /// Returns a registered handle that the caller must close. Exclusive
+    /// creation returns `AlreadyExists` for an occupied final name. A returned
+    /// error preserves the namespace and existing contents and registers no
+    /// handle. Truncation requests require a write-capable access mode and
+    /// return `ResourceBusy` when the existing inode has name protection.
+    pub fn open_or_create_with_options(
+        &mut self,
+        path: &str,
+        access_mode: AccessMode,
+        create_mode: CreateMode,
+        open_contents_mode: OpenContentsMode,
+        permissions: Permissions,
+        working_directory: Option<Arc<Directory>>,
+    ) -> Result<Arc<FileHandle>, FileSystemError> {
+        if open_contents_mode == OpenContentsMode::Truncate
+            && !access_mode.can_write()
+        {
+            return Err(FileSystemError::InvalidAccessMode);
+        }
+
+        // Check handle capacity before the driver creates or truncates a file.
         let next_handle_id = self.next_handle_id.checked_add(1)
             .ok_or(FileSystemError::InternalError)?;
         let mut target_path = path.to_string();
@@ -265,11 +366,17 @@ impl VirtualFileSystem {
                     let key = OpenFileKey::new(
                         inode.filesystem.instance_id(), inode.inode_number,
                     );
+
                     if inode.metadata.lock().link_count == 0
                         || self.open_files.get(&key)
                             .is_some_and(|master| master.is_pending_deletion())
                     {
                         return Err(FileSystemError::NotFound);
+                    }
+
+                    if open_contents_mode == OpenContentsMode::Truncate {
+                        self.ensure_open_truncation_allowed(&inode, &key)?;
+                        Self::truncate_for_open(&inode)?;
                     }
                     inode
                 }
@@ -300,6 +407,64 @@ impl VirtualFileSystem {
                 next_handle_id,
             ));
         }
+    }
+
+    /// Checks existing name protection and the exclusive write lock.
+    ///
+    /// The caller holds global VFS serialization and checks before acquiring
+    /// any protection for this open. The new handle cannot own an existing
+    /// exclusive write lock.
+    ///
+    /// # Arguments
+    ///
+    /// * `inode` - Canonical regular-file inode to truncate.
+    /// * `key`   - Open-file table key identifying that inode.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` if truncation is allowed, `ResourceBusy` if the
+    /// inode has name protection, or `FileLocked` for an exclusive write lock.
+    fn ensure_open_truncation_allowed(
+        &self,
+        inode: &Inode,
+        key: &OpenFileKey,
+    ) -> Result<(), FileSystemError> {
+        if inode.names_are_protected() {
+            return Err(FileSystemError::ResourceBusy);
+        }
+
+        if self.open_files.get(key)
+            .is_some_and(|master| master.is_write_blocked(self.next_handle_id))
+        {
+            return Err(FileSystemError::FileLocked);
+        }
+
+        Ok(())
+    }
+
+    /// Commits truncation immediately before registering the checked open.
+    ///
+    /// The caller holds global VFS serialization and has completed all
+    /// recoverable open checks and any requested token acquisition.
+    ///
+    /// # Arguments
+    ///
+    /// * `inode` - Canonical regular-file inode for the checked open.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` after updating the shared size and modification time.
+    /// A driver error preserves the file's data and metadata.
+    fn truncate_for_open(inode: &Inode) -> Result<(), FileSystemError> {
+        inode.filesystem.truncate_to_zero(inode)?;
+
+        let now = current_timestamp();
+        let mut metadata = inode.metadata.lock();
+        metadata.size = 0;
+        metadata.timestamps.modified = now;
+        metadata.dirty = true;
+
+        Ok(())
     }
 
     /// Registers a checked handle without further recoverable operations.

@@ -118,6 +118,21 @@ fn fail_next_unmount_for(instance_id: u64) {
 /// accidentally consume another test's failure.
 static FAIL_FREE_ONCE_FOR: SpinLock<Option<(u64, u64)>> = SpinLock::new(None);
 
+/// One-shot truncation failure keyed by filesystem instance and inode number.
+static FAIL_TRUNCATE_ONCE_FOR: SpinLock<Option<(u64, u64)>> = SpinLock::new(None);
+
+/// Arms a truncation failure before any backing data is changed.
+///
+/// The serial boot harness must consume the request before its fixture ends.
+///
+/// # Arguments
+///
+/// * `inode` - The backing inode whose next truncation should fail.
+fn fail_next_truncate_for(inode: &Inode) {
+    *FAIL_TRUNCATE_ONCE_FOR.lock() =
+        Some((inode.filesystem.instance_id(), inode.inode_number));
+}
+
 /// One-shot regular-file creation failure after validation and before commit.
 static FAIL_CREATE_ONCE_FOR: SpinLock<Option<u64>> = SpinLock::new(None);
 
@@ -648,6 +663,42 @@ impl FileSystemInstance for StubFsInstance {
         }
 
         Ok(buffer.len())
+    }
+
+    /// Clears regular-file data and sets the backing inode length to zero.
+    ///
+    /// The caller holds VFS serialization. All backing lookups and failure
+    /// injection checks precede the mutation.
+    ///
+    /// # Arguments
+    ///
+    /// * `inode` - Regular-file inode owned by this stub instance.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(())` after truncating, `NotFound` if a backing record
+    /// is missing, or `DiskWriteError` for the armed failure.
+    fn truncate_to_zero(&self, inode: &Inode) -> Result<(), FileSystemError> {
+        let mut file_data = self.file_data.lock();
+        let (_, data) = file_data
+            .iter_mut()
+            .find(|(number, _)| *number == inode.inode_number)
+            .ok_or(FileSystemError::NotFound)?;
+
+        let mut inodes = self.inodes.lock();
+        let index = Self::find_inode_index(&inodes, inode.inode_number)?;
+
+        {
+            let mut fail_for = FAIL_TRUNCATE_ONCE_FOR.lock();
+            if *fail_for == Some((self.id, inode.inode_number)) {
+                *fail_for = None;
+                return Err(FileSystemError::DiskWriteError);
+            }
+        }
+
+        *data = Vec::new();
+        inodes[index].size = 0;
+        Ok(())
     }
 
     fn create_file(

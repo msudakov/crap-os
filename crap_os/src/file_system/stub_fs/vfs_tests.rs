@@ -46,7 +46,9 @@
 //!     pathname and protection rules, pre-commit failure, and cleanup retry.
 //! 22. **Create-and-open** - checks existing and new files, final symlinks,
 //!     shared traversal limits, and creation and registration failures.
-//! 23. **Teardown** - releases the global VFS owner after the tests.
+//! 23. **Truncate at open** - checks shared data and length, handle offsets,
+//!     creation modes, name protection, and pre-commit failure.
+//! 24. **Teardown** - releases the global VFS owner after the tests.
 
 extern crate alloc;
 
@@ -58,7 +60,7 @@ use crate::file_system::stub_fs::StubFileSystemDriver;
 use crate::file_system::virtual_fs::directory::Directory;
 use crate::file_system::virtual_fs::types::{
     AccessMode, CreateMode, FileSystemError, InodeType, Permissions,
-    NamespaceProtection,
+    NamespaceProtection, OpenContentsMode,
 };
 use crate::file_system::virtual_fs::vfs::VirtualFileSystem;
 use crate::file_system::virtual_fs::file::FileHandle;
@@ -117,6 +119,10 @@ pub fn run_vfs_tests() {
     test_open_or_create_basic();
     test_open_or_create_symlinks();
     test_open_or_create_failures();
+    test_open_truncate_shared_inode();
+    test_open_truncate_creation();
+    test_open_truncate_protection();
+    test_open_truncate_failure();
     expect_ok(with_vfs(|vfs| vfs.reclaim_unlinked_inodes()), "final unlinked inode cleanup");
     teardown_vfs();
 
@@ -2888,4 +2894,245 @@ fn test_open_or_create_failures() {
     expect_ok(vfs.close(&retry), "close retry creation");
 
     sprintln!("[VFS TEST] create-and-open failures ... PASS");
+}
+
+/// Checks that truncating through a hard-link alias updates the shared file.
+///
+/// # Panics
+///
+/// Panics if the inode changes identity, backing or live data survives, or
+/// truncation resets an existing handle's offset.
+fn test_open_truncate_shared_inode() {
+    sprintln!("[VFS TEST] truncate at open, shared inode ...");
+    let mut vfs = new_stub_vfs();
+    let path = "/etc/truncate-file";
+    let alias = "/etc/truncate-alias";
+    let original = expect_ok(vfs.open_or_create(
+        path, AccessMode::ReadWrite, CreateMode::Exclusive,
+        Permissions::all_permissive(), None,
+    ), "create truncation target");
+    assert_eq!(expect_ok(vfs.write(&original, b"old!"), "seed data"), 4);
+    expect_ok(vfs.create_hard_link(path, alias, None, false), "link target");
+    let inode = &original.file.inode;
+    let before = inode.stat();
+
+    let truncated = expect_ok(vfs.open_with_options(
+        alias, AccessMode::ReadWrite, OpenContentsMode::Truncate,
+        None, NamespaceProtection::NONE,
+    ), "truncate through alias");
+    assert!(Arc::ptr_eq(inode, &truncated.file.inode));
+    let after = expect_ok(vfs.stat(path, None, false), "stat original name");
+    assert_eq!(after, expect_ok(vfs.stat(alias, None, false), "stat alias"));
+    assert_eq!(after.size, 0);
+    assert_eq!(after.link_count, 2);
+    assert_eq!(after.permissions, before.permissions);
+    assert_eq!(after.timestamps.created, before.timestamps.created);
+    assert_eq!(after.timestamps.accessed, before.timestamps.accessed);
+    assert_eq!(expect_ok(inode.filesystem.load_inode(inode.inode_number),
+        "load backing inode after truncate").stat().size, 0);
+
+    let mut contents = [0xff; 5];
+    assert_eq!(expect_ok(vfs.read(&truncated, &mut contents),
+        "new handle reads EOF"), 0);
+    assert_eq!(expect_ok(vfs.read(&original, &mut contents),
+        "old handle reads EOF"), 0);
+
+    // The old offset is four. Writing there must expose zeroes where the
+    // previous contents were, while the new handle still reads from zero.
+    assert_eq!(expect_ok(vfs.write(&original, b"x"), "write at old offset"), 1);
+    assert_eq!(expect_ok(vfs.read(&truncated, &mut contents),
+        "read gap and new byte"), contents.len());
+    assert_eq!(contents, [0, 0, 0, 0, b'x']);
+
+    expect_ok(vfs.close(&truncated), "close truncating open");
+    expect_ok(vfs.close(&original), "close original open");
+    sprintln!("[VFS TEST] truncate at open, shared inode ... PASS");
+}
+
+/// Checks how truncation combines with missing targets and exclusive creation.
+///
+/// # Panics
+///
+/// Panics if an exclusive open modifies an occupied name, an ordinary open
+/// creates a missing name, or a create-and-truncate selects the wrong target.
+fn test_open_truncate_creation() {
+    sprintln!("[VFS TEST] truncate at open, creation ...");
+    let mut vfs = new_stub_vfs();
+    let link = "/etc/truncate-link";
+    let target = "/etc/truncate-target";
+    expect_ok(vfs.create_symlink(link, "truncate-target", None),
+        "create dangling final link");
+
+    expect_err(vfs.open_with_options(
+        link, AccessMode::ReadWrite, OpenContentsMode::Truncate,
+        None, NamespaceProtection::NONE,
+    ), FileSystemError::NotFound, "truncate without create follows dangling link");
+    expect_err(vfs.open_or_create_with_options(
+        link, AccessMode::ReadWrite, CreateMode::Exclusive,
+        OpenContentsMode::Truncate, Permissions::all_permissive(), None,
+    ), FileSystemError::AlreadyExists, "exclusive rejects dangling final link");
+    expect_err(vfs.resolve(target, None, false),
+        FileSystemError::NotFound, "rejected opens leave target absent");
+
+    let created = expect_ok(vfs.open_or_create_with_options(
+        link, AccessMode::ReadWrite, CreateMode::IfMissing,
+        OpenContentsMode::Truncate, Permissions::all_permissive(), None,
+    ), "create the missing final target");
+    let target_inode = expect_ok(vfs.resolve(target, None, false),
+        "resolve target of creation");
+    assert!(Arc::ptr_eq(&created.file.inode, &target_inode));
+    assert_eq!(target_inode.stat().size, 0);
+    assert_eq!(expect_ok(vfs.write(&created, b"keep"), "seed final target"), 4);
+
+    expect_err(vfs.open_or_create_with_options(
+        target, AccessMode::ReadWrite, CreateMode::Exclusive,
+        OpenContentsMode::Truncate, Permissions::all_permissive(), None,
+    ), FileSystemError::AlreadyExists, "exclusive preserves occupied file");
+    let mut contents = [0; 4];
+    expect_ok(vfs.seek(&created, 0), "rewind existing target");
+    assert_eq!(expect_ok(vfs.read(&created, &mut contents),
+        "read data after exclusive rejection"), 4);
+    assert_eq!(&contents, b"keep");
+
+    let reopened = expect_ok(vfs.open_or_create_with_options(
+        link, AccessMode::WriteOnly, CreateMode::IfMissing,
+        OpenContentsMode::Truncate, Permissions::all_permissive(), None,
+    ), "truncate existing final target");
+    assert!(Arc::ptr_eq(&reopened.file.inode, &target_inode));
+    assert_eq!(target_inode.stat().size, 0);
+    expect_ok(vfs.seek(&created, 0), "rewind after truncating final target");
+    assert_eq!(expect_ok(vfs.read(&created, &mut contents),
+        "existing handle reads EOF"), 0);
+
+    expect_ok(vfs.close(&reopened), "close truncated target");
+    expect_ok(vfs.close(&created), "close created target");
+    sprintln!("[VFS TEST] truncate at open, creation ... PASS");
+}
+
+/// Checks existing inode protection and protection requested by the same open.
+///
+/// # Panics
+///
+/// Panics if a name-protected inode can be truncated, ancestor-only
+/// protection blocks truncation, or an open conflicts with its own tokens.
+fn test_open_truncate_protection() {
+    sprintln!("[VFS TEST] truncate at open, protection ...");
+    let mut vfs = new_stub_vfs();
+    let path = "/etc/truncate-protected";
+    let alias = "/var/truncate-protected-alias";
+    let original = expect_ok(vfs.open_or_create(
+        path, AccessMode::ReadWrite, CreateMode::Exclusive,
+        Permissions::all_permissive(), None,
+    ), "create protected truncation target");
+    assert_eq!(expect_ok(vfs.write(&original, b"keep"), "seed protected file"), 4);
+    expect_ok(vfs.create_hard_link(path, alias, None, false), "link protected file");
+    let before = original.file.inode.stat();
+
+    for protection in [
+        NamespaceProtection::PROTECT_NAMES,
+        NamespaceProtection::PROTECT_FULL,
+    ] {
+        let guard = expect_ok(vfs.open_with_namespace_protection(
+            path, AccessMode::ReadOnly, None, protection,
+        ), "protect original name and aliases");
+        expect_err(vfs.open_with_options(
+            path, AccessMode::ReadWrite, OpenContentsMode::Truncate,
+            None, NamespaceProtection::NONE,
+        ), FileSystemError::ResourceBusy, "reject truncation of protected file");
+        expect_err(vfs.open_or_create_with_options(
+            alias, AccessMode::ReadWrite, CreateMode::IfMissing,
+            OpenContentsMode::Truncate, Permissions::all_permissive(), None,
+        ), FileSystemError::ResourceBusy, "reject truncation through hard link");
+        assert_eq!(original.file.inode.stat(), before);
+        expect_ok(vfs.close(&guard), "release existing name protection");
+    }
+    let mut contents = [0; 4];
+    expect_ok(vfs.seek(&original, 0), "rewind after rejected truncations");
+    assert_eq!(expect_ok(vfs.read(&original, &mut contents),
+        "read data after rejected truncations"), 4);
+    assert_eq!(&contents, b"keep");
+
+    let ancestors = expect_ok(vfs.open_with_namespace_protection(
+        path, AccessMode::ReadOnly, None, NamespaceProtection::PROTECT_ANCESTORS,
+    ), "protect ancestors only");
+    let truncated = expect_ok(vfs.open_with_options(
+        path, AccessMode::ReadWrite, OpenContentsMode::Truncate,
+        None, NamespaceProtection::PROTECT_FULL,
+    ), "truncate with ancestor-only guard and acquire full protection");
+    assert_eq!(original.file.inode.stat().size, 0);
+    expect_err(vfs.open_with_options(
+        alias, AccessMode::WriteOnly, OpenContentsMode::Truncate,
+        None, NamespaceProtection::NONE,
+    ), FileSystemError::ResourceBusy, "truncating open holds name protection");
+    expect_ok(vfs.close(&truncated), "release full protection");
+    expect_ok(vfs.close(&ancestors), "release ancestor-only protection");
+    expect_ok(vfs.close(&original), "close original");
+    sprintln!("[VFS TEST] truncate at open, protection ... PASS");
+}
+
+/// Checks pre-commit truncation failures and a subsequent successful retry.
+///
+/// # Panics
+///
+/// Panics if a rejected truncating open changes data or metadata, leaks
+/// namespace protection or an open registration, or cannot be retried.
+fn test_open_truncate_failure() {
+    sprintln!("[VFS TEST] truncate at open, failures ...");
+    let mut vfs = new_stub_vfs();
+    let path = "/etc/truncate-failure";
+    let absent = "/etc/truncate-read-only-missing";
+    let original = expect_ok(vfs.open_or_create(
+        path, AccessMode::ReadWrite, CreateMode::Exclusive,
+        Permissions::all_permissive(), None,
+    ), "create failure target");
+    assert_eq!(expect_ok(vfs.write(&original, b"keep"), "seed failure target"), 4);
+    let inode = &original.file.inode;
+    let before = inode.stat();
+
+    super::fail_next_truncate_for(inode);
+    expect_err(vfs.open_with_options(
+        path, AccessMode::ReadOnly, OpenContentsMode::Truncate,
+        None, NamespaceProtection::NONE,
+    ), FileSystemError::InvalidAccessMode, "read-only truncation rejected");
+    expect_err(vfs.open_or_create_with_options(
+        absent, AccessMode::ReadOnly, CreateMode::IfMissing,
+        OpenContentsMode::Truncate, Permissions::all_permissive(), None,
+    ), FileSystemError::InvalidAccessMode, "read-only truncation cannot create");
+    expect_err(vfs.resolve(absent, None, false),
+        FileSystemError::NotFound, "read-only rejection leaves name absent");
+    expect_err(vfs.open_with_options(
+        "/etc", AccessMode::ReadWrite, OpenContentsMode::Truncate,
+        None, NamespaceProtection::NONE,
+    ), FileSystemError::NotAFile, "directory truncation rejected");
+    expect_err(vfs.open_with_options(
+        path, AccessMode::ReadWrite, OpenContentsMode::Truncate,
+        None, NamespaceProtection::PROTECT_FULL,
+    ), FileSystemError::DiskWriteError, "injected driver truncate failure");
+
+    assert_eq!(inode.stat(), before);
+    assert_eq!(expect_ok(inode.filesystem.load_inode(inode.inode_number),
+        "load backing inode after failure").stat().size, before.size);
+    let mut contents = [0; 4];
+    expect_ok(vfs.seek(&original, 0), "rewind after failed truncate");
+    assert_eq!(expect_ok(vfs.read(&original, &mut contents),
+        "read original data after failure"), 4);
+    assert_eq!(&contents, b"keep");
+
+    // Moving the parent and unlinking the name require both temporary
+    // protection contributions from the failed open to have been released.
+    expect_ok(vfs.rename("/etc", "/etc-after-truncate-failure", None),
+        "rename parent after failed open");
+    let moved = "/etc-after-truncate-failure/truncate-failure";
+    let retry = expect_ok(vfs.open_with_options(
+        moved, AccessMode::ReadWrite, OpenContentsMode::Truncate,
+        None, NamespaceProtection::NONE,
+    ), "retry truncation");
+    assert!(Arc::ptr_eq(inode, &retry.file.inode));
+    assert_eq!(inode.stat().size, 0);
+    expect_ok(vfs.close(&retry), "close retry");
+    expect_ok(vfs.close(&original), "close original");
+    expect_ok(vfs.unlink(moved, None), "unlink after failed open and retry");
+    expect_err(inode.filesystem.load_inode(inode.inode_number),
+        FileSystemError::NotFound, "no leaked registration delays reclaim");
+    sprintln!("[VFS TEST] truncate at open, failures ... PASS");
 }

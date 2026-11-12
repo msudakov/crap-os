@@ -100,8 +100,8 @@ pub enum FileSystemError {
     /// contains entries.
     DirectoryNotEmpty,
 
-    /// A namespace object is protected, is an active mount point, or is the
-    /// global root. Retry after its holders release protection where possible.
+    /// An object is protected, is an active mount point, or is the global
+    /// root. Retry after its holders release protection where possible.
     ResourceBusy,
 
     /// Symlink resolution exceeded
@@ -228,6 +228,16 @@ pub enum AccessMode {
     ReadWrite,
 }
 
+/// Selects what a successful open does to an existing regular file's data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenContentsMode {
+    /// Preserve the file's current length and contents.
+    Preserve,
+
+    /// Set the file length to zero. Requires a write-capable access mode.
+    Truncate,
+}
+
 /// Selects how create-and-open treats an occupied final pathname component.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreateMode {
@@ -280,7 +290,8 @@ impl NamespaceProtection {
     pub const NONE: Self = Self(0);
 
     /// Rejects unlink, rename, direct move, and replacement of every entry
-    /// naming the opened inode. Additional hard links remain permitted and
+    /// naming the opened inode. Also rejects truncating opens of the inode
+    /// through any name. Additional hard links remain permitted and
     /// immediately share this protection. Ancestors remain independently
     /// mutable.
     pub const PROTECT_NAMES: Self = Self(1);

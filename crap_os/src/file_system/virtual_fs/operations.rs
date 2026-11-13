@@ -50,8 +50,8 @@ use super::file::{File, FileHandle, OpenNamespaceProtection};
 use super::inode::Inode;
 use super::types::{
     AccessMode, CreateMode, DirectoryEntryType, FileSystemError, InodeStat,
-    NamespaceProtection, OpenContentsMode, OpenFileKey, Permissions, SeekOrigin,
-    Timestamps,
+    NamespaceProtection, OpenContentsMode, OpenFileKey, OpenOptions,
+    Permissions, SeekOrigin, Timestamps,
 };
 use super::vfs::VirtualFileSystem;
 use crate::globals;
@@ -77,54 +77,20 @@ impl VirtualFileSystem {
         access_mode: AccessMode,
         working_directory: Option<Arc<Directory>>,
     ) -> Result<Arc<FileHandle>, FileSystemError> {
-        self.open_with_namespace_protection(
-            path, access_mode, working_directory, NamespaceProtection::NONE,
-        )
-    }
-
-    /// Opens a regular file and atomically acquires namespace protection.
-    ///
-    /// The caller holds global VFS serialization throughout resolution, token
-    /// acquisition, and registration. No namespace mutation can interleave.
-    /// Prefer `PROTECT_FULL` for namespace stability. Ancestor-only protection
-    /// stays on captured directories if the file later moves. All hard-link
-    /// names share name protection, but only this resolved path's ancestors
-    /// are captured. Symlink entries used to reach the target are not guarded.
-    ///
-    /// Reads, writes, timestamps, and write locking keep their own contracts.
-    /// Protection does not prevent additional opens. The caller must close
-    /// the registration before dropping its last Arc; a failed close retains
-    /// protection for retry. Arc clones do not acquire independent tokens.
-    ///
-    /// # Arguments
-    ///
-    /// * `path`              - File pathname; final symlinks are followed.
-    /// * `access_mode`       - Content access rights requested.
-    /// * `working_directory` - Relative-path base, or root when absent.
-    /// * `protection`        - Independent namespace restrictions, or `NONE`.
-    ///
-    /// # Returns
-    ///
-    /// Returns a registered handle owning the contributions. Returns `NotAFile`
-    /// for other inode types, `NotFound` for a detached target, `ResourceBusy`
-    /// for protection-counter exhaustion, `InternalError` for exhausted handle
-    /// IDs or missing regular-file parent context, or a resolution error.
-    /// A returned error publishes no handle and retains no new protection.
-    pub fn open_with_namespace_protection(
-        &mut self,
-        path: &str,
-        access_mode: AccessMode,
-        working_directory: Option<Arc<Directory>>,
-        protection: NamespaceProtection,
-    ) -> Result<Arc<FileHandle>, FileSystemError> {
         self.open_with_options(
-            path, access_mode, OpenContentsMode::Preserve, working_directory,
-            protection,
+            path,
+            access_mode,
+            OpenOptions {
+                contents_mode: OpenContentsMode::Preserve,
+                append: false,
+            },
+            working_directory,
+            NamespaceProtection::NONE,
         )
     }
 
-    /// Opens an existing regular file with the requested contents and
-    /// protection modes.
+    /// Opens an existing regular file with the requested options and
+    /// protection.
     ///
     /// The caller holds global VFS serialization and closes the returned handle
     /// through the VFS. On truncation, all names and handles observe the same
@@ -133,12 +99,16 @@ impl VirtualFileSystem {
     /// through any alias. Protection requested by this open applies after
     /// preflight.
     ///
+    /// Name protection applies to every hard-link alias. Ancestor protection
+    /// guards the resolved target's parent and its ancestors, including mount
+    /// hosts, for the lifetime of the registration. Successful close releases
+    /// its contributions, even if Arc clones remain. Failed close retains them.
+    ///
     /// # Arguments
     ///
     /// * `path`               - File pathname. Final symlinks are followed.
     /// * `access_mode`        - Content access rights requested for the handle.
-    /// * `open_contents_mode` - Whether to preserve or truncate the existing
-    ///   file.
+    /// * `options`            - File open options for the new handle.
     /// * `working_directory`  - Relative-path base, or root when absent.
     /// * `protection`         - Namespace contributions to own for this open.
     ///
@@ -152,11 +122,11 @@ impl VirtualFileSystem {
         &mut self,
         path: &str,
         access_mode: AccessMode,
-        open_contents_mode: OpenContentsMode,
+        options: OpenOptions,
         working_directory: Option<Arc<Directory>>,
         protection: NamespaceProtection,
     ) -> Result<Arc<FileHandle>, FileSystemError> {
-        if open_contents_mode == OpenContentsMode::Truncate
+        if options.contents_mode == OpenContentsMode::Truncate
             && !access_mode.can_write()
         {
             return Err(FileSystemError::InvalidAccessMode);
@@ -187,7 +157,7 @@ impl VirtualFileSystem {
 
         // Only protection from existing opens applies to this truncation.
         // Finish fallible token acquisition before committing the change.
-        if open_contents_mode == OpenContentsMode::Truncate {
+        if options.contents_mode == OpenContentsMode::Truncate {
             self.ensure_open_truncation_allowed(&inode, &key)?;
         }
 
@@ -215,12 +185,13 @@ impl VirtualFileSystem {
             flags: protection, name_guard, ancestor_guard,
         };
 
-        if open_contents_mode == OpenContentsMode::Truncate {
+        if options.contents_mode == OpenContentsMode::Truncate {
             Self::truncate_for_open(&inode)?;
         }
 
         Ok(self.register_open_handle(
-            inode, access_mode, namespace_protection, next_handle_id,
+            inode, access_mode, options.append, namespace_protection,
+            next_handle_id,
         ))
     }
 
@@ -257,12 +228,19 @@ impl VirtualFileSystem {
         working_directory: Option<Arc<Directory>>,
     ) -> Result<Arc<FileHandle>, FileSystemError> {
         self.open_or_create_with_options(
-            path, access_mode, create_mode, OpenContentsMode::Preserve,
-            permissions, working_directory,
+            path,
+            access_mode,
+            create_mode,
+            OpenOptions {
+                contents_mode: OpenContentsMode::Preserve,
+                append: false,
+            },
+            permissions,
+            working_directory,
         )
     }
 
-    /// Opens or creates a regular file with the requested contents mode.
+    /// Opens or creates a regular file with the requested open options.
     ///
     /// The caller holds global VFS serialization until registration completes.
     /// A newly created file starts empty. For an existing target, truncation
@@ -274,8 +252,7 @@ impl VirtualFileSystem {
     ///   rejected.
     /// * `access_mode`        - Content access rights requested for the handle.
     /// * `create_mode`        - Whether an occupied final name is permitted.
-    /// * `open_contents_mode` - Whether to preserve or truncate an existing
-    ///   target.
+    /// * `options`            - File open options for the new handle.
     /// * `permissions`        - Initial permissions when creating a file.
     /// * `working_directory`  - Relative-path base, or root when absent.
     ///
@@ -291,11 +268,11 @@ impl VirtualFileSystem {
         path: &str,
         access_mode: AccessMode,
         create_mode: CreateMode,
-        open_contents_mode: OpenContentsMode,
+        options: OpenOptions,
         permissions: Permissions,
         working_directory: Option<Arc<Directory>>,
     ) -> Result<Arc<FileHandle>, FileSystemError> {
-        if open_contents_mode == OpenContentsMode::Truncate
+        if options.contents_mode == OpenContentsMode::Truncate
             && !access_mode.can_write()
         {
             return Err(FileSystemError::InvalidAccessMode);
@@ -375,7 +352,7 @@ impl VirtualFileSystem {
                         return Err(FileSystemError::NotFound);
                     }
 
-                    if open_contents_mode == OpenContentsMode::Truncate {
+                    if options.contents_mode == OpenContentsMode::Truncate {
                         self.ensure_open_truncation_allowed(&inode, &key)?;
                         Self::truncate_for_open(&inode)?;
                     }
@@ -400,6 +377,7 @@ impl VirtualFileSystem {
             return Ok(self.register_open_handle(
                 inode,
                 access_mode,
+                options.append,
                 OpenNamespaceProtection {
                     flags: NamespaceProtection::NONE,
                     name_guard: None,
@@ -476,10 +454,12 @@ impl VirtualFileSystem {
     ///
     /// # Arguments
     ///
-    /// * `inode` - Canonical regular-file inode to hold open.
-    /// * `access_mode` - Content access rights for the handle.
+    /// * `inode`                - Canonical regular-file inode to hold open.
+    /// * `access_mode`          - Content access rights for the handle.
+    /// * `append`               - Whether each write selects the file end.
     /// * `namespace_protection` - Tokens already acquired for this handle.
-    /// * `next_handle_id` - Checked successor to commit after registration.
+    /// * `next_handle_id`       - Checked successor to commit after
+    ///   registration.
     ///
     /// # Returns
     ///
@@ -488,6 +468,7 @@ impl VirtualFileSystem {
         &mut self,
         inode: Arc<Inode>,
         access_mode: AccessMode,
+        append: bool,
         namespace_protection: OpenNamespaceProtection,
         next_handle_id: u64,
     ) -> Arc<FileHandle> {
@@ -498,7 +479,7 @@ impl VirtualFileSystem {
             .or_insert_with(|| Arc::new(File::new(Arc::clone(&inode))));
 
         let handle = Arc::new(FileHandle::new(
-            Arc::clone(master), self.next_handle_id, access_mode,
+            Arc::clone(master), self.next_handle_id, access_mode, append,
             namespace_protection,
         ));
 
@@ -561,30 +542,33 @@ impl VirtualFileSystem {
         Ok(bytes_read)
     }
 
-    /// Writes `buffer.len()` bytes from `buffer` into the file at `handle`'s
-    /// current position.
+    /// Writes bytes at the handle's current position or at the file end.
     ///
-    /// Writes from the handle's current position and advances it by the number
-    /// of bytes successfully written. The write is dispatched to the filesystem
-    /// driver via [`super::driver::FileSystemInstance::write`].
+    /// Calls [`super::driver::FileSystemInstance::write`] and sets the handle
+    /// position to the selected start plus the number of bytes written.
     ///
     /// If another handle holds an exclusive write lock on the same file and
     /// `handle` is not the lock holder, the write is rejected with
     /// [`FileSystemError::FileLocked`].
     ///
-    /// After a successful write, `modified` and `accessed` on the underlying
-    /// inode's timestamps are updated, `size` is updated if the write extended
-    /// the file, and the inode is marked dirty for a later sync.
-    /// The handle state is locked through the driver write and offset update so
-    /// operations sharing this handle cannot write from the same offset. A
-    /// closed handle returns `InvalidHandle` before calling the driver.
+    /// An append handle selects the canonical inode size for every write.
+    /// The caller holds global VFS serialization across EOF selection, the
+    /// driver transfer, and size publication, including across separate
+    /// opens of the inode. A failed transfer preserves the handle position.
+    /// Empty writes through an append handle return zero after access checks.
+    ///
+    /// After a successful driver write, `modified` and `accessed` on the inode
+    /// are updated, `size` is updated if the write extended the file, and the
+    /// inode is marked dirty for a later sync. The handle state is locked
+    /// through the driver write and offset update so operations sharing this
+    /// handle cannot write from the same offset. A closed handle returns
+    /// `InvalidHandle` before calling the driver.
     ///
     /// # Arguments
     ///
-    /// * `handle`       - The file handle to write through. Must have
+    /// * `handle` - The file handle to write through. Must have
     ///   [`AccessMode::WriteOnly`] or [`AccessMode::ReadWrite`].
-    /// * `buffer`       - The source buffer whose entire contents are written
-    ///   starting at the handle's current position.
+    /// * `buffer` - Source bytes to write at the current position or file end.
     ///
     /// # Returns
     ///
@@ -612,14 +596,18 @@ impl VirtualFileSystem {
             return Err(FileSystemError::FileLocked);
         }
 
-        let inode = Arc::clone(&handle.file.inode);
-        let bytes_written = inode.filesystem.write(
-            &inode,
-            state.position,
-            buffer,
-        )?;
+        if handle.append && buffer.is_empty() {
+            return Ok(0);
+        }
 
-        state.position = state.position.saturating_add(bytes_written as u64);
+        let inode = Arc::clone(&handle.file.inode);
+        let start = if handle.append {
+            inode.metadata.lock().size
+        } else {
+            state.position
+        };
+        let bytes_written = inode.filesystem.write(&inode, start, buffer)?;
+        state.position = start.saturating_add(bytes_written as u64);
 
         // Update size if the write extended the file, then mark dirty.
         let new_end = state.position;

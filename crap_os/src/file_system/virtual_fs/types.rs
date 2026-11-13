@@ -257,6 +257,17 @@ pub enum OpenContentsMode {
     Truncate,
 }
 
+/// Controls file contents at open and the write position of the new handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenOptions {
+    /// Whether to preserve or truncate the contents of an existing file.
+    pub contents_mode: OpenContentsMode,
+
+    /// Selects the current end of the file for each write through this handle.
+    /// The handle's access rights still determine whether it can write.
+    pub append: bool,
+}
+
 /// Selects how create-and-open treats an occupied final pathname component.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CreateMode {

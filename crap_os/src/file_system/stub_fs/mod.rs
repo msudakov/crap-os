@@ -118,6 +118,21 @@ fn fail_next_unmount_for(instance_id: u64) {
 /// accidentally consume another test's failure.
 static FAIL_FREE_ONCE_FOR: SpinLock<Option<(u64, u64)>> = SpinLock::new(None);
 
+/// One-shot write failure keyed by filesystem instance and inode number.
+static FAIL_WRITE_ONCE_FOR: SpinLock<Option<(u64, u64)>> = SpinLock::new(None);
+
+/// Arms a failure before the next write changes the selected backing file.
+///
+/// The serial boot harness consumes the request before its fixture ends.
+///
+/// # Arguments
+///
+/// * `inode` - The backing inode whose next write should fail.
+fn fail_next_write_for(inode: &Inode) {
+    *FAIL_WRITE_ONCE_FOR.lock() =
+        Some((inode.filesystem.instance_id(), inode.inode_number));
+}
+
 /// One-shot truncation failure keyed by filesystem instance and inode number.
 static FAIL_TRUNCATE_ONCE_FOR: SpinLock<Option<(u64, u64)>> = SpinLock::new(None);
 
@@ -643,6 +658,14 @@ impl FileSystemInstance for StubFsInstance {
             .iter_mut()
             .find(|(n, _)| *n == inode.inode_number)
             .ok_or(FileSystemError::NotFound)?;
+
+        {
+            let mut fail_for = FAIL_WRITE_ONCE_FOR.lock();
+            if *fail_for == Some((self.id, inode.inode_number)) {
+                *fail_for = None;
+                return Err(FileSystemError::DiskWriteError);
+            }
+        }
 
         let start   = offset as usize;
         let end     = start + buffer.len();

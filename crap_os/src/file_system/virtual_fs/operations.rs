@@ -42,7 +42,7 @@
 #![allow(dead_code)]
 
 use alloc::sync::Arc;
-use alloc::string::ToString;
+use alloc::string::{String, ToString};
 use core::sync::atomic::Ordering;
 
 use super::directory::Directory;
@@ -799,6 +799,43 @@ impl VirtualFileSystem {
     ) -> Result<InodeStat, FileSystemError> {
         let inode = self.resolve(path, working_directory, follow_symlinks)?;
         Ok(inode.stat())
+    }
+
+    /// Returns the target string stored in the symbolic link at `path`.
+    ///
+    /// Follows symlinks in parent components and reads the final symlink
+    /// itself. The stored string is returned verbatim, including relative
+    /// paths and paths whose targets are missing. A trailing slash retains
+    /// the resolver's directory requirement.
+    ///
+    /// After the driver read succeeds, updates the link inode's access time
+    /// and marks its metadata dirty for a later sync.
+    ///
+    /// # Arguments
+    ///
+    /// * `path`              - Path to the symbolic link.
+    /// * `working_directory` - Starting directory for relative paths. `None`
+    ///   uses the global root.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(String)` with the stored target. Returns
+    /// `Err(FileSystemError::NotASymlink)` if the resolved inode has another
+    /// type, or propagates the resolver or driver error.
+    pub fn readlink(
+        &self,
+        path: &str,
+        working_directory: Option<Arc<Directory>>,
+    ) -> Result<String, FileSystemError> {
+        let inode = self.resolve(path, working_directory, false)?;
+        if !inode.is_symlink() {
+            return Err(FileSystemError::NotASymlink);
+        }
+
+        let target = inode.filesystem.read_symlink(&inode)?;
+        self.touch_accessed(&inode)?;
+
+        Ok(target)
     }
 
     /// Creates a new regular file at `path`.

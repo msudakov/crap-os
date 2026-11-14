@@ -50,7 +50,8 @@
 //!     creation modes, name protection, and pre-commit failure.
 //! 24. **Signed seek** - checks origins, shared offsets, and rejected seeks.
 //! 25. **Append** - checks per-write EOF selection, offsets, and failures.
-//! 26. **Teardown** - releases the global VFS owner after the tests.
+//! 26. **Readlink** - checks stored targets, path errors, and link access time.
+//! 27. **Teardown** - releases the global VFS owner after the tests.
 
 extern crate alloc;
 
@@ -129,6 +130,7 @@ pub fn run_vfs_tests() {
     test_seek_signed_errors();
     test_append_writes();
     test_append_write_failure();
+    test_readlink();
     expect_ok(with_vfs(|vfs| vfs.reclaim_unlinked_inodes()), "final unlinked inode cleanup");
     teardown_vfs();
 
@@ -3409,4 +3411,79 @@ fn test_append_write_failure() {
 
     expect_ok(vfs.close(&handle), "close append failure target");
     sprintln!("[VFS TEST] append, write failure ... PASS");
+}
+
+/// Verifies that `readlink` returns stored targets and preserves path errors.
+///
+/// The fixture's `/lib` link points to `/etc`. Reading through that alias
+/// exercises parent traversal, and a self-link exercises the final-component
+/// rule and the traversal limit when used as a parent.
+///
+/// # Panics
+///
+/// Panics if fixture setup fails or a target, path error, or metadata update
+/// differs from the expected result.
+fn test_readlink() {
+    sprintln!("[VFS TEST] readlink ...");
+    let mut vfs = new_stub_vfs();
+
+    let link = expect_ok(
+        vfs.create_symlink("/etc/dangling", "../var//missing", None),
+        "create relative dangling symlink",
+    );
+    // Seed a distinct access time so the check does not depend on clock ticks.
+    link.metadata.lock().timestamps.accessed = u64::MAX;
+    let before = link.stat();
+    assert!(!link.is_dirty());
+
+    assert_eq!(
+        expect_ok(vfs.readlink("/lib/dangling", None), "read through parent link"),
+        "../var//missing",
+    );
+    let after = link.stat();
+    assert_ne!(after.timestamps.accessed, before.timestamps.accessed);
+    assert_eq!(after.timestamps.modified, before.timestamps.modified);
+    assert!(link.is_dirty());
+
+    assert_eq!(
+        expect_ok(vfs.readlink("/lib", None), "read absolute target"),
+        "/etc",
+    );
+
+    expect_ok(
+        vfs.create_symlink("/etc/loop", "loop", None),
+        "create self-link",
+    );
+    assert_eq!(
+        expect_ok(vfs.readlink("/etc/loop", None), "read self-link"),
+        "loop",
+    );
+    expect_err(
+        vfs.readlink("/etc/loop/child", None),
+        FileSystemError::TooManySymlinks,
+        "self-link in parent path",
+    );
+
+    expect_err(
+        vfs.readlink("/etc/config.txt", None),
+        FileSystemError::NotASymlink,
+        "readlink on regular file",
+    );
+    expect_err(
+        vfs.readlink("/lib/", None),
+        FileSystemError::NotASymlink,
+        "trailing slash on link to directory",
+    );
+
+    expect_ok(
+        vfs.create_symlink("/etc/file-link", "config.txt", None),
+        "create link to regular file",
+    );
+    expect_err(
+        vfs.readlink("/etc/file-link/", None),
+        FileSystemError::NotADirectory,
+        "trailing slash on link to regular file",
+    );
+
+    sprintln!("[VFS TEST] readlink ... PASS");
 }

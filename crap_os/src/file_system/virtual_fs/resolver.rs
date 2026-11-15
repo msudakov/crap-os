@@ -6,7 +6,7 @@
 //! [`super::directory::Directory`] that the path refers to.
 //!
 //! The resolver is the most central piece of VFS logic. Every operation that
-//! accepts a path (e.g., open, stat, create, delete, rename, mount, unmount)
+//! accepts a path (e.g., to open a file, query metadata, or mount a volume)
 //! begins with a resolver call.
 //! 
 //! ## Algorithm Overview
@@ -105,7 +105,7 @@ impl VirtualFileSystem {
     ///
     /// * `true`  - the symlink is followed, and the target's inode is returned.
     ///   Used by operations that want the object the symlink points to (e.g.,
-    ///   open, stat).
+    ///   `open` or a metadata lookup that follows the final symlink).
     /// * `false` - the symlink inode itself is returned without following.
     ///   Used by operations that want the symlink object itself (e.g., delete,
     ///   read symlink target).

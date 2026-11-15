@@ -15,7 +15,7 @@
 //! The tests are grouped and run in dependency order:
 //!
 //! 1. **Mount** - registers the stub driver and mounts the root volume.
-//! 2. **Stat** - resolves known paths and checks inode types and sizes.
+//! 2. **Path metadata** - resolves known paths and checks inode types and sizes.
 //! 3. **Read** - opens known files and verifies their content byte-for-byte.
 //! 4. **Write** - writes to `kernel.log`, reads back, and verifies.
 //! 5. **Inode coherence** - checks identity and metadata across references.
@@ -92,7 +92,7 @@ pub fn run_vfs_tests() {
     sprintln!("[VFS TEST] ----------------------------------------");
 
     test_mount_and_register();
-    test_stat();
+    test_inode_metadata_by_path();
     test_read();
     test_write();
     test_inode_coherence();
@@ -296,22 +296,22 @@ fn test_mount_and_register() {
 /// # Panics
 ///
 /// Panics if a lookup fails or an inode has the wrong type or metadata.
-fn test_stat() {
-    sprintln!("[VFS TEST] stat ...");
+fn test_inode_metadata_by_path() {
+    sprintln!("[VFS TEST] inode metadata by path ...");
 
     // Root should be a directory.
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/", None, false)),
-        "stat(/)",
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/", None, false)),
+        "metadata for /",
     );
     assert!(
         stat.inode_type == InodeType::Directory,
-        "[VFS TEST] FAIL - stat(/): expected Directory"
+        "[VFS TEST] FAIL - metadata for /: expected Directory"
     );
 
     // /etc should be a directory.
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/etc", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc", None, false)),
         "stat(/etc)",
     );
     assert!(
@@ -321,7 +321,7 @@ fn test_stat() {
 
     // /etc/config.txt should be a file with the right size.
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/etc/config.txt", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/config.txt", None, false)),
         "stat(/etc/config.txt)",
     );
     assert!(
@@ -335,7 +335,7 @@ fn test_stat() {
 
     // /lib should be a symlink when follow_symlinks is false.
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/lib", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/lib", None, false)),
         "stat(/lib, no follow)",
     );
     assert!(
@@ -345,7 +345,7 @@ fn test_stat() {
 
     // /lib with follow_symlinks should resolve to /etc - a directory.
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/lib", None, true)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/lib", None, true)),
         "stat(/lib, follow)",
     );
     assert!(
@@ -353,7 +353,7 @@ fn test_stat() {
         "[VFS TEST] FAIL - stat(/lib, follow): expected Directory"
     );
 
-    sprintln!("[VFS TEST] stat ... PASS");
+    sprintln!("[VFS TEST] inode metadata by path ... PASS");
 }
 
 /// Verifies registered reads, independent opens, shared clones, and close.
@@ -592,7 +592,7 @@ fn test_symlink_traversal() {
 
     // /lib/config.txt should resolve through lib -> /etc to /etc/config.txt.
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/lib/config.txt", None, true)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/lib/config.txt", None, true)),
         "stat(/lib/config.txt)",
     );
     assert!(
@@ -635,11 +635,11 @@ fn test_dotdot_traversal() {
 
     // /bin/tools/../shell should resolve to /bin/shell.
     let stat_direct = expect_ok(
-        with_vfs(|vfs| vfs.stat("/bin/shell", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/bin/shell", None, false)),
         "stat(/bin/shell) direct",
     );
     let stat_dotdot = expect_ok(
-        with_vfs(|vfs| vfs.stat("/bin/tools/../shell", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/bin/tools/../shell", None, false)),
         "stat(/bin/tools/../shell)",
     );
     assert!(
@@ -658,7 +658,7 @@ fn test_dotdot_traversal() {
         "resolve /bin/tools as working directory",
     );
     let stat_relative = expect_ok(
-        with_vfs(|vfs| vfs.stat("../shell", Some(working_dir), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("../shell", Some(working_dir), false)),
         "stat ../shell from /bin/tools",
     );
     assert!(
@@ -668,11 +668,11 @@ fn test_dotdot_traversal() {
 
     // /etc/.. should resolve to root.
     let stat_root = expect_ok(
-        with_vfs(|vfs| vfs.stat("/", None, false)),
-        "stat(/)",
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/", None, false)),
+        "metadata for /",
     );
     let stat_up = expect_ok(
-        with_vfs(|vfs| vfs.stat("/etc/..", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/..", None, false)),
         "stat(/etc/..)",
     );
     assert!(
@@ -682,7 +682,7 @@ fn test_dotdot_traversal() {
 
     // /../.. should stay at root (cannot go above root).
     let stat_overflow = expect_ok(
-        with_vfs(|vfs| vfs.stat("/../..", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/../..", None, false)),
         "stat(/../..)",
     );
     assert!(
@@ -713,7 +713,7 @@ fn test_create_file() {
 
     // Verify the file exists and is a File.
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/var/log/test.log", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/var/log/test.log", None, false)),
         "stat /var/log/test.log after create",
     );
     assert!(
@@ -757,7 +757,7 @@ fn test_create_directory() {
     );
 
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/bin/utils", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/bin/utils", None, false)),
         "stat /bin/utils after create",
     );
     assert!(
@@ -799,7 +799,7 @@ fn test_create_symlink() {
 
     // Without following, it should be a Symlink.
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/etc/cfg", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/cfg", None, false)),
         "stat /etc/cfg no follow",
     );
     assert!(
@@ -809,7 +809,7 @@ fn test_create_symlink() {
 
     // With following, it should resolve to /etc/config.txt - a File.
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/etc/cfg", None, true)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/cfg", None, true)),
         "stat /etc/cfg follow",
     );
     assert!(
@@ -856,14 +856,14 @@ fn test_rename() {
 
     // Old name should be gone.
     expect_err(
-        with_vfs(|vfs| vfs.stat("/etc/hosts.txt", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/hosts.txt", None, false)),
         FileSystemError::NotFound,
         "stat old name after rename",
     );
 
     // New name should exist and be a File with the same content.
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/etc/hosts.cfg", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/hosts.cfg", None, false)),
         "stat /etc/hosts.cfg after rename",
     );
     assert!(
@@ -903,12 +903,12 @@ fn test_rename() {
         "rename hosts.cfg relative to /etc",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("/etc/hosts.cfg", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/hosts.cfg", None, false)),
         FileSystemError::NotFound,
         "stat old name after relative rename",
     );
     let relative_stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/etc/hosts.relative", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/hosts.relative", None, false)),
         "stat new name after relative rename",
     );
     assert!(
@@ -923,7 +923,7 @@ fn test_rename() {
     // Move a file between directories and back. The inode and content must
     // survive both moves, and the old name must disappear after each one.
     let debug_stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/bin/tools/debug", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/bin/tools/debug", None, false)),
         "stat /bin/tools/debug before cross-directory rename",
     );
     expect_ok(
@@ -931,12 +931,12 @@ fn test_rename() {
         "move /bin/tools/debug to /var/log/debug",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("/bin/tools/debug", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/bin/tools/debug", None, false)),
         FileSystemError::NotFound,
         "stat old name after cross-directory rename",
     );
     let moved_stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/var/log/debug", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/var/log/debug", None, false)),
         "stat /var/log/debug after cross-directory rename",
     );
     assert!(
@@ -959,12 +959,12 @@ fn test_rename() {
         "restore /bin/tools/debug after cross-directory rename",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("/var/log/debug", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/var/log/debug", None, false)),
         FileSystemError::NotFound,
         "stat moved name after restoring /bin/tools/debug",
     );
     let restored_stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/bin/tools/debug", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/bin/tools/debug", None, false)),
         "stat /bin/tools/debug after restoring cross-directory rename",
     );
     assert!(
@@ -990,7 +990,7 @@ fn test_unlink() {
 
     // The path should now return NotFound.
     expect_err(
-        with_vfs(|vfs| vfs.stat("/bin/tools/debug", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/bin/tools/debug", None, false)),
         FileSystemError::NotFound,
         "stat after unlink",
     );
@@ -1045,7 +1045,7 @@ fn test_unlink_reclamation_retry() {
             "unlink succeeds despite eager free failure",
         );
         expect_err(
-            vfs.stat(path, None, false),
+            vfs.inode_metadata_by_path(path, None, false),
             FileSystemError::NotFound,
             "failed eager free leaves name removed",
         );
@@ -1104,7 +1104,7 @@ fn test_posix_deferred_unlink() {
         "resolve /etc before deferred unlink",
     );
     expect_ok(
-        with_vfs(|vfs| vfs.stat("config.txt", Some(Arc::clone(&etc_dir)), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("config.txt", Some(Arc::clone(&etc_dir)), false)),
         "load config.txt in retained /etc wrapper",
     );
     let first = expect_ok(
@@ -1124,7 +1124,7 @@ fn test_posix_deferred_unlink() {
 
     // The path should now be gone from the namespace.
     expect_err(
-        with_vfs(|vfs| vfs.stat("/etc/config.txt", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/config.txt", None, false)),
         FileSystemError::NotFound,
         "stat after deferred unlink",
     );
@@ -1215,7 +1215,7 @@ fn test_posix_deferred_unlink() {
         "unlink file relative to /var/log",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("/var/log/deferred-relative.tmp", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/var/log/deferred-relative.tmp", None, false)),
         FileSystemError::NotFound,
         "stat after relative deferred unlink",
     );
@@ -1254,7 +1254,7 @@ fn test_retained_directory_namespace() {
         "retain /var/log for namespace checks",
     );
     expect_ok(
-        with_vfs(|vfs| vfs.stat("kernel.log", Some(Arc::clone(&log_dir)), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("kernel.log", Some(Arc::clone(&log_dir)), false)),
         "visit a child through retained /var/log before mutation",
     );
 
@@ -1265,11 +1265,11 @@ fn test_retained_directory_namespace() {
         "create file through a fresh path",
     );
     let relative = expect_ok(
-        with_vfs(|vfs| vfs.stat("wrapper-new.tmp", Some(Arc::clone(&log_dir)), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("wrapper-new.tmp", Some(Arc::clone(&log_dir)), false)),
         "find created file through retained wrapper",
     );
     let absolute = expect_ok(
-        with_vfs(|vfs| vfs.stat("/var/log/wrapper-new.tmp", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/var/log/wrapper-new.tmp", None, false)),
         "find created file through fresh path",
     );
     assert!(relative.inode_number == created.inode_number
@@ -1283,16 +1283,16 @@ fn test_retained_directory_namespace() {
         "rename file through fresh paths",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("wrapper-new.tmp", Some(Arc::clone(&log_dir)), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("wrapper-new.tmp", Some(Arc::clone(&log_dir)), false)),
         FileSystemError::NotFound,
         "old name through retained wrapper after rename",
     );
     let renamed = expect_ok(
-        with_vfs(|vfs| vfs.stat("wrapper-renamed.tmp", Some(Arc::clone(&log_dir)), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("wrapper-renamed.tmp", Some(Arc::clone(&log_dir)), false)),
         "new name through retained wrapper after rename",
     );
     let fresh_renamed = expect_ok(
-        with_vfs(|vfs| vfs.stat("/var/log/wrapper-renamed.tmp", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/var/log/wrapper-renamed.tmp", None, false)),
         "new name through fresh path after rename",
     );
     assert!(renamed.inode_number == created.inode_number
@@ -1304,12 +1304,12 @@ fn test_retained_directory_namespace() {
         "unlink file through fresh path",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("wrapper-renamed.tmp", Some(log_dir), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("wrapper-renamed.tmp", Some(log_dir), false)),
         FileSystemError::NotFound,
         "unlinked name through retained wrapper",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("/var/log/wrapper-renamed.tmp", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/var/log/wrapper-renamed.tmp", None, false)),
         FileSystemError::NotFound,
         "unlinked name through fresh path",
     );
@@ -1335,7 +1335,7 @@ fn test_mount_wrapper_consistency() {
         "retain /etc before mount",
     );
     expect_ok(
-        with_vfs(|vfs| vfs.stat("hosts.cfg", Some(Arc::clone(&etc_dir)), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("hosts.cfg", Some(Arc::clone(&etc_dir)), false)),
         "visit a child through retained /etc before covering it",
     );
 
@@ -1375,7 +1375,7 @@ fn test_mount_wrapper_consistency() {
         && fresh.filesystem.instance_id() != etc_dir.inode.filesystem.instance_id(),
         "[VFS TEST] FAIL - wrappers see different mounted instances");
     expect_err(
-        with_vfs(|vfs| vfs.stat("hosts.cfg", Some(Arc::clone(&etc_dir)), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("hosts.cfg", Some(Arc::clone(&etc_dir)), false)),
         FileSystemError::NotFound,
         "retained host hides covered children while mounted",
     );
@@ -1412,11 +1412,11 @@ fn test_mount_wrapper_consistency() {
         "unmount with a simulated flush failure",
     );
     expect_ok(
-        with_vfs(|vfs| vfs.stat("/etc/bin/shell", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/bin/shell", None, false)),
         "fresh path still enters mount after failed unmount",
     );
     expect_ok(
-        with_vfs(|vfs| vfs.stat("bin/shell", Some(Arc::clone(&etc_dir)), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("bin/shell", Some(Arc::clone(&etc_dir)), false)),
         "retained host still enters mount after failed unmount",
     );
     let parent_after_failure = expect_ok(
@@ -1439,7 +1439,7 @@ fn test_mount_wrapper_consistency() {
         "retry unmount /etc through fresh path",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("/etc/bin/shell", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/bin/shell", None, false)),
         FileSystemError::NotFound,
         "covered /etc restored after unmount",
     );
@@ -1451,7 +1451,7 @@ fn test_mount_wrapper_consistency() {
         "mount through retained host",
     );
     expect_ok(
-        with_vfs(|vfs| vfs.stat("bin/shell", Some(Arc::clone(&etc_dir)), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("bin/shell", Some(Arc::clone(&etc_dir)), false)),
         "retained host sees remount",
     );
     expect_ok(
@@ -1459,7 +1459,7 @@ fn test_mount_wrapper_consistency() {
         "unmount through retained host",
     );
     expect_ok(
-        with_vfs(|vfs| vfs.stat("hosts.cfg", Some(etc_dir), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("hosts.cfg", Some(etc_dir), false)),
         "retained host sees uncovered /etc again",
     );
 
@@ -1490,14 +1490,14 @@ fn test_moved_working_directory_parent() {
     );
 
     let moved = expect_ok(
-        with_vfs(|vfs| vfs.stat("/bin/log", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/bin/log", None, false)),
         "find moved directory through fresh path",
     );
     assert!(moved.inode_number == retained_log.inode.inode_number,
         "[VFS TEST] FAIL - moving /var/log changed its inode");
 
     let bin = expect_ok(
-        with_vfs(|vfs| vfs.stat("/bin", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/bin", None, false)),
         "stat expected new parent /bin",
     );
     let fresh_log = expect_ok(
@@ -1508,14 +1508,14 @@ fn test_moved_working_directory_parent() {
         "resolve moved directory through fresh path",
     );
     let fresh_parent = expect_ok(
-        with_vfs(|vfs| vfs.stat("..", Some(fresh_log), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("..", Some(fresh_log), false)),
         "resolve .. from fresh /bin/log wrapper",
     );
     assert!(fresh_parent.inode_number == bin.inode_number,
         "[VFS TEST] FAIL - fresh moved-directory parent is not /bin");
 
     let retained_parent = expect_ok(
-        with_vfs(|vfs| vfs.stat("..", Some(Arc::clone(&retained_log)), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("..", Some(Arc::clone(&retained_log)), false)),
         "resolve .. from retained moved-directory wrapper",
     );
     assert!(retained_parent.inode_number == bin.inode_number,
@@ -1527,11 +1527,11 @@ fn test_moved_working_directory_parent() {
         "restore /var/log after parent check",
     );
     let var = expect_ok(
-        with_vfs(|vfs| vfs.stat("/var", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/var", None, false)),
         "stat restored parent /var",
     );
     let restored_parent = expect_ok(
-        with_vfs(|vfs| vfs.stat("..", Some(retained_log), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("..", Some(retained_log), false)),
         "resolve .. from retained wrapper after restoring /var/log",
     );
     assert!(restored_parent.inode_number == var.inode_number,
@@ -1564,7 +1564,7 @@ fn test_trailing_slash_paths() {
         "create_file with trailing slash",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("/var/log/trailing-file.tmp", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/var/log/trailing-file.tmp", None, false)),
         FileSystemError::NotFound,
         "file was not created after trailing-slash rejection",
     );
@@ -1594,7 +1594,7 @@ fn test_trailing_slash_paths() {
         "create_symlink with trailing slash",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("/etc/trailing-link", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/trailing-link", None, false)),
         FileSystemError::NotFound,
         "symlink was not created after trailing-slash rejection",
     );
@@ -1602,13 +1602,13 @@ fn test_trailing_slash_paths() {
     // The deferred-unlink test removed config.txt. The rename test restored
     // hosts.cfg, so it remains a live regular-file fixture here.
     let regular_file = expect_ok(
-        with_vfs(|vfs| vfs.stat("/etc/hosts.cfg", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/hosts.cfg", None, false)),
         "verify live regular-file fixture for trailing-slash checks",
     );
     assert!(regular_file.inode_type == InodeType::File,
         "[VFS TEST] FAIL - trailing-slash regular-file fixture is not a file");
     expect_err(
-        with_vfs(|vfs| vfs.stat("/etc/hosts.cfg/", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/hosts.cfg/", None, false)),
         FileSystemError::NotADirectory,
         "stat regular file with trailing slash",
     );
@@ -1639,17 +1639,17 @@ fn test_trailing_slash_paths() {
         "rename regular file to trailing-slash path",
     );
     expect_ok(
-        with_vfs(|vfs| vfs.stat("/etc/hosts.cfg", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/hosts.cfg", None, false)),
         "regular file remains after rejected trailing-slash mutations",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("/etc/trailing-renamed.txt", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/trailing-renamed.txt", None, false)),
         FileSystemError::NotFound,
         "rename destination was not created after trailing-slash rejection",
     );
 
     let linked_directory = expect_ok(
-        with_vfs(|vfs| vfs.stat("/lib/", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/lib/", None, false)),
         "stat symlink to directory with trailing slash",
     );
     assert!(linked_directory.inode_type == InodeType::Directory,
@@ -1661,7 +1661,7 @@ fn test_trailing_slash_paths() {
         "create symlink to live file for trailing-slash lookup",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("/etc/trailing-file-link/", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/trailing-file-link/", None, false)),
         FileSystemError::NotADirectory,
         "stat symlink to file with trailing slash",
     );
@@ -1677,7 +1677,7 @@ fn test_trailing_slash_paths() {
         "create_directory with trailing slash",
     );
     let directory = expect_ok(
-        with_vfs(|vfs| vfs.stat("/bin/trailing-dir/", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/bin/trailing-dir/", None, false)),
         "stat directory with trailing slash",
     );
     assert!(directory.inode_type == InodeType::Directory,
@@ -1755,10 +1755,10 @@ fn test_hard_links() {
         expect_ok(vfs.rename(
             "/etc/hard-source", "/var/log/hard-alias", None,
         ), "rename between aliases is a no-op");
-        assert_eq!(expect_ok(vfs.stat(
+        assert_eq!(expect_ok(vfs.inode_metadata_by_path(
             "/etc/hard-source", None, false,
         ), "source survives same-inode rename").link_count, 2);
-        assert_eq!(expect_ok(vfs.stat(
+        assert_eq!(expect_ok(vfs.inode_metadata_by_path(
             "/var/log/hard-alias", None, false,
         ), "alias survives same-inode rename").link_count, 2);
 
@@ -2811,7 +2811,7 @@ fn test_open_or_create_symlinks() {
         "/etc/absolute-link", AccessMode::ReadWrite,
         CreateMode::Exclusive, Permissions::all_permissive(), None,
     ), FileSystemError::AlreadyExists, "exclusive dangling symlink");
-    expect_err(vfs.stat("/var/created-absolute", None, false),
+    expect_err(vfs.inode_metadata_by_path("/var/created-absolute", None, false),
         FileSystemError::NotFound, "exclusive did not create target");
     let absolute = expect_ok(vfs.open_or_create(
         "/etc/absolute-link", AccessMode::ReadWrite,
@@ -2968,8 +2968,8 @@ fn test_open_truncate_shared_inode() {
         None, NamespaceProtection::NONE,
     ), "truncate through alias");
     assert!(Arc::ptr_eq(inode, &truncated.file.inode));
-    let after = expect_ok(vfs.stat(path, None, false), "stat original name");
-    assert_eq!(after, expect_ok(vfs.stat(alias, None, false), "stat alias"));
+    let after = expect_ok(vfs.inode_metadata_by_path(path, None, false), "stat original name");
+    assert_eq!(after, expect_ok(vfs.inode_metadata_by_path(alias, None, false), "stat alias"));
     assert_eq!(after.size, 0);
     assert_eq!(after.link_count, 2);
     assert_eq!(after.permissions, before.permissions);
@@ -3534,7 +3534,7 @@ fn test_inode_metadata_by_handle() {
     assert_eq!(displaced.size, before.size);
     assert_eq!(displaced.link_count, 0);
 
-    let replacement = expect_ok(vfs.stat("/etc/old", None, true), "stat replacement");
+    let replacement = expect_ok(vfs.inode_metadata_by_path("/etc/old", None, true), "get replacement metadata");
     assert_eq!(replacement.inode_number, incoming.inode_number);
     assert_eq!(replacement.size, 11);
     assert_eq!(replacement.link_count, 1);

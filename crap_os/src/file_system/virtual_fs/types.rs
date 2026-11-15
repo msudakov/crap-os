@@ -26,8 +26,10 @@
 //!   - [`Permissions`]        : Placeholder for the future ACL-based permission
 //!                              model.
 //!   - [`InodeStat`]          : A point-in-time snapshot of inode metadata,
-//!                              returned by `VirtualFileSystem::stat()` and
-//!                              eventually copied into usermode `stat` buffers.
+//!                              returned by
+//!                              `VirtualFileSystem::inode_metadata_by_path()`
+//!                              and eventually copied into usermode status
+//!                              buffers.
 //!   - [`OpenFileKey`]        : Composite key used to look up a file's master
 //!                              record in the VFS open-file table.
 
@@ -513,14 +515,14 @@ impl Permissions {
 
 /// A point-in-time snapshot of an inode's metadata.
 ///
-/// Returned by [`crate::file_system::virtual_fs::vfs::VirtualFileSystem::stat`]
+/// Returned by [`super::vfs::VirtualFileSystem::inode_metadata_by_path`]
 /// rather than a raw `Arc<Inode>` reference, for two reasons: it avoids
 /// unnecessarily widening the lifetime of the inode's `Arc`, and it maps
 /// directly onto what a future `stat()` syscall will need to copy into a
 /// userspace buffer.
 ///
 /// Filesystem drivers do not produce [`InodeStat`] directly; the VFS constructs
-/// one from a loaded `Inode` at the point `stat()` is called.
+/// one from the canonical `Inode` when queried by path or handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InodeStat {
     /// The inode's unique identifier within its filesystem instance.

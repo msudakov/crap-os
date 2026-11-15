@@ -775,23 +775,24 @@ impl VirtualFileSystem {
     /// by a `stat`-family syscall.
     ///
     /// If `path` resolves to a symlink, the symlink is followed and the
-    /// target's metadata is returned. To stat the symlink inode itself, pass
-    /// `follow_symlinks: false`.
+    /// target's metadata is returned. For the final symlink's own metadata,
+    /// pass `follow_symlinks: false`.
     ///
     /// # Arguments
     ///
-    /// * `path`              - The path of the inode to stat.
+    /// * `path`              - The path of the inode whose metadata is
+    ///   requested.
     /// * `working_directory` - The starting directory for relative paths.
     ///   `None` means use the global root.
     /// * `follow_symlinks`   - Whether to follow a symlink at the final path
-    ///   component. `true` returns the target's stat; `false` returns the
-    ///   symlink's own stat.
+    ///   component. With `true`, returns the target's metadata. With `false`,
+    ///   returns the symlink's own metadata.
     ///
     /// # Returns
     ///
     /// Returns `Ok(InodeStat)` on success, or `Err(FileSystemError)` if the
     /// path cannot be resolved, or an I/O error occurs.
-    pub fn stat(
+    pub fn inode_metadata_by_path(
         &self,
         path: &str,
         working_directory: Option<Arc<Directory>>,

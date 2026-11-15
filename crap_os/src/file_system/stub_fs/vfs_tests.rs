@@ -52,7 +52,8 @@
 //! 25. **Append** - checks per-write EOF selection, offsets, and failures.
 //! 26. **Readlink** - checks stored targets, path errors, and link access time.
 //! 27. **Handle metadata** - checks inode metadata across replacement and close.
-//! 28. **Teardown** - releases the global VFS owner after the tests.
+//! 28. **Directory listing** - checks snapshots, symlinks, and mount visibility.
+//! 29. **Teardown** - releases the global VFS owner after the tests.
 
 extern crate alloc;
 
@@ -63,7 +64,7 @@ use crate::file_system::stub_fs::stub_block_device::StubBlockDevice;
 use crate::file_system::stub_fs::StubFileSystemDriver;
 use crate::file_system::virtual_fs::directory::Directory;
 use crate::file_system::virtual_fs::types::{
-    AccessMode, CreateMode, FileSystemError, InodeType, Permissions,
+    AccessMode, CreateMode, DirectoryEntryType, FileSystemError, InodeType, Permissions,
     NamespaceProtection, OpenContentsMode, OpenOptions, SeekOrigin,
 };
 use crate::file_system::virtual_fs::vfs::VirtualFileSystem;
@@ -133,6 +134,7 @@ pub fn run_vfs_tests() {
     test_append_write_failure();
     test_readlink();
     test_inode_metadata_by_handle();
+    test_list_directory();
     expect_ok(with_vfs(|vfs| vfs.reclaim_unlinked_inodes()), "final unlinked inode cleanup");
     teardown_vfs();
 
@@ -3555,4 +3557,90 @@ fn test_inode_metadata_by_handle() {
     );
 
     sprintln!("[VFS TEST] inode metadata by handle ... PASS");
+}
+
+/// Verifies directory listings across rename, mount, and removal.
+///
+/// A final symlink selects the directory to list, and a dangling child
+/// symlink appears with its own identity. Saved entries remain readable
+/// after namespace changes, while each new listing reads the current state.
+///
+/// # Panics
+///
+/// Panics if fixture setup fails or the entries, access time, or path errors
+/// differ from the listing contract.
+fn test_list_directory() {
+    sprintln!("[VFS TEST] directory listing ...");
+    let mut vfs = new_stub_vfs();
+    let path = "/etc/listing";
+    let dir = expect_ok(
+        vfs.create_directory(path, Permissions::all_permissive(), None),
+        "create listing directory",
+    );
+    let child = expect_ok(
+        vfs.create_symlink("/etc/listing/link", "/missing", None),
+        "create dangling child link",
+    );
+    expect_ok(
+        vfs.create_symlink("/listing-link", path, None),
+        "create link to listing directory",
+    );
+
+    // Seed access time so the assertion is independent of clock ticks.
+    dir.metadata.lock().timestamps.accessed = u64::MAX;
+    let snapshot = expect_ok(vfs.list_directory("/listing-link", None), "list through symlink");
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].name, "link");
+    assert_eq!(snapshot[0].inode_number, child.inode_number);
+    assert_eq!(snapshot[0].entry_type, DirectoryEntryType::Symlink);
+    assert_ne!(dir.stat().timestamps.accessed, u64::MAX);
+    assert!(dir.is_dirty());
+
+    expect_ok(
+        vfs.rename("/etc/listing/link", "/etc/listing/renamed", None),
+        "rename listed child",
+    );
+    let fresh = expect_ok(vfs.list_directory(path, None), "list after rename");
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(fresh[0].name, "renamed");
+    assert_eq!(snapshot[0].name, "link");
+    expect_ok(vfs.unlink("/etc/listing/renamed", None), "unlink listed child");
+
+    let budget = crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH;
+    let retained = expect_ok(
+        vfs.resolve_dir_with_budget(path, None, budget),
+        "retain host directory",
+    );
+    expect_ok(
+        vfs.mount("stubfs", Arc::new(StubBlockDevice), path, None),
+        "mount over listing directory",
+    );
+    let parent = expect_ok(vfs.list_directory("/etc", None), "list mount parent");
+    let host = parent.iter().find(|entry| entry.name == "listing")
+        .expect("mount host entry missing");
+    assert_eq!(host.inode_number, dir.inode_number);
+    assert_eq!(host.entry_type, DirectoryEntryType::Directory);
+
+    let mounted = expect_ok(
+        vfs.list_directory(".", Some(Arc::clone(&retained))),
+        "list mounted root relative to retained host",
+    );
+    expect_ok(vfs.unmount(path, None), "unmount while listing is retained");
+    assert!(mounted.iter().any(|entry| entry.name == "etc"));
+    let uncovered = expect_ok(vfs.list_directory(path, None), "list uncovered host");
+    assert!(uncovered.is_empty());
+
+    expect_ok(vfs.remove_directory(path, None), "remove retained host");
+    expect_err(
+        vfs.list_directory(".", Some(retained)),
+        FileSystemError::NotFound,
+        "list detached working directory",
+    );
+    expect_err(
+        vfs.list_directory("/etc/config.txt", None),
+        FileSystemError::NotADirectory,
+        "list regular file",
+    );
+
+    sprintln!("[VFS TEST] directory listing ... PASS");
 }

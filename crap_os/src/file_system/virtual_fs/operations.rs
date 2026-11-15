@@ -43,11 +43,12 @@
 
 use alloc::sync::Arc;
 use alloc::string::{String, ToString};
+use alloc::vec::Vec;
 use core::sync::atomic::Ordering;
 
 use super::directory::Directory;
 use super::file::{File, FileHandle, OpenNamespaceProtection};
-use super::inode::Inode;
+use super::inode::{DirectoryEntry, Inode};
 use super::types::{
     AccessMode, CreateMode, DirectoryEntryType, FileSystemError, InodeStat,
     NamespaceProtection, OpenContentsMode, OpenFileKey, OpenOptions,
@@ -865,6 +866,52 @@ impl VirtualFileSystem {
         self.touch_accessed(&inode)?;
 
         Ok(target)
+    }
+
+    /// Returns an owned snapshot of the named children of a directory.
+    ///
+    /// Resolves `path` through symlinks and mounts, then reads the resolved
+    /// directory from its driver. Entries retain the names, inode numbers,
+    /// and types stored in that directory. A mount point appears as its host
+    /// entry when listing its parent, and listing the mount point itself
+    /// reads the mounted root.
+    ///
+    /// The listing excludes `.` and `..`, has unspecified order, and keeps
+    /// no inode references. After a successful read, updates the resolved
+    /// directory's access time and marks its metadata dirty for a later sync.
+    ///
+    /// # Arguments
+    ///
+    /// * `path`              - Path to the directory to list.
+    /// * `working_directory` - Starting directory for relative paths. `None`
+    ///   means use the global root.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(Vec<DirectoryEntry>)` on success, including an empty vector
+    /// for an empty directory. Returns `Err(FileSystemError::NotADirectory)`
+    /// if the path resolves to another inode type, or
+    /// `Err(FileSystemError::NotFound)` if it resolves to a detached directory.
+    /// Propagates path resolution and driver errors.
+    pub fn list_directory(
+        &self,
+        path: &str,
+        working_directory: Option<Arc<Directory>>,
+    ) -> Result<Vec<DirectoryEntry>, FileSystemError> {
+        let inode = self.resolve(path, working_directory, true)?;
+
+        if !inode.is_directory() {
+            return Err(FileSystemError::NotADirectory);
+        }
+
+        if inode.metadata.lock().link_count == 0 {
+            return Err(FileSystemError::NotFound);
+        }
+
+        let entries = inode.filesystem.read_dir(&inode)?;
+        self.touch_accessed(&inode)?;
+
+        Ok(entries)
     }
 
     /// Creates a new regular file at `path`.

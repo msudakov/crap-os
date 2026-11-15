@@ -51,7 +51,8 @@
 //! 24. **Signed seek** - checks origins, shared offsets, and rejected seeks.
 //! 25. **Append** - checks per-write EOF selection, offsets, and failures.
 //! 26. **Readlink** - checks stored targets, path errors, and link access time.
-//! 27. **Teardown** - releases the global VFS owner after the tests.
+//! 27. **Handle metadata** - checks inode metadata across replacement and close.
+//! 28. **Teardown** - releases the global VFS owner after the tests.
 
 extern crate alloc;
 
@@ -131,6 +132,7 @@ pub fn run_vfs_tests() {
     test_append_writes();
     test_append_write_failure();
     test_readlink();
+    test_inode_metadata_by_handle();
     expect_ok(with_vfs(|vfs| vfs.reclaim_unlinked_inodes()), "final unlinked inode cleanup");
     teardown_vfs();
 
@@ -3486,4 +3488,71 @@ fn test_readlink() {
     );
 
     sprintln!("[VFS TEST] readlink ... PASS");
+}
+
+/// Verifies that handle metadata follows the open inode across replacement.
+///
+/// A write-only handle retains the displaced inode after the destination
+/// name moves to the incoming inode. The handle continues to report the
+/// displaced inode's size and current link count. A successful close
+/// invalidates the retained handle clone.
+///
+/// # Panics
+///
+/// Panics if setup fails or metadata, file position, or handle validity
+/// differs from the expected result.
+fn test_inode_metadata_by_handle() {
+    sprintln!("[VFS TEST] inode metadata by handle ...");
+    let mut vfs = new_stub_vfs();
+    let old = replacement_file(&mut vfs, "/etc/old", b"old");
+    let incoming = replacement_file(&mut vfs, "/etc/incoming", b"replacement");
+    let handle = expect_ok(
+        vfs.open("/etc/old", AccessMode::WriteOnly, None),
+        "open write-only destination",
+    );
+    let retained = Arc::clone(&handle);
+    expect_ok(vfs.seek(&handle, 2), "set destination handle position");
+
+    let before = expect_ok(
+        vfs.inode_metadata_by_handle(&handle),
+        "get write-only handle metadata",
+    );
+    assert_eq!(before.inode_number, old.inode_number);
+    assert_eq!(before.size, 3);
+    assert_eq!(before.link_count, 1);
+
+    expect_ok(
+        vfs.rename("/etc/incoming", "/etc/old", None),
+        "replace open destination",
+    );
+
+    let displaced = expect_ok(
+        vfs.inode_metadata_by_handle(&handle),
+        "get displaced handle metadata",
+    );
+    assert_eq!(displaced.inode_number, before.inode_number);
+    assert_eq!(displaced.size, before.size);
+    assert_eq!(displaced.link_count, 0);
+
+    let replacement = expect_ok(vfs.stat("/etc/old", None, true), "stat replacement");
+    assert_eq!(replacement.inode_number, incoming.inode_number);
+    assert_eq!(replacement.size, 11);
+    assert_eq!(replacement.link_count, 1);
+
+    assert_eq!(
+        expect_ok(
+            vfs.seek_signed(&handle, 0, SeekOrigin::Current),
+            "get destination handle position",
+        ),
+        2,
+    );
+
+    expect_ok(vfs.close(&handle), "close displaced handle");
+    expect_err(
+        vfs.inode_metadata_by_handle(&retained),
+        FileSystemError::InvalidHandle,
+        "get metadata through retained clone after close",
+    );
+
+    sprintln!("[VFS TEST] inode metadata by handle ... PASS");
 }

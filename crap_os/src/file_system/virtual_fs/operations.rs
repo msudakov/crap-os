@@ -801,6 +801,34 @@ impl VirtualFileSystem {
         Ok(inode.stat())
     }
 
+    /// Returns a metadata snapshot for the inode associated with `handle`.
+    ///
+    /// Reads the canonical inode retained by the handle, so the snapshot still
+    /// describes that inode after its name is removed or replaced. Holds the
+    /// handle state lock through the snapshot, so close cannot invalidate the
+    /// handle during the operation. Any open access mode is accepted, and the
+    /// handle's file position is preserved.
+    ///
+    /// # Arguments
+    ///
+    /// * `handle` - File handle registered by this VFS.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(InodeStat)` with the current metadata, or
+    /// `Err(FileSystemError::InvalidHandle)` if the handle has been closed.
+    pub fn inode_metadata_by_handle(
+        &self,
+        handle: &FileHandle,
+    ) -> Result<InodeStat, FileSystemError> {
+        let state = handle.state.lock();
+        if state.closed {
+            return Err(FileSystemError::InvalidHandle);
+        }
+
+        Ok(handle.file.inode.stat())
+    }
+
     /// Returns the target string stored in the symbolic link at `path`.
     ///
     /// Follows symlinks in parent components and reads the final symlink

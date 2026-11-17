@@ -350,7 +350,10 @@ impl VirtualFileSystem {
         self.inodes.lock().remove(key);
     }
 
-    /// Persists dirty inodes for one mounted filesystem before unmount.
+    /// Hands dirty inode metadata to one mounted filesystem instance.
+    ///
+    /// Completion of this pass lets the VFS clear its inode dirty flags.
+    /// The subsequent driver flush supplies the volume durability boundary.
     ///
     /// The global VFS lock prevents another VFS operation from changing an
     /// inode after its successful sync. Clone the references under the table
@@ -382,6 +385,57 @@ impl VirtualFileSystem {
         }
 
         Ok(())
+    }
+
+    /// Synchronizes the mounted filesystem containing the resolved path.
+    ///
+    /// Resolution follows the final symlink. A mount path selects the mounted
+    /// filesystem, and `/` selects the root filesystem. Only the selected
+    /// instance is synced. Open handles and retained directories are permitted.
+    /// The caller holds VFS serialization through resolution and driver I/O.
+    /// Drivers must complete synchronously without waiting for interrupts on
+    /// the CPU holding the global VFS IRQ lock.
+    ///
+    /// # Arguments
+    ///
+    /// * `path`              - Existing file or directory used to select its
+    ///   filesystem.
+    /// * `working_directory` - Relative-path base, or root when absent.
+    ///
+    /// # Returns
+    ///
+    /// Returns success after the driver flushes data and metadata, or a path,
+    /// inode synchronization, or volume flush error. A failure leaves the
+    /// instance usable and its pending work retryable.
+    pub fn sync_volume(
+        &mut self,
+        path: &str,
+        working_directory: Option<Arc<Directory>>,
+    ) -> Result<(), FileSystemError> {
+        let inode = self.resolve(path, working_directory, true)?;
+        self.sync_volume_instance(&inode.filesystem)
+    }
+
+    /// Hands off dirty inode metadata, then flushes the selected instance.
+    ///
+    /// Explicit sync and unmount use the same sequence. Flush always runs
+    /// after a successful inode pass, including when no inodes remain dirty.
+    /// A driver retains pending writes after a failed flush so a retry can
+    /// finish without requiring the VFS to mark accepted metadata dirty again.
+    ///
+    /// # Arguments
+    ///
+    /// * `instance` - Mounted instance to sync under VFS serialization.
+    ///
+    /// # Returns
+    ///
+    /// Returns success after both phases, or their first driver error.
+    fn sync_volume_instance(
+        &self,
+        instance: &Arc<dyn FileSystemInstance>,
+    ) -> Result<(), FileSystemError> {
+        self.sync_volume_inodes(instance.instance_id())?;
+        instance.sync_volume()
     }
 
     /// Registers a filesystem driver with the VFS under its declared name.
@@ -535,9 +589,9 @@ impl VirtualFileSystem {
     ///    directory inode. A free error leaves the mount attached for retry.
     /// 2. Verify a filesystem is currently mounted there.
     /// 3. Verify no open file handles exist on the mounted volume.
-    /// 4. Sync dirty VFS inodes, then call
-    ///    [`super::driver::FileSystemInstance::unmount`] to flush driver state.
-    ///    If either step fails, leave the mount records intact for retry.
+    /// 4. Sync dirty VFS inodes and flush the volume before calling
+    ///    [`super::driver::FileSystemInstance::unmount`] to release driver
+    ///    state. If any step fails, leave the mount records intact for retry.
     /// 5. Remove the [`MountPoint`], mounted-root identity, relocated parents,
     ///    and VFS inode entries for this filesystem instance.
     ///
@@ -622,11 +676,11 @@ impl VirtualFileSystem {
             return Err(FileSystemError::FileLocked);
         }
 
-        // Persist VFS metadata before the driver tears down its own state.
-        // An error leaves the mount and inode table intact for a retry.
-        self.sync_volume_inodes(filesystem_id)?;
+        // Complete both sync phases before driver teardown. Errors preserve
+        // the mount and retained inode table so normal operations can continue.
+        self.sync_volume_instance(&mount_point.instance)?;
 
-        // Flush driver-owned state before changing the namespace.
+        // Release driver-owned resources before changing the namespace.
         mount_point.instance.unmount()?;
 
         // The global VFS lock prevents another path walk from observing these

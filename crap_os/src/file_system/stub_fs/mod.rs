@@ -4,10 +4,10 @@
 //! development to exercise the VFS layer before a real on-disk filesystem is
 //! available. It implements [`FileSystemDriver`] and [`FileSystemInstance`]
 //! with a hardcoded directory tree and no disk interaction.
-//! The VFS test harness can inject one-shot unmount, inode-free, staged
-//! creation, and staged rename errors to check retry behavior without changing
-//! backing state on failure. Namespace protection is enforced by the VFS, not
-//! this driver.
+//! The VFS test harness can inject one-shot inode-sync, volume-flush, unmount,
+//! inode-free, staged creation, and staged rename errors to check retry behavior
+//! without changing backing state on failure. Namespace protection is enforced
+//! by the VFS.
 //!
 //! ## Hardcoded Tree
 //!
@@ -111,6 +111,41 @@ static FAIL_UNMOUNT_ONCE_FOR: SpinLock<Option<u64>> = SpinLock::new(None);
 /// * `instance_id` - Identifier of the mounted stub instance to target.
 fn fail_next_unmount_for(instance_id: u64) {
     *FAIL_UNMOUNT_ONCE_FOR.lock() = Some(instance_id);
+}
+
+/// One-shot metadata handoff failure for one inode on one instance.
+static FAIL_SYNC_INODE_ONCE_FOR: SpinLock<Option<(u64, u64)>> = SpinLock::new(None);
+
+/// One-shot volume flush failure for one instance.
+static FAIL_SYNC_VOLUME_ONCE_FOR: SpinLock<Option<u64>> = SpinLock::new(None);
+
+/// Driver boundaries recorded while an instance is selected by a sync test.
+#[derive(Debug, PartialEq, Eq)]
+enum SyncEvent {
+    /// Generic metadata handoff for this inode number.
+    Inode(u64),
+    /// Volume data and metadata flush.
+    Flush,
+    /// Driver resource teardown.
+    Unmount,
+}
+
+/// Optional event capture keyed by instance so other volumes stay isolated.
+static SYNC_EVENTS: SpinLock<Option<(u64, Vec<SyncEvent>)>> = SpinLock::new(None);
+
+/// Records a driver boundary when the harness has selected this instance.
+///
+/// # Arguments
+///
+/// * `instance_id` - Instance receiving the driver call.
+/// * `event` - Boundary reached before any injected failure.
+fn record_sync_event(instance_id: u64, event: SyncEvent) {
+    let mut capture = SYNC_EVENTS.lock();
+    if let Some((selected, events)) = capture.as_mut() {
+        if *selected == instance_id {
+            events.push(event);
+        }
+    }
 }
 
 /// One-shot free failure keyed by filesystem instance and inode number.
@@ -548,8 +583,25 @@ impl FileSystemInstance for StubFsInstance {
         Ok(Self::make_vfs_inode(&inodes[idx], instance_arc))
     }
 
-    fn sync_inode(&self, _inode: &Inode) -> Result<(), FileSystemError> {
-        // No disk to sync to; the in-memory state is always current.
+    /// Exercises metadata handoff and its retry boundary in the VFS.
+    ///
+    /// StubFS has no persistent metadata store. Event capture and failure
+    /// injection let tests observe the VFS dirty flag and flush ordering.
+    ///
+    /// # Arguments
+    ///
+    /// * `inode` - Canonical inode whose metadata the VFS is handing off.
+    ///
+    /// # Returns
+    ///
+    /// Returns an armed `DiskWriteError` once, or success.
+    fn sync_inode(&self, inode: &Inode) -> Result<(), FileSystemError> {
+        record_sync_event(self.id, SyncEvent::Inode(inode.inode_number));
+        let mut fail_for = FAIL_SYNC_INODE_ONCE_FOR.lock();
+        if *fail_for == Some((self.id, inode.inode_number)) {
+            *fail_for = None;
+            return Err(FileSystemError::DiskWriteError);
+        }
         Ok(())
     }
 
@@ -1082,6 +1134,23 @@ impl FileSystemInstance for StubFsInstance {
         Ok(())
     }
 
+    /// Exercises the volume flush boundary without performing disk I/O.
+    ///
+    /// Failure injection is independent of inode handoff and unmount.
+    ///
+    /// # Returns
+    ///
+    /// Returns an armed `DiskWriteError` once, or success.
+    fn sync_volume(&self) -> Result<(), FileSystemError> {
+        record_sync_event(self.id, SyncEvent::Flush);
+        let mut fail_for = FAIL_SYNC_VOLUME_ONCE_FOR.lock();
+        if *fail_for == Some(self.id) {
+            *fail_for = None;
+            return Err(FileSystemError::DiskWriteError);
+        }
+        Ok(())
+    }
+
     /// Completes unmount, unless the test harness armed a one-shot failure.
     ///
     /// A simulated failure leaves this instance usable for a later retry.
@@ -1090,6 +1159,7 @@ impl FileSystemInstance for StubFsInstance {
     ///
     /// Returns `Err(DiskWriteError)` once for an armed instance, or `Ok(())`.
     fn unmount(&self) -> Result<(), FileSystemError> {
+        record_sync_event(self.id, SyncEvent::Unmount);
         // Exercise the VFS retry path without releasing any instance state.
         let mut fail_for = FAIL_UNMOUNT_ONCE_FOR.lock();
         if *fail_for == Some(self.id) {
@@ -1097,8 +1167,8 @@ impl FileSystemInstance for StubFsInstance {
             return Err(FileSystemError::DiskWriteError);
         }
 
-        // Nothing to flush; the stub retains its in-memory state until the
-        // last reference to this instance is dropped.
+        // VFS volume sync has completed. Backing memory stays owned by this
+        // instance until its last reference is dropped.
         Ok(())
     }
 }

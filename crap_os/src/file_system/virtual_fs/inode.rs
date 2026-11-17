@@ -162,13 +162,12 @@ pub(crate) struct InodeMetadata {
     /// cleanup before the driver frees storage and releases the inode slot.
     pub(crate) link_count: u32,
 
-    /// Indicates that this inode has been modified in memory but not yet
-    /// synced to disk.
+    /// Indicates that generic metadata awaits handoff to the driver.
     ///
-    /// Set to `true` by VFS reads and writes. The VFS clears it after
-    /// [`super::driver::FileSystemInstance::sync_inode`] succeeds during
-    /// volume unmount. A separate sync path for the boot volume is not yet
-    /// implemented.
+    /// Set by VFS metadata updates, including read and write timestamps.
+    /// The VFS clears it after [`FileSystemInstance::sync_inode`] succeeds.
+    /// Persistence completes when [`FileSystemInstance::sync_volume`]
+    /// subsequently flushes the driver and backing storage.
     pub(crate) dirty: bool,
 }
 

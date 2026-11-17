@@ -127,6 +127,19 @@ pub trait BlockDevice: Send + Sync {
         block_number: u64,
         buffer: &[u8],
     ) -> Result<(), FileSystemError>;
+
+    /// Completes prior writes through this device's persistence boundary.
+    ///
+    /// A caching device must finish the hardware flush before returning
+    /// success. A device, whose successful writes are already persistent, may
+    /// complete immediately. Filesystem drivers call this after submitting
+    /// the data and metadata needed for their volume sync.
+    ///
+    /// # Returns
+    ///
+    /// Returns success after prior writes are persistent, or a device error.
+    /// A failure permits a later retry of the flush.
+    fn flush(&self) -> Result<(), FileSystemError>;
 }
 
 /// A stateless factory that produces a live [`FileSystemInstance`] from a
@@ -289,10 +302,11 @@ pub trait FileSystemInstance: Send + Sync {
     ///
     /// The driver can obtain a consistent snapshot of the generic metadata
     /// (size, permissions, timestamps, and link count) with `inode.stat()` and
-    /// persist it in its backing record. The in-memory stub has nothing to
-    /// persist. The VFS does not hold the inode's metadata lock across driver
-    /// calls. It clears the dirty flag only after this method succeeds during
-    /// volume unmount.
+    /// accept it into its backing record or pending write state. The VFS
+    /// releases the metadata lock before this call and clears its dirty flag
+    /// after success. A returned error leaves that inode dirty for retry.
+    /// A successful call transfers responsibility for pending metadata to the
+    /// driver. [`FileSystemInstance::sync_volume`] completes the flush.
     ///
     /// # Arguments
     ///
@@ -770,20 +784,38 @@ pub trait FileSystemInstance: Send + Sync {
     // Mount Lifecycle
     // =========================================================================
 
-    /// Flushes all pending writes and releases resources held by this
-    /// filesystem instance.
+    /// Flushes this instance's pending data and filesystem metadata.
     ///
-    /// Called by the VFS during unmount, after checking for open handles and
-    /// syncing dirty VFS inodes. The driver must flush pending writes and
-    /// metadata it owns before releasing resources needed for filesystem
-    /// operations. On an error, the instance remains mounted and usable so the
-    /// VFS can retry unmount. On success, the VFS removes the mount record and
-    /// its retained inodes; other external inode references may remain.
+    /// The VFS first hands off dirty inode metadata through
+    /// [`FileSystemInstance::sync_inode`]. This operation also flushes driver
+    /// state such as directory entries and allocation records, along with
+    /// data written through open files. Success includes completion of any
+    /// backing-device cache flush needed to make those writes persistent
+    /// through [`BlockDevice::flush`]. In-memory filesystems complete without
+    /// a storage-device flush.
+    ///
+    /// Calls are serialized by the VFS. Open files are permitted. The instance
+    /// stays usable after success or failure. After a partial failure the
+    /// driver retains enough state to retry every outstanding write or flush.
+    /// Accepted inode metadata may already be clean in the VFS at that point.
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` after a successful flush and teardown, or
-    /// `Err(FileSystemError)` if flushing fails. On error, the driver must
-    /// retain the state needed for normal operations and another unmount call.
+    /// Returns success when prior writes have reached the backing storage's
+    /// persistence boundary, or a driver error with pending work retryable.
+    fn sync_volume(&self) -> Result<(), FileSystemError>;
+
+    /// Releases resources held by this filesystem instance after volume sync.
+    ///
+    /// The VFS checks unmount eligibility and completes both inode sync and
+    /// volume flush before calling this method. On error, the instance remains
+    /// mounted and usable for normal operations and a later unmount retry.
+    /// Success permits the VFS to remove its mount record and retained inodes.
+    /// External inode references can still keep the instance object alive.
+    ///
+    /// # Returns
+    ///
+    /// Returns success after teardown or a driver error preserving the state
+    /// needed for normal operations and another unmount attempt.
     fn unmount(&self) -> Result<(), FileSystemError>;
 }

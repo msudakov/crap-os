@@ -54,7 +54,8 @@
 //! 27. **Handle metadata** - checks inode metadata across replacement and close.
 //! 28. **Directory listing** - checks snapshots, symlinks, and mount visibility.
 //! 29. **Filenames** - checks case, spelling, path syntax, and byte limits.
-//! 30. **Teardown** - releases the global VFS owner after the tests.
+//! 30. **Volume sync** - checks selection, inode handoff, flush, and retries.
+//! 31. **Teardown** - releases the global VFS owner after the tests.
 
 extern crate alloc;
 
@@ -138,6 +139,9 @@ pub fn run_vfs_tests() {
     test_list_directory();
     test_filename_case();
     test_filename_limits();
+    test_volume_sync_selection();
+    test_volume_sync_retry();
+    test_volume_sync_unmount();
     expect_ok(with_vfs(|vfs| vfs.reclaim_unlinked_inodes()), "final unlinked inode cleanup");
     teardown_vfs();
 
@@ -1408,13 +1412,13 @@ fn test_mount_wrapper_consistency() {
     );
     close_file(&busy_handle);
 
-    // A failed driver flush must leave both mount indexes intact. The stub
-    // injects one failure for this mounted instance, then permits a retry.
+    // A failed driver teardown must leave both mount indexes intact. The
+    // stub injects one failure for this instance, then permits a retry.
     super::fail_next_unmount_for(visible_root.filesystem.instance_id());
     expect_err(
         with_vfs(|vfs| vfs.unmount("/etc", None)),
         FileSystemError::DiskWriteError,
-        "unmount with a simulated flush failure",
+        "unmount with a simulated teardown failure",
     );
     expect_ok(
         with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/bin/shell", None, false)),
@@ -3781,4 +3785,205 @@ fn test_filename_limits() {
     expect_err(vfs.resolve("/long-target/config.txt", None, true),
         FileSystemError::InvalidPath, "reject path exceeding limit after expansion");
     sprintln!("[VFS TEST] filename limits ... PASS");
+}
+
+/// Starts capture of sync boundaries for one filesystem instance.
+///
+/// # Arguments
+///
+/// * `instance_id` - Instance selected by the next sync test operation.
+fn capture_sync_events(instance_id: u64) {
+    *super::SYNC_EVENTS.lock() = Some((instance_id, alloc::vec::Vec::new()));
+}
+
+/// Ends capture and returns the recorded driver boundaries.
+///
+/// # Returns
+///
+/// Returns the events for the selected instance in driver-call order.
+///
+/// # Panics
+///
+/// Panics if a test ends capture without starting it.
+fn take_sync_events() -> alloc::vec::Vec<super::SyncEvent> {
+    super::SYNC_EVENTS.lock().take().expect("sync capture is active").1
+}
+
+/// Checks root, mounted, symlink, and relative-path volume selection.
+///
+/// Root sync must leave a separately mounted instance's metadata dirty. A
+/// flush must run even when the selected instance has no dirty VFS inodes.
+///
+/// # Panics
+///
+/// Panics if selection or flush behavior violates the volume sync contract.
+fn test_volume_sync_selection() {
+    use super::SyncEvent;
+    sprintln!("[VFS TEST] volume sync selection ...");
+    let mut vfs = new_stub_vfs();
+    let root = expect_ok(vfs.resolve("/", None, true), "root identity");
+    expect_ok(vfs.mount("stubfs", Arc::new(StubBlockDevice), "/var", None),
+        "mount second volume");
+    let mounted = expect_ok(vfs.resolve("/var", None, true), "mounted identity");
+    let opened = expect_ok(vfs.open("/etc/config.txt", AccessMode::ReadWrite, None),
+        "open root file during sync");
+    expect_ok(vfs.write(&opened, b"sync"), "dirty root file");
+    mounted.metadata.lock().dirty = true;
+    capture_sync_events(root.filesystem.instance_id());
+    expect_ok(vfs.sync_volume("/", None), "sync root with an open file");
+    let events = take_sync_events();
+    assert!(events.contains(&SyncEvent::Inode(opened.file.inode.inode_number)));
+    assert_eq!(events.last(), Some(&SyncEvent::Flush));
+    assert!(!opened.file.inode.is_dirty());
+    assert!(mounted.is_dirty());
+
+    capture_sync_events(root.filesystem.instance_id());
+    expect_ok(vfs.sync_volume("/etc/config.txt", None), "sync by file path");
+    assert_eq!(take_sync_events(), alloc::vec![SyncEvent::Flush]);
+
+    expect_ok(vfs.create_symlink("/selected-volume", "/var", None),
+        "link to mounted root");
+    capture_sync_events(mounted.filesystem.instance_id());
+    expect_ok(vfs.sync_volume("/selected-volume", None), "follow selection symlink");
+    assert_eq!(take_sync_events(),
+        alloc::vec![SyncEvent::Inode(mounted.inode_number), SyncEvent::Flush]);
+    assert!(!mounted.is_dirty());
+
+    let working = expect_ok(vfs.resolve_dir_with_budget(
+        "/var", None,
+        crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH,
+    ), "mounted working directory");
+    capture_sync_events(mounted.filesystem.instance_id());
+    expect_ok(vfs.sync_volume("etc/config.txt", Some(working)),
+        "select relative to a working directory");
+    assert_eq!(take_sync_events(), alloc::vec![SyncEvent::Flush]);
+
+    capture_sync_events(root.filesystem.instance_id());
+    expect_err(vfs.sync_volume("/missing", None), FileSystemError::NotFound,
+        "missing path cannot select a volume");
+    assert!(take_sync_events().is_empty());
+    expect_ok(vfs.close(&opened), "close root file");
+    sprintln!("[VFS TEST] volume sync selection ... PASS");
+}
+
+/// Checks dirty flag ownership across metadata and flush failures.
+///
+/// A failed inode handoff stays dirty and prevents the flush phase. A failed
+/// flush can leave VFS metadata clean, and retry must still call the driver.
+///
+/// # Panics
+///
+/// Panics if a failed sync loses retry work or a retry skips volume flush.
+fn test_volume_sync_retry() {
+    use super::SyncEvent;
+    sprintln!("[VFS TEST] volume sync retry ...");
+    let mut vfs = new_stub_vfs();
+    let root = expect_ok(vfs.resolve("/", None, true), "root identity");
+    let instance_id = root.filesystem.instance_id();
+    expect_ok(vfs.sync_volume("/", None), "baseline sync");
+    root.metadata.lock().dirty = true;
+    *super::FAIL_SYNC_INODE_ONCE_FOR.lock() = Some((instance_id, root.inode_number));
+    capture_sync_events(instance_id);
+    expect_err(vfs.sync_volume("/", None), FileSystemError::DiskWriteError,
+        "failed inode handoff");
+    assert_eq!(take_sync_events(), alloc::vec![SyncEvent::Inode(root.inode_number)]);
+    assert!(root.is_dirty());
+
+    capture_sync_events(instance_id);
+    expect_ok(vfs.sync_volume("/", None), "retry inode handoff");
+    assert_eq!(take_sync_events(),
+        alloc::vec![SyncEvent::Inode(root.inode_number), SyncEvent::Flush]);
+    assert!(!root.is_dirty());
+
+    root.metadata.lock().dirty = true;
+    *super::FAIL_SYNC_VOLUME_ONCE_FOR.lock() = Some(instance_id);
+    capture_sync_events(instance_id);
+    expect_err(vfs.sync_volume("/", None), FileSystemError::DiskWriteError,
+        "failed volume flush after accepted metadata");
+    assert_eq!(take_sync_events(),
+        alloc::vec![SyncEvent::Inode(root.inode_number), SyncEvent::Flush]);
+    assert!(!root.is_dirty());
+
+    capture_sync_events(instance_id);
+    expect_ok(vfs.sync_volume("/", None), "retry flush with clean inode flags");
+    assert_eq!(take_sync_events(), alloc::vec![SyncEvent::Flush]);
+    let file = expect_ok(vfs.resolve("/etc/config.txt", None, true),
+        "second inode for partial progress");
+    root.metadata.lock().dirty = true;
+    file.metadata.lock().dirty = true;
+    capture_sync_events(instance_id);
+    expect_ok(vfs.sync_volume("/", None), "observe inode pass order");
+    let order = take_sync_events();
+    assert_eq!(order.len(), 3);
+    let last_inode = match &order[1] {
+        SyncEvent::Inode(number) => *number,
+        _ => panic!("second sync event must hand off inode metadata"),
+    };
+
+    root.metadata.lock().dirty = true;
+    file.metadata.lock().dirty = true;
+    *super::FAIL_SYNC_INODE_ONCE_FOR.lock() = Some((instance_id, last_inode));
+    capture_sync_events(instance_id);
+    expect_err(vfs.sync_volume("/", None), FileSystemError::DiskWriteError,
+        "fail after another inode was accepted");
+    assert_eq!(take_sync_events().as_slice(), &order[..2]);
+    assert_eq!(root.is_dirty(), root.inode_number == last_inode);
+    assert_eq!(file.is_dirty(), file.inode_number == last_inode);
+
+    capture_sync_events(instance_id);
+    expect_ok(vfs.sync_volume("/", None), "retry only outstanding metadata");
+    assert_eq!(take_sync_events(),
+        alloc::vec![SyncEvent::Inode(last_inode), SyncEvent::Flush]);
+    sprintln!("[VFS TEST] volume sync retry ... PASS");
+}
+
+/// Checks that unmount completes sync before teardown and preserves retry state.
+///
+/// Each failed phase must preserve the mounted namespace. Repeated attempts
+/// finish pending flush work before making the underlying host visible.
+///
+/// # Panics
+///
+/// Panics if teardown runs before successful sync or an error detaches the mount.
+fn test_volume_sync_unmount() {
+    use super::SyncEvent;
+    sprintln!("[VFS TEST] volume sync unmount ...");
+    let mut vfs = new_stub_vfs();
+    expect_ok(vfs.mount("stubfs", Arc::new(StubBlockDevice), "/var", None),
+        "mount sync fixture");
+    let mounted = expect_ok(vfs.resolve("/var", None, true), "mounted identity");
+    let instance_id = mounted.filesystem.instance_id();
+    expect_ok(vfs.sync_volume("/var", None), "baseline mounted sync");
+    mounted.metadata.lock().dirty = true;
+    *super::FAIL_SYNC_INODE_ONCE_FOR.lock() = Some((instance_id, mounted.inode_number));
+    capture_sync_events(instance_id);
+    expect_err(vfs.unmount("/var", None), FileSystemError::DiskWriteError,
+        "inode error prevents teardown");
+    assert_eq!(take_sync_events(), alloc::vec![SyncEvent::Inode(mounted.inode_number)]);
+    assert!(mounted.is_dirty());
+
+    *super::FAIL_SYNC_VOLUME_ONCE_FOR.lock() = Some(instance_id);
+    capture_sync_events(instance_id);
+    expect_err(vfs.unmount("/var", None), FileSystemError::DiskWriteError,
+        "flush error prevents teardown");
+    assert_eq!(take_sync_events(),
+        alloc::vec![SyncEvent::Inode(mounted.inode_number), SyncEvent::Flush]);
+    assert!(!mounted.is_dirty());
+    let still_mounted = expect_ok(vfs.resolve("/var", None, true), "mount survives errors");
+    assert!(Arc::ptr_eq(&mounted, &still_mounted));
+
+    super::fail_next_unmount_for(instance_id);
+    capture_sync_events(instance_id);
+    expect_err(vfs.unmount("/var", None), FileSystemError::DiskWriteError,
+        "teardown error preserves mount");
+    assert_eq!(take_sync_events(), alloc::vec![SyncEvent::Flush, SyncEvent::Unmount]);
+    let still_mounted = expect_ok(vfs.resolve("/var", None, true), "mount survives teardown error");
+    assert!(Arc::ptr_eq(&mounted, &still_mounted));
+
+    capture_sync_events(instance_id);
+    expect_ok(vfs.unmount("/var", None), "retry unmount");
+    assert_eq!(take_sync_events(), alloc::vec![SyncEvent::Flush, SyncEvent::Unmount]);
+    let host = expect_ok(vfs.resolve("/var", None, true), "uncovered host");
+    assert_ne!(host.filesystem.instance_id(), instance_id);
+    sprintln!("[VFS TEST] volume sync unmount ... PASS");
 }

@@ -195,6 +195,10 @@ pub trait FileSystemDriver: Send + Sync {
 /// state consistent when a mutation succeeds or reports an error. Native
 /// drivers must also account for failures during persistent writes.
 ///
+/// Directory entries preserve spelling and are unique under ASCII case folding
+/// within their parent directory. Lookup and namespace mutations use that same
+/// comparison. Drivers validate names before changing backing state.
+///
 /// `Send + Sync` are required because the VFS may call into instances from
 /// different kernel threads in SMP context.
 pub trait FileSystemInstance: Send + Sync {
@@ -215,6 +219,16 @@ pub trait FileSystemInstance: Send + Sync {
     ///
     /// Returns the unique instance identifier assigned by the driver.
     fn instance_id(&self) -> u64;
+
+    /// Reports the maximum size of one entry name on this instance.
+    ///
+    /// This limit stays fixed while the instance is mounted. The VFS checks
+    /// components against the volume containing their parent directory.
+    ///
+    /// # Returns
+    ///
+    /// Returns the maximum name size in bytes, excluding any terminator.
+    fn max_name_bytes(&self) -> usize;
 
     /// Gets the size in bytes of one logical block on this filesystem.
     ///
@@ -327,13 +341,13 @@ pub trait FileSystemInstance: Send + Sync {
     /// Looks up a single child by name within a directory inode.
     ///
     /// The driver searches the directory identified by `directory` for an
-    /// entry whose name exactly matches `name`, and returns a
-    /// [`DirectoryEntry`] containing its name, inode number, and type. The
-    /// entry does not hold an inode reference. When traversal needs the full
-    /// inode, the VFS acquires its shared inode by number, loading it through
-    /// [`FileSystemInstance::load_inode`] if it is not already retained.
-    /// The current resolver uses [`FileSystemInstance::read_dir`] for child
-    /// lookups rather than calling this method.
+    /// entry whose name matches `name` under ASCII case folding, and returns
+    /// a [`DirectoryEntry`] containing its stored spelling, inode number, and
+    /// type. When traversal needs the full inode, the VFS acquires the shared
+    /// inode by number, loading it through [`FileSystemInstance::load_inode`]
+    /// if it is not already retained. The current resolver uses
+    /// [`FileSystemInstance::read_dir`] for child lookups rather than calling
+    /// this method.
     ///
     /// The special names `.` and `..` are handled entirely by the VFS path
     /// resolver and must not be stored as real entries on disk. Drivers must
@@ -651,8 +665,10 @@ pub trait FileSystemInstance: Send + Sync {
     ///
     /// Every returned error leaves listings, directory-parent records, and
     /// backing link counts unchanged. The VFS performs no rollback. Crash
-    /// recovery and durable transaction mechanisms belong to the driver.
-    /// Same-inode destinations are successful no-ops handled by the VFS.
+    /// recovery and durable transaction mechanisms belong to the driver. When
+    /// both paths name the same entry and the requested spelling differs,
+    /// commit the new spelling without changing link counts. The VFS handles
+    /// unchanged spelling and distinct hard links to the same inode as no-ops.
     ///
     /// # Arguments
     ///

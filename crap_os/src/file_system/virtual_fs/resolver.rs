@@ -89,6 +89,30 @@ pub(super) struct ResolvedEntry {
 /// recursive stack depth manageable.
 pub const MAX_SYMLINK_DEPTH: u8 = 16;
 
+/// Maximum bytes of path text, including separators.
+const MAX_PATH_BYTES: usize = 1024;
+
+/// Checks the bytes of a path before splitting or resolving it.
+///
+/// Empty paths and special components are interpreted by the caller.
+///
+/// # Arguments
+///
+/// * `path` - Path text without a string terminator.
+///
+/// # Returns
+///
+/// Returns success for a path within the byte limit and free of ASCII
+/// control bytes, or `InvalidPath` if either constraint fails.
+pub(super) fn validate_path(path: &str) -> Result<(), FileSystemError> {
+    if path.len() > MAX_PATH_BYTES
+        || path.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(FileSystemError::InvalidPath);
+    }
+    Ok(())
+}
+
 impl VirtualFileSystem {
     /// Resolves `path` to the [`Inode`] it refers to.
     ///
@@ -251,6 +275,8 @@ impl VirtualFileSystem {
         follow_symlinks: bool,
         symlink_budget: u8,
     ) -> Result<ResolvedEntry, FileSystemError> {
+        validate_path(path)?;
+
         if path.is_empty() {
             return Err(FileSystemError::InvalidPath);
         }
@@ -455,6 +481,8 @@ impl VirtualFileSystem {
                     let target = current.inode.filesystem
                         .read_symlink(&symlink_inode)?;
 
+                    validate_path(&target)?;
+
                     // Build the effective path by appending any remaining
                     // components after the symlink onto the target. E.g., if
                     // if the path is `/foo/link/bar/baz`, and "link" resolves
@@ -529,6 +557,8 @@ impl VirtualFileSystem {
         working_directory: Option<Arc<Directory>>,
         symlink_budget: &mut u8,
     ) -> Result<Arc<Directory>, FileSystemError> {
+        validate_path(path)?;
+
         if path.is_empty() {
             return Err(FileSystemError::InvalidPath);
         }
@@ -657,8 +687,11 @@ impl VirtualFileSystem {
                     let symlink_inode = self.get_or_load_inode(
                         &current.inode.filesystem, inode_number,
                     )?;
+
                     let target = current.inode.filesystem
                         .read_symlink(&symlink_inode)?;
+
+                    validate_path(&target)?;
 
                     let effective_path = if index < last_index {
                         let remaining: Vec<&str> =

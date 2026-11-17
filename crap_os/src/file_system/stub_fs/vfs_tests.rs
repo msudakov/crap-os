@@ -53,7 +53,8 @@
 //! 26. **Readlink** - checks stored targets, path errors, and link access time.
 //! 27. **Handle metadata** - checks inode metadata across replacement and close.
 //! 28. **Directory listing** - checks snapshots, symlinks, and mount visibility.
-//! 29. **Teardown** - releases the global VFS owner after the tests.
+//! 29. **Filenames** - checks case, spelling, path syntax, and byte limits.
+//! 30. **Teardown** - releases the global VFS owner after the tests.
 
 extern crate alloc;
 
@@ -135,6 +136,8 @@ pub fn run_vfs_tests() {
     test_readlink();
     test_inode_metadata_by_handle();
     test_list_directory();
+    test_filename_case();
+    test_filename_limits();
     expect_ok(with_vfs(|vfs| vfs.reclaim_unlinked_inodes()), "final unlinked inode cleanup");
     teardown_vfs();
 
@@ -3643,4 +3646,139 @@ fn test_list_directory() {
     );
 
     sprintln!("[VFS TEST] directory listing ... PASS");
+}
+
+/// Checks the shared name comparison and case-only rename contract.
+///
+/// A failed spelling change preserves the published name. Distinct hard links
+/// continue to name the same inode and keep their individual spellings.
+///
+/// # Panics
+///
+/// Panics if lookup, mutation, or listing violates the filename contract.
+fn test_filename_case() {
+    sprintln!("[VFS TEST] filename case ...");
+    let mut vfs = new_stub_vfs();
+    let file = expect_ok(vfs.create_file("/etc/README", Permissions::all_permissive(), None),
+        "create uppercase entry");
+
+    let opened = expect_ok(vfs.open_or_create(
+        "/ETC/readme", AccessMode::ReadOnly, CreateMode::IfMissing,
+        Permissions::all_permissive(), None,
+    ), "open by alternate spelling");
+    assert!(Arc::ptr_eq(&file, &opened.file.inode));
+    expect_err(vfs.open_or_create(
+        "/etc/reADme", AccessMode::ReadWrite, CreateMode::Exclusive,
+        Permissions::all_permissive(), None,
+    ), FileSystemError::AlreadyExists, "reject alternate spelling on create");
+    expect_err(vfs.create_directory("/etc/ReadMe", Permissions::all_permissive(), None),
+        FileSystemError::AlreadyExists, "case collision across entry types");
+    expect_err(vfs.create_hard_link("/etc/README", "/etc/ReadMe", None, false),
+        FileSystemError::AlreadyExists, "case collision for hard link");
+
+    expect_ok(vfs.create_hard_link("/etc/rEaDmE", "/etc/Manual", None, false),
+        "create a separate hard link");
+    expect_ok(vfs.rename("/etc/rEaDmE", "/etc/MANUAL", None),
+        "rename between distinct hard links is a no-op");
+
+    super::fail_next_rename_for(file.filesystem.instance_id());
+    expect_err(vfs.rename("/etc/rEaDmE", "/ETC/readme", None),
+        FileSystemError::DiskWriteError, "case-only rename reaches the driver");
+    let listing = expect_ok(vfs.list_directory("/etc", None), "list after failure");
+    assert!(listing.iter().any(|entry| entry.name == "README"));
+
+    expect_ok(vfs.rename("/etc/rEaDmE", "/ETC/readme", None),
+        "change the stored spelling");
+    let listing = expect_ok(vfs.list_directory("/ETC", None), "list after rename");
+    assert!(listing.iter().any(|entry| entry.name == "readme"));
+    assert!(!listing.iter().any(|entry| entry.name == "README"));
+    assert!(listing.iter().any(|entry| entry.name == "Manual"));
+    let resolved = expect_ok(vfs.resolve("/ETC/ReadMe", None, false),
+        "resolve new spelling case-insensitively");
+    assert!(Arc::ptr_eq(&file, &resolved));
+    assert_eq!(file.metadata.lock().link_count, 2);
+    let backing = expect_ok(file.filesystem.load_inode(file.inode_number),
+        "read backing link count");
+    assert_eq!(backing.metadata.lock().link_count, 2);
+
+    expect_ok(vfs.unlink("/etc/README", None), "unlink using alternate spelling");
+    expect_err(vfs.resolve("/etc/readme", None, false),
+        FileSystemError::NotFound, "case-only entry is gone");
+    expect_ok(vfs.close(&opened), "close handle opened before rename");
+
+    let displaced = expect_ok(vfs.create_file("/etc/Alternate", Permissions::all_permissive(), None),
+        "create a distinct destination inode");
+    expect_ok(vfs.rename("/etc/MANUAL", "/etc/alternate", None),
+        "replace a different entry found under alternate spelling");
+    let resolved = expect_ok(vfs.resolve("/etc/ALTERNATE", None, false),
+        "resolve replacement");
+    assert!(Arc::ptr_eq(&file, &resolved));
+    assert_eq!(displaced.metadata.lock().link_count, 0);
+
+    expect_ok(vfs.rename("/ETC", "/Etc", None),
+        "case-only rename of a nonempty directory");
+    let root = expect_ok(vfs.list_directory("/", None), "list root");
+    assert!(root.iter().any(|entry| entry.name == "Etc"));
+    sprintln!("[VFS TEST] filename case ... PASS");
+}
+
+/// Checks literal punctuation, reserved names, and exact byte boundaries.
+///
+/// Repeated separators make it possible to reach the pathname limit without
+/// creating a deep directory tree. Symlink traversal also checks the expanded
+/// path length once the target and remaining components are combined.
+///
+/// # Panics
+///
+/// Panics if valid names fail or invalid names and lengths are accepted.
+fn test_filename_limits() {
+    sprintln!("[VFS TEST] filename limits ...");
+    let mut vfs = new_stub_vfs();
+
+    let literal = "/etc/A\\b\". ";
+    let file = expect_ok(vfs.create_file(literal, Permissions::all_permissive(), None),
+        "create name with literal backslash, quote, and trailing space");
+    let resolved = expect_ok(vfs.resolve("/ETC/a\\B\". ", None, false),
+        "resolve name with literal punctuation");
+    assert!(Arc::ptr_eq(&file, &resolved));
+
+    let utf8_file = expect_ok(
+        vfs.create_file("/etc/caf\u{e9}.txt", Permissions::all_permissive(), None),
+        "create a UTF-8 name",
+    );
+    let resolved = expect_ok(vfs.resolve("/ETC/CAF\u{e9}.TXT", None, false),
+        "resolve UTF-8 name with folding of ASCII letters");
+    assert!(Arc::ptr_eq(&utf8_file, &resolved));
+    expect_err(vfs.resolve("/etc/CAF\u{c9}.TXT", None, false),
+        FileSystemError::NotFound, "non-ASCII case variants match literally");
+
+    for path in ["/etc/.", "/etc/..", "/etc/a\0b", "/etc/a\nb", "/etc/a\x7fb"] {
+        expect_err(vfs.create_file(path, Permissions::all_permissive(), None),
+            FileSystemError::InvalidPath, "reject reserved or control name");
+    }
+
+    let component = format!("/etc/{}", "x".repeat(255));
+    expect_ok(vfs.create_file(&component, Permissions::all_permissive(), None),
+        "accept a 255-byte name");
+    let oversized_component = format!("{}x", component);
+    expect_err(vfs.create_file(&oversized_component, Permissions::all_permissive(), None),
+        FileSystemError::InvalidPath, "reject a 256-byte name");
+
+    let path = format!("{}x", "/".repeat(1023));
+    expect_ok(vfs.create_file(&path, Permissions::all_permissive(), None),
+        "accept a 1024-byte pathname");
+    expect_ok(vfs.resolve(&path, None, false), "resolve at the pathname limit");
+    let oversized_path = format!("/{}", path);
+    expect_err(vfs.create_file(&oversized_path, Permissions::all_permissive(), None),
+        FileSystemError::InvalidPath, "reject a 1025-byte creation pathname");
+    expect_err(vfs.resolve(&oversized_path, None, false),
+        FileSystemError::InvalidPath, "reject a 1025-byte lookup pathname");
+
+    let target = format!("{}etc", "/".repeat(1020));
+    expect_ok(vfs.create_symlink("/long-target", &target, None),
+        "create a link whose target fits the limit");
+    expect_ok(vfs.list_directory("/long-target", None), "follow the target");
+    expect_err(vfs.resolve("/long-target/config.txt", None, true),
+        FileSystemError::InvalidPath, "reject path exceeding limit after expansion");
+    sprintln!("[VFS TEST] filename limits ... PASS");
 }

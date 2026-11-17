@@ -512,6 +512,15 @@ impl FileSystemInstance for StubFsInstance {
         self.id
     }
 
+    /// Reports the component size limit exercised by StubFS.
+    ///
+    /// # Returns
+    ///
+    /// Returns 255 bytes of name text.
+    fn max_name_bytes(&self) -> usize {
+        255
+    }
+
     fn block_size(&self) -> u32 {
         4096
     }
@@ -588,12 +597,13 @@ impl FileSystemInstance for StubFsInstance {
         directory: &Inode,
         name: &str,
     ) -> Result<DirectoryEntry, FileSystemError> {
+        DirectoryEntry::validate_name(name, self.max_name_bytes())?;
         let inodes = self.inodes.lock();
         let idx    = Self::find_inode_index(&inodes, directory.inode_number)?;
         let dir    = &inodes[idx];
 
         for (child_name, child_ino, child_type) in &dir.children {
-            if child_name == name {
+            if child_name.eq_ignore_ascii_case(name) {
                 return Ok(DirectoryEntry::new(
                     child_name.clone(),
                     *child_ino,
@@ -731,9 +741,10 @@ impl FileSystemInstance for StubFsInstance {
         _permissions: Permissions,
         _timestamps: Timestamps,
     ) -> Result<Arc<Inode>, FileSystemError> {
+        DirectoryEntry::validate_name(name, self.max_name_bytes())?;
         let mut inodes = self.inodes.lock();
         let parent_idx = Self::find_inode_index(&inodes, parent.inode_number)?;
-        if inodes[parent_idx].children.iter().any(|(n, _, _)| n == name) {
+        if inodes[parent_idx].children.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(name)) {
             return Err(FileSystemError::AlreadyExists);
         }
 
@@ -776,6 +787,7 @@ impl FileSystemInstance for StubFsInstance {
         _permissions: Permissions,
         _timestamps: Timestamps,
     ) -> Result<Arc<Inode>, FileSystemError> {
+        DirectoryEntry::validate_name(name, self.max_name_bytes())?;
         let new_ino = {
             let mut counter = self.next_inode.lock();
             let n = *counter;
@@ -786,7 +798,7 @@ impl FileSystemInstance for StubFsInstance {
         {
             let mut inodes = self.inodes.lock();
             let parent_idx = Self::find_inode_index(&inodes, parent.inode_number)?;
-            if inodes[parent_idx].children.iter().any(|(n, _, _)| n == name) {
+            if inodes[parent_idx].children.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(name)) {
                 return Err(FileSystemError::AlreadyExists);
             }
             inodes[parent_idx].children.push((
@@ -807,6 +819,7 @@ impl FileSystemInstance for StubFsInstance {
         target: &str,
         _timestamps: Timestamps,
     ) -> Result<Arc<Inode>, FileSystemError> {
+        DirectoryEntry::validate_name(name, self.max_name_bytes())?;
         let new_ino = {
             let mut counter = self.next_inode.lock();
             let n = *counter;
@@ -817,7 +830,7 @@ impl FileSystemInstance for StubFsInstance {
         {
             let mut inodes = self.inodes.lock();
             let parent_idx = Self::find_inode_index(&inodes, parent.inode_number)?;
-            if inodes[parent_idx].children.iter().any(|(n, _, _)| n == name) {
+            if inodes[parent_idx].children.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(name)) {
                 return Err(FileSystemError::AlreadyExists);
             }
             inodes[parent_idx].children.push((
@@ -860,6 +873,7 @@ impl FileSystemInstance for StubFsInstance {
         destination_parent: &Inode,
         destination_name: &str,
     ) -> Result<(), FileSystemError> {
+        DirectoryEntry::validate_name(destination_name, self.max_name_bytes())?;
         let mut inodes = self.inodes.lock();
         let source_idx = Self::find_inode_index(&inodes, source.inode_number)?;
         let destination_parent_idx =
@@ -881,7 +895,7 @@ impl FileSystemInstance for StubFsInstance {
             return Err(FileSystemError::NotFound);
         }
         if inodes[destination_parent_idx].children.iter()
-            .any(|(name, _, _)| name == destination_name)
+            .any(|(name, _, _)| name.eq_ignore_ascii_case(destination_name))
         {
             return Err(FileSystemError::AlreadyExists);
         }
@@ -919,10 +933,11 @@ impl FileSystemInstance for StubFsInstance {
         parent: &Inode,
         name: &str,
     ) -> Result<(), FileSystemError> {
+        DirectoryEntry::validate_name(name, self.max_name_bytes())?;
         let mut inodes = self.inodes.lock();
         let parent_idx = Self::find_inode_index(&inodes, parent.inode_number)?;
         let pos = inodes[parent_idx].children.iter()
-            .position(|(n, _, _)| n == name)
+            .position(|(n, _, _)| n.eq_ignore_ascii_case(name))
             .ok_or(FileSystemError::NotFound)?;
         let target_number = inodes[parent_idx].children[pos].1;
         let target_idx = Self::find_inode_index(&inodes, target_number)?;
@@ -950,13 +965,16 @@ impl FileSystemInstance for StubFsInstance {
     ///
     /// # Returns
     ///
-    /// Returns success after commit, a backing lookup/type/count error before
-    /// mutation, or one injected `DiskWriteError` after staging. Allocation
-    /// failure follows the existing kernel allocator contract.
+    /// Returns success after commit or a same-inode no-op. Name validation and
+    /// backing checks can fail before mutation, as can an injected
+    /// `DiskWriteError` after staging. Allocation failure follows the existing
+    /// kernel allocator contract.
     fn rename(
         &self, old_parent: &Inode, old_name: &str,
         new_parent: &Inode, new_name: &str,
     ) -> Result<(), FileSystemError> {
+        DirectoryEntry::validate_name(old_name, self.max_name_bytes())?;
+        DirectoryEntry::validate_name(new_name, self.max_name_bytes())?;
         let mut inodes = self.inodes.lock();
         let old_idx = Self::find_inode_index(&inodes, old_parent.inode_number)?;
         let new_idx = Self::find_inode_index(&inodes, new_parent.inode_number)?;
@@ -964,20 +982,31 @@ impl FileSystemInstance for StubFsInstance {
             || inodes[new_idx].inode_type != InodeType::Directory
         { return Err(FileSystemError::NotADirectory); }
         let source_pos = inodes[old_idx].children.iter()
-            .position(|(name, _, _)| name == old_name)
+            .position(|(name, _, _)| name.eq_ignore_ascii_case(old_name))
             .ok_or(FileSystemError::NotFound)?;
-        let (_, source_number, source_type) = &inodes[old_idx].children[source_pos];
+        let (source_name, source_number, source_type) =
+            &inodes[old_idx].children[source_pos];
         let source_number = *source_number;
         let source_type = *source_type;
         // Validate backing source existence before staging, even though no
         // separate parent record needs to be updated by this driver.
         Self::find_inode_index(&inodes, source_number)?;
-        let displaced = match inodes[new_idx].children.iter()
-            .find(|(name, _, _)| name == new_name)
-        {
-            Some((_, number, _)) if *number == source_number => return Ok(()),
-            Some((_, number, _)) => {
-                let idx = Self::find_inode_index(&inodes, *number)?;
+        let destination_pos = inodes[new_idx].children.iter()
+            .position(|(name, _, _)| name.eq_ignore_ascii_case(new_name));
+        let displaced = match destination_pos {
+            Some(pos) if old_idx == new_idx && pos == source_pos => {
+                if source_name == new_name {
+                    return Ok(());
+                }
+                // Same entry with a new spelling. No backing link is removed.
+                None
+            }
+            Some(pos) => {
+                let number = inodes[new_idx].children[pos].1;
+                if number == source_number {
+                    return Ok(());
+                }
+                let idx = Self::find_inode_index(&inodes, number)?;
                 let source_directory = source_type == DirectoryEntryType::Directory;
                 let destination_directory = inodes[idx].inode_type == InodeType::Directory;
                 if source_directory && !destination_directory {
@@ -999,12 +1028,12 @@ impl FileSystemInstance for StubFsInstance {
         let mut old_children = inodes[old_idx].children.clone();
         old_children.remove(source_pos);
         let new_children = if old_idx == new_idx {
-            old_children.retain(|(name, _, _)| name != new_name);
+            old_children.retain(|(name, _, _)| !name.eq_ignore_ascii_case(new_name));
             old_children.push(new_entry);
             None
         } else {
             let mut children = inodes[new_idx].children.clone();
-            children.retain(|(name, _, _)| name != new_name);
+            children.retain(|(name, _, _)| !name.eq_ignore_ascii_case(new_name));
             children.push(new_entry);
             Some(children)
         };

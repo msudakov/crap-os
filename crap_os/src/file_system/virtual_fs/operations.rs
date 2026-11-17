@@ -49,6 +49,7 @@ use core::sync::atomic::Ordering;
 use super::directory::Directory;
 use super::file::{File, FileHandle, OpenNamespaceProtection};
 use super::inode::{DirectoryEntry, Inode};
+use super::resolver::validate_path;
 use super::types::{
     AccessMode, CreateMode, DirectoryEntryType, FileSystemError, InodeStat,
     NamespaceProtection, OpenContentsMode, OpenFileKey, OpenOptions,
@@ -282,6 +283,7 @@ impl VirtualFileSystem {
         // Check handle capacity before the driver creates or truncates a file.
         let next_handle_id = self.next_handle_id.checked_add(1)
             .ok_or(FileSystemError::InternalError)?;
+        validate_path(path)?;
         let mut target_path = path.to_string();
         let mut base = working_directory;
         let mut symlink_budget = super::resolver::MAX_SYMLINK_DEPTH;
@@ -1064,10 +1066,9 @@ impl VirtualFileSystem {
     ///
     /// Returns `Ok(Arc<Inode>)` for the newly created symlink inode on
     /// success, `Err(FileSystemError::AlreadyExists)` if an entry with that
-    /// name already exists, `Err(FileSystemError::InvalidPath)` if `target`
-    /// is empty, `Err(FileSystemError::NotADirectory)` if `path` ends in `/`,
-    /// or other `Err(FileSystemError)` variants for resolution and I/O
-    /// failures.
+    /// name already exists, `InvalidPath` for a malformed name or an empty,
+    /// malformed, or oversized target, or `NotADirectory` if `path` ends in
+    /// `/`. Resolution and I/O failures propagate their corresponding errors.
     pub fn create_symlink(
         &mut self,
         path: &str,
@@ -1076,6 +1077,8 @@ impl VirtualFileSystem {
     ) -> Result<Arc<super::inode::Inode>,
         FileSystemError>
     {
+        validate_path(target)?;
+
         if target.is_empty() {
             return Err(FileSystemError::InvalidPath);
         }
@@ -1157,12 +1160,12 @@ impl VirtualFileSystem {
     ) -> Result<(), FileSystemError> {
         let (destination_parent_path, destination_name) =
             split_parent_and_name(destination_path)?;
+
         if destination_path.ends_with('/') {
             return Err(FileSystemError::NotADirectory);
         }
-        if destination_name == "." || destination_name == ".."
-            || destination_name.contains('\0')
-        {
+
+        if destination_name == "." || destination_name == ".." {
             return Err(FileSystemError::InvalidPath);
         }
 
@@ -1306,6 +1309,8 @@ impl VirtualFileSystem {
             return Err(FileSystemError::NotFound);
         }
 
+        validate_path(path)?;
+
         let trimmed = path.trim_end_matches('/');
         if trimmed.is_empty() {
             return Err(FileSystemError::ResourceBusy);
@@ -1418,8 +1423,9 @@ impl VirtualFileSystem {
     ///
     /// Regular files and symlinks may replace either non-directory type.
     /// Directories may replace empty directories only. Final symlinks are not
-    /// followed. A same-inode destination is a successful no-op, even
-    /// protected. The caller holds global VFS serialization throughout
+    /// followed. Distinct hard links to the same inode and unchanged spelling
+    /// are successful no-ops. A case-only spelling change is subject to the
+    /// same protection checks as a move. The caller holds serialization through
     /// preflight, driver commit, and publication of canonical metadata. Driver
     /// errors must leave both names and backing link counts unchanged.
     ///
@@ -1449,10 +1455,10 @@ impl VirtualFileSystem {
     /// instances,`ResourceBusy` for protected entries or active mount hosts,
     /// `IsADirectory` or `NotADirectory` for type mismatches,
     /// `DirectoryNotEmpty` for nonempty destination directories, `InvalidPath`
-    /// for moving a directory into its subtree or embedded NUL, or a pathname/
-    /// driver error before commit. Kernel allocation failure follows the
-    /// existing allocator contract and is not represented as a returned
-    /// filesystem error.
+    /// for moving a directory into its subtree or invalid path syntax or
+    /// length, or another driver or resolution error before commit. Kernel
+    /// allocation failure follows the existing allocator contract and is not
+    /// represented as a returned filesystem error.
     pub fn rename(
         &mut self,
         old_path: &str,
@@ -1494,7 +1500,11 @@ impl VirtualFileSystem {
             &old_parent.inode.filesystem, source_entry.inode_number,
         )?;
 
-        let destination = match new_parent.lookup_child(new_name)? {
+        let same_parent =
+            old_parent.inode.inode_number == new_parent.inode.inode_number;
+        let destination_entry = new_parent.lookup_child(new_name)?;
+
+        let mut destination = match destination_entry.as_ref() {
             Some(entry) => Some(self.get_or_load_inode(
                 &new_parent.inode.filesystem, entry.inode_number,
             )?),
@@ -1522,7 +1532,16 @@ impl VirtualFileSystem {
         if destination
             .as_ref().is_some_and(|inode| Arc::ptr_eq(inode, &source))
         {
-            return Ok(());
+            let same_entry = same_parent && destination_entry.as_ref()
+                .is_some_and(|entry| entry.name == source_entry.name);
+
+            if !same_entry || source_entry.name == new_name {
+                return Ok(());
+            }
+
+            // A spelling change rewrites the source entry without displacing
+            // an inode. Continue through normal mutation preflight and commit.
+            destination = None;
         }
 
         self.ensure_rename_target_available(&source)?;
@@ -1580,9 +1599,6 @@ impl VirtualFileSystem {
                 // storage identity for explicit cleanup and failed-free retry.
             }
         }
-
-        let same_parent =
-            old_parent.inode.inode_number == new_parent.inode.inode_number;
 
         if source.is_directory() && !same_parent {
             let key = OpenFileKey::new(source.filesystem.instance_id(),
@@ -1768,15 +1784,13 @@ fn ensure_namespace_mutation_allowed(inode: &Inode) -> Result<(), FileSystemErro
 ///
 /// Returns parent and name, `NotFound` for empty paths, `ResourceBusy` for
 /// root, `OperationNotAllowed` for final `.`/`..`, or `InvalidPath` for
-/// embedded NUL.
+/// invalid path bytes or length.
 fn rename_parent_and_name(path: &str) -> Result<(&str, &str), FileSystemError> {
     if path.is_empty() {
         return Err(FileSystemError::NotFound);
     }
 
-    if path.contains('\0') {
-        return Err(FileSystemError::InvalidPath);
-    }
+    validate_path(path)?;
 
     if path.trim_end_matches('/').is_empty() {
         return Err(FileSystemError::ResourceBusy);
@@ -1811,6 +1825,8 @@ fn rename_parent_and_name(path: &str) -> Result<(&str, &str), FileSystemError> {
 /// the second is the terminal component name, or
 /// `Err(FileSystemError::InvalidPath)` if the path is malformed.
 fn split_parent_and_name(path: &str) -> Result<(&str, &str), FileSystemError> {
+    validate_path(path)?;
+
     if path.is_empty() {
         return Err(FileSystemError::InvalidPath);
     }

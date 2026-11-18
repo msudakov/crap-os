@@ -6,7 +6,7 @@
 //! [`super::directory::Directory`] that the path refers to.
 //!
 //! The resolver is the most central piece of VFS logic. Every operation that
-//! accepts a path (e.g., open, stat, create, delete, rename, mount, unmount)
+//! accepts a path (e.g., to open a file, query metadata, or mount a volume)
 //! begins with a resolver call.
 //! 
 //! ## Algorithm Overview
@@ -89,6 +89,30 @@ pub(super) struct ResolvedEntry {
 /// recursive stack depth manageable.
 pub const MAX_SYMLINK_DEPTH: u8 = 16;
 
+/// Maximum bytes of path text, including separators.
+const MAX_PATH_BYTES: usize = 1024;
+
+/// Checks the bytes of a path before splitting or resolving it.
+///
+/// Empty paths and special components are interpreted by the caller.
+///
+/// # Arguments
+///
+/// * `path` - Path text without a string terminator.
+///
+/// # Returns
+///
+/// Returns success for a path within the byte limit and free of ASCII
+/// control bytes, or `InvalidPath` if either constraint fails.
+pub(super) fn validate_path(path: &str) -> Result<(), FileSystemError> {
+    if path.len() > MAX_PATH_BYTES
+        || path.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(FileSystemError::InvalidPath);
+    }
+    Ok(())
+}
+
 impl VirtualFileSystem {
     /// Resolves `path` to the [`Inode`] it refers to.
     ///
@@ -105,7 +129,7 @@ impl VirtualFileSystem {
     ///
     /// * `true`  - the symlink is followed, and the target's inode is returned.
     ///   Used by operations that want the object the symlink points to (e.g.,
-    ///   open, stat).
+    ///   `open` or a metadata lookup that follows the final symlink).
     /// * `false` - the symlink inode itself is returned without following.
     ///   Used by operations that want the symlink object itself (e.g., delete,
     ///   read symlink target).
@@ -183,7 +207,8 @@ impl VirtualFileSystem {
 
         // Walk the path again to obtain the Directory wrapper for the terminal
         // component. A separate wrapper may represent the same inode.
-        self.walk_to_directory(path, working_directory, symlink_budget)
+        let mut remaining_budget = symlink_budget;
+        self.walk_to_directory(path, working_directory, &mut remaining_budget)
     }
 
     /// Resolves a path and discards its final regular-file parent context.
@@ -250,6 +275,8 @@ impl VirtualFileSystem {
         follow_symlinks: bool,
         symlink_budget: u8,
     ) -> Result<ResolvedEntry, FileSystemError> {
+        validate_path(path)?;
+
         if path.is_empty() {
             return Err(FileSystemError::InvalidPath);
         }
@@ -454,6 +481,8 @@ impl VirtualFileSystem {
                     let target = current.inode.filesystem
                         .read_symlink(&symlink_inode)?;
 
+                    validate_path(&target)?;
+
                     // Build the effective path by appending any remaining
                     // components after the symlink onto the target. E.g., if
                     // if the path is `/foo/link/bar/baz`, and "link" resolves
@@ -502,12 +531,11 @@ impl VirtualFileSystem {
     /// Walks `path` through the directory tree and returns the
     /// [`Directory`] wrapper for the terminal component.
     ///
-    /// This internal helper is used by
-    /// [`VirtualFileSystem::resolve_dir_with_budget`] to obtain the
-    /// [`Directory`] wrapper when the caller needs it (e.g., for mount
-    /// and unmount operations that need the host's identity). It duplicates
-    /// part of the resolver's walking logic but returns the wrapper instead
-    /// of the inode.
+    /// [`VirtualFileSystem::resolve_dir_with_budget`] uses this helper to
+    /// obtain a [`Directory`] wrapper for mount and working-directory paths.
+    /// Create-and-open uses it to resolve a parent while retaining the
+    /// remaining symlink allowance for a possible final link. It duplicates
+    /// part of the inode resolver's walk but returns the wrapper.
     ///
     /// # Arguments
     ///
@@ -515,19 +543,22 @@ impl VirtualFileSystem {
     ///   directory.
     /// * `working_directory` - The starting directory for relative paths.
     ///   `None` means use the global root.
-    /// * `symlink_budget`    - The remaining symlink follow budget.
+    /// * `symlink_budget`    - Shared remaining symlink allowance, updated
+    ///   for every link followed during this traversal.
     ///
     /// # Returns
     ///
     /// Returns `Ok(Arc<Directory>)` for the directory at the end of `path`,
     /// or `Err(FileSystemError)` if resolution fails or the terminal component
     /// is not a directory.
-    fn walk_to_directory(
+    pub(super) fn walk_to_directory(
         &self,
         path: &str,
         working_directory: Option<Arc<Directory>>,
-        symlink_budget: u8,
+        symlink_budget: &mut u8,
     ) -> Result<Arc<Directory>, FileSystemError> {
+        validate_path(path)?;
+
         if path.is_empty() {
             return Err(FileSystemError::InvalidPath);
         }
@@ -648,16 +679,19 @@ impl VirtualFileSystem {
                 }
 
                 DirectoryEntryType::Symlink => {
-                    if symlink_budget == 0 {
+                    if *symlink_budget == 0 {
                         return Err(FileSystemError::TooManySymlinks);
                     }
-                    let remaining_budget = symlink_budget - 1;
+                    *symlink_budget -= 1;
 
                     let symlink_inode = self.get_or_load_inode(
                         &current.inode.filesystem, inode_number,
                     )?;
+
                     let target = current.inode.filesystem
                         .read_symlink(&symlink_inode)?;
+
+                    validate_path(&target)?;
 
                     let effective_path = if index < last_index {
                         let remaining: Vec<&str> =
@@ -677,7 +711,7 @@ impl VirtualFileSystem {
                     return self.walk_to_directory(
                         &effective_path,
                         symlink_base,
-                        remaining_budget,
+                        symlink_budget,
                     );
                 }
             }

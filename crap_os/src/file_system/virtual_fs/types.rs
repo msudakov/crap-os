@@ -19,14 +19,17 @@
 //!                              `InodeType` at the entry level.
 //!   - [`AccessMode`]         : Describes the access rights requested when
 //!                              opening a file handle.
+//!   - [`CreateMode`]         : Selects ordinary or exclusive create-and-open.
 //!   - [`FileLockState`]      : Tracks the current write-lock state of an open
 //!                              file's master record.
 //!   - [`Timestamps`]         : Wall-clock timestamps recorded on every inode.
 //!   - [`Permissions`]        : Placeholder for the future ACL-based permission
 //!                              model.
 //!   - [`InodeStat`]          : A point-in-time snapshot of inode metadata,
-//!                              returned by `VirtualFileSystem::stat()` and
-//!                              eventually copied into usermode `stat` buffers.
+//!                              returned by
+//!                              `VirtualFileSystem::inode_metadata_by_path()`
+//!                              and eventually copied into usermode status
+//!                              buffers.
 //!   - [`OpenFileKey`]        : Composite key used to look up a file's master
 //!                              record in the VFS open-file table.
 
@@ -67,6 +70,9 @@ pub enum FileSystemError {
     /// The filesystem has no free inode slots remaining.
     OutOfInodes,
 
+    /// The requested file length exceeds the driver's supported size range.
+    FileTooLarge,
+
     /// The requested path component or directory entry does not exist.
     NotFound,
 
@@ -99,8 +105,8 @@ pub enum FileSystemError {
     /// contains entries.
     DirectoryNotEmpty,
 
-    /// A namespace object is protected, is an active mount point, or is the
-    /// global root. Retry after its holders release protection where possible.
+    /// An object is protected, is an active mount point, or is the global
+    /// root. Retry after its holders release protection where possible.
     ResourceBusy,
 
     /// Symlink resolution exceeded
@@ -133,6 +139,12 @@ pub enum FileSystemError {
     /// A file handle was closed, was not registered with this VFS, or did not
     /// belong to the expected open-file master record.
     InvalidHandle,
+
+    /// A signed seek would place the file position before byte zero.
+    InvalidOffset,
+
+    /// A signed seek would place the file position above [`i64::MAX`] bytes.
+    OffsetOverflow,
 
     /// The path string was empty, contained illegal characters, or exceeded
     /// the maximum supported length.
@@ -227,6 +239,52 @@ pub enum AccessMode {
     ReadWrite,
 }
 
+/// Selects the base position for a signed seek.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SeekOrigin {
+    /// Byte zero, corresponding to POSIX `SEEK_SET`.
+    Start,
+
+    /// The open handle's current position, corresponding to POSIX `SEEK_CUR`.
+    Current,
+
+    /// The current file length, corresponding to POSIX `SEEK_END`.
+    End,
+}
+
+/// Selects what a successful open does to an existing regular file's data.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OpenContentsMode {
+    /// Preserve the file's current length and contents.
+    Preserve,
+
+    /// Set the file length to zero. Requires a write-capable access mode.
+    Truncate,
+}
+
+/// Controls file contents at open and the write position of the new handle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OpenOptions {
+    /// Whether to preserve or truncate the contents of an existing file.
+    pub contents_mode: OpenContentsMode,
+
+    /// Selects the current end of the file for each write through this handle.
+    /// The handle's access rights still determine whether it can write.
+    pub append: bool,
+}
+
+/// Selects how create-and-open treats an occupied final pathname component.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CreateMode {
+    /// Follow final symlinks and open an existing file, or create the missing
+    /// final target as a regular file.
+    IfMissing,
+
+    /// Require a new final directory entry. Any occupied name, including a
+    /// symlink, returns [`FileSystemError::AlreadyExists`].
+    Exclusive,
+}
+
 impl AccessMode {
     /// Helper function to check if this access mode permits read operations.
     ///
@@ -267,8 +325,10 @@ impl NamespaceProtection {
     pub const NONE: Self = Self(0);
 
     /// Rejects unlink, rename, direct move, and replacement of every entry
-    /// naming the opened inode. Additional hard links remain permitted and
-    /// immediately share this protection. Ancestors remain independently
+    /// naming the opened inode. Also rejects truncating opens of the inode
+    /// through any name. Writes and handle-based resize, including resize to
+    /// zero, remain permitted by this protection. Additional hard links
+    /// immediately share name protection. Ancestors remain independently
     /// mutable.
     pub const PROTECT_NAMES: Self = Self(1);
 
@@ -459,14 +519,14 @@ impl Permissions {
 
 /// A point-in-time snapshot of an inode's metadata.
 ///
-/// Returned by [`crate::file_system::virtual_fs::vfs::VirtualFileSystem::stat`]
+/// Returned by [`super::vfs::VirtualFileSystem::inode_metadata_by_path`]
 /// rather than a raw `Arc<Inode>` reference, for two reasons: it avoids
 /// unnecessarily widening the lifetime of the inode's `Arc`, and it maps
 /// directly onto what a future `stat()` syscall will need to copy into a
 /// userspace buffer.
 ///
 /// Filesystem drivers do not produce [`InodeStat`] directly; the VFS constructs
-/// one from a loaded `Inode` at the point `stat()` is called.
+/// one from the canonical `Inode` when queried by path or handle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InodeStat {
     /// The inode's unique identifier within its filesystem instance.

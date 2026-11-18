@@ -32,6 +32,15 @@ use crate::file_system::virtual_fs::types::FileSystemError;
 pub struct StubBlockDevice;
 
 impl BlockDevice for StubBlockDevice {
+    /// Completes immediately because this device accepts no block writes.
+    ///
+    /// # Returns
+    ///
+    /// Returns success with no pending device data to persist.
+    fn flush(&self) -> Result<(), FileSystemError> {
+        Ok(())
+    }
+
     /// Returns the logical block size for this device.
     ///
     /// The stub filesystem uses 4096-byte blocks to match the VFS-wide

@@ -137,14 +137,9 @@ impl Directory {
 
     /// Looks up a child entry by name in a fresh directory snapshot.
     ///
-    /// The lookup is a linear scan of the driver's child list. This is
-    /// acceptable at this stage. A name index could be added if directory
-    /// lookup cost becomes a problem. The snapshot is dropped after the lookup,
-    /// so retained wrappers cannot hold stale child lists.
-    ///
-    /// The special names `.` and `..` are not stored as real entries and
-    /// will not be found by this method. The path resolver handles those
-    /// components before calling here.
+    /// The lookup scans a fresh driver listing with ASCII case-insensitive
+    /// comparison and preserves the spelling returned by the driver. Traversal
+    /// handles `.` and `..` before calling this entry lookup.
     ///
     /// # Arguments
     ///
@@ -154,12 +149,16 @@ impl Directory {
     /// # Returns
     ///
     /// Returns the matching owned [`DirectoryEntry`] if found, `None` if no
-    /// entry has that name, or `Err(FileSystemError)` if the driver read fails.
-    /// Detached directories return `None` without consulting the driver.
+    /// entry has that name, `InvalidPath` for an invalid component, or the
+    /// driver error if the read fails. For valid names, detached directories
+    /// return `None` without reading the driver listing.
     pub fn lookup_child(
         &self,
         name: &str,
     ) -> Result<Option<DirectoryEntry>, FileSystemError> {
+        DirectoryEntry::validate_name(name, 
+            self.inode.filesystem.max_name_bytes())?;
+
         // Removed directories remain inspectable, but can never gain children.
         if self.inode.metadata.lock().link_count == 0 {
             return Ok(None);
@@ -168,7 +167,7 @@ impl Directory {
         Ok(self.inode.filesystem
             .read_dir(&self.inode)?
             .into_iter()
-            .find(|entry| entry.name == name))
+            .find(|entry| entry.name.eq_ignore_ascii_case(name)))
     }
 
     /// Checks if this directory is the global root of the namespace.

@@ -162,13 +162,12 @@ pub(crate) struct InodeMetadata {
     /// cleanup before the driver frees storage and releases the inode slot.
     pub(crate) link_count: u32,
 
-    /// Indicates that this inode has been modified in memory but not yet
-    /// synced to disk.
+    /// Indicates that generic metadata awaits handoff to the driver.
     ///
-    /// Set to `true` by VFS reads and writes. The VFS clears it after
-    /// [`super::driver::FileSystemInstance::sync_inode`] succeeds during
-    /// volume unmount. A separate sync path for the boot volume is not yet
-    /// implemented.
+    /// Set by VFS metadata updates, including read and write timestamps.
+    /// The VFS clears it after [`FileSystemInstance::sync_inode`] succeeds.
+    /// Persistence completes when [`FileSystemInstance::sync_volume`]
+    /// subsequently flushes the driver and backing storage.
     pub(crate) dirty: bool,
 }
 
@@ -325,10 +324,9 @@ impl Inode {
 pub struct DirectoryEntry {
     /// The name of this entry within its parent directory.
     ///
-    /// This is the single path component (e.g., `bin`, `kernel.elf`)
-    /// without any separators. Names must not be empty, must not contain
-    /// `/`, and must not be `.` or `..` (those are synthesized by the
-    /// path resolver, not stored as real entries).
+    /// This stores the spelling used at creation or rename. New names must
+    /// satisfy [`DirectoryEntry::validate_name`]. The resolver interprets
+    /// `.` and `..` during traversal.
     pub name: String,
 
     /// The inode number of the filesystem object this entry references,
@@ -364,5 +362,33 @@ impl DirectoryEntry {
             inode_number,
             entry_type,
         }
+    }
+
+    /// Checks a single directory entry name against the owning volume's limit.
+    ///
+    /// The input is already valid UTF-8. This check rejects ASCII control
+    /// bytes and the path separator. Name matching uses ASCII case folding.
+    ///
+    /// # Arguments
+    ///
+    /// * `name`      - An individual name without separators or a string
+    ///   terminator.
+    /// * `max_bytes` - The mounted driver's maximum component size in bytes.
+    ///
+    /// # Returns
+    ///
+    /// Returns success for a valid name, or `InvalidPath` for an empty,
+    /// reserved, oversized, or malformed name.
+    pub(crate) fn validate_name(
+        name: &str,
+        max_bytes: usize,
+    ) -> Result<(), FileSystemError> {
+        if name.is_empty() || name.len() > max_bytes || name == "."
+            || name == ".." || name.bytes().any(|byte| byte.is_ascii_control()
+            || byte == b'/')
+        {
+            return Err(FileSystemError::InvalidPath);
+        }
+        Ok(())
     }
 }

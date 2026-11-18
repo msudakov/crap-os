@@ -15,7 +15,7 @@
 //! The tests are grouped and run in dependency order:
 //!
 //! 1. **Mount** - registers the stub driver and mounts the root volume.
-//! 2. **Stat** - resolves known paths and checks inode types and sizes.
+//! 2. **Path metadata** - resolves known paths and checks inode types and sizes.
 //! 3. **Read** - opens known files and verifies their content byte-for-byte.
 //! 4. **Write** - writes to `kernel.log`, reads back, and verifies.
 //! 5. **Inode coherence** - checks identity and metadata across references.
@@ -25,7 +25,8 @@
 //! 9. **Create directory** - creates a new directory and verifies it exists.
 //! 10. **Create symlink** - creates a new symlink and verifies traversal.
 //! 11. **Rename** - verifies in-place, relative, and cross-directory renames.
-//! 12. **Unlink** - removes a file name and verifies it is gone.
+//! 12. **Unlink** - removes a file name and verifies it is gone, and checks
+//!     successful removal after eager reclamation failure with cleanup retry.
 //! 13. **POSIX deferred unlink** - checks two independent opens, lookup through
 //!     a retained wrapper after unlink, final-close reclamation, and deletion
 //!     relative to a working directory.
@@ -43,17 +44,31 @@
 //!     protection retention across a failed final close.
 //! 21. **Replacement rename** - checks displaced lifetimes, compatible types,
 //!     pathname and protection rules, pre-commit failure, and cleanup retry.
-//! 22. **Teardown** - releases the global VFS owner after the tests.
+//! 22. **Create-and-open** - checks existing and new files, final symlinks,
+//!     shared traversal limits, and creation and registration failures.
+//! 23. **Truncate at open** - checks shared data and length, handle offsets,
+//!     creation modes, name protection, and pre-commit failure.
+//! 24. **Signed seek** - checks origins, shared offsets, and rejected seeks.
+//! 25. **Append** - checks per-write EOF selection, offsets, and failures.
+//! 26. **Readlink** - checks stored targets, path errors, and link access time.
+//! 27. **Handle metadata** - checks inode metadata across replacement and close.
+//! 28. **Directory listing** - checks snapshots, symlinks, and mount visibility.
+//! 29. **Filenames** - checks case, spelling, path syntax, and byte limits.
+//! 30. **Volume sync** - checks selection, inode handoff, flush, and retries.
+//! 31. **Resize** - checks exact lengths, zero extension, access, and failures.
+//! 32. **Teardown** - releases the global VFS owner after the tests.
 
 extern crate alloc;
 
 use alloc::sync::Arc;
+use alloc::format;
 
 use crate::file_system::stub_fs::stub_block_device::StubBlockDevice;
 use crate::file_system::stub_fs::StubFileSystemDriver;
 use crate::file_system::virtual_fs::directory::Directory;
 use crate::file_system::virtual_fs::types::{
-    AccessMode, FileSystemError, InodeType, Permissions, NamespaceProtection,
+    AccessMode, CreateMode, DirectoryEntryType, FileSystemError, InodeType, Permissions,
+    NamespaceProtection, OpenContentsMode, OpenOptions, SeekOrigin,
 };
 use crate::file_system::virtual_fs::vfs::VirtualFileSystem;
 use crate::file_system::virtual_fs::file::FileHandle;
@@ -81,7 +96,7 @@ pub fn run_vfs_tests() {
     sprintln!("[VFS TEST] ----------------------------------------");
 
     test_mount_and_register();
-    test_stat();
+    test_inode_metadata_by_path();
     test_read();
     test_write();
     test_inode_coherence();
@@ -92,6 +107,7 @@ pub fn run_vfs_tests() {
     test_create_symlink();
     test_rename();
     test_unlink();
+    test_unlink_reclamation_retry();
     test_posix_deferred_unlink();
     test_retained_directory_namespace();
     test_mount_wrapper_consistency();
@@ -108,6 +124,28 @@ pub fn run_vfs_tests() {
     test_replacement_rejections();
     test_replacement_failure_atomicity();
     test_replacement_reclamation();
+    test_open_or_create_basic();
+    test_open_or_create_symlinks();
+    test_open_or_create_failures();
+    test_open_truncate_shared_inode();
+    test_open_truncate_creation();
+    test_open_truncate_protection();
+    test_open_truncate_failure();
+    test_seek_signed_positions();
+    test_seek_signed_errors();
+    test_append_writes();
+    test_append_write_failure();
+    test_readlink();
+    test_inode_metadata_by_handle();
+    test_list_directory();
+    test_filename_case();
+    test_filename_limits();
+    test_volume_sync_selection();
+    test_volume_sync_retry();
+    test_volume_sync_unmount();
+    test_resize_contents();
+    test_resize_access();
+    test_resize_failures();
     expect_ok(with_vfs(|vfs| vfs.reclaim_unlinked_inodes()), "final unlinked inode cleanup");
     teardown_vfs();
 
@@ -271,22 +309,22 @@ fn test_mount_and_register() {
 /// # Panics
 ///
 /// Panics if a lookup fails or an inode has the wrong type or metadata.
-fn test_stat() {
-    sprintln!("[VFS TEST] stat ...");
+fn test_inode_metadata_by_path() {
+    sprintln!("[VFS TEST] inode metadata by path ...");
 
     // Root should be a directory.
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/", None, false)),
-        "stat(/)",
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/", None, false)),
+        "metadata for /",
     );
     assert!(
         stat.inode_type == InodeType::Directory,
-        "[VFS TEST] FAIL - stat(/): expected Directory"
+        "[VFS TEST] FAIL - metadata for /: expected Directory"
     );
 
     // /etc should be a directory.
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/etc", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc", None, false)),
         "stat(/etc)",
     );
     assert!(
@@ -296,7 +334,7 @@ fn test_stat() {
 
     // /etc/config.txt should be a file with the right size.
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/etc/config.txt", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/config.txt", None, false)),
         "stat(/etc/config.txt)",
     );
     assert!(
@@ -310,7 +348,7 @@ fn test_stat() {
 
     // /lib should be a symlink when follow_symlinks is false.
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/lib", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/lib", None, false)),
         "stat(/lib, no follow)",
     );
     assert!(
@@ -320,7 +358,7 @@ fn test_stat() {
 
     // /lib with follow_symlinks should resolve to /etc - a directory.
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/lib", None, true)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/lib", None, true)),
         "stat(/lib, follow)",
     );
     assert!(
@@ -328,7 +366,7 @@ fn test_stat() {
         "[VFS TEST] FAIL - stat(/lib, follow): expected Directory"
     );
 
-    sprintln!("[VFS TEST] stat ... PASS");
+    sprintln!("[VFS TEST] inode metadata by path ... PASS");
 }
 
 /// Verifies registered reads, independent opens, shared clones, and close.
@@ -567,7 +605,7 @@ fn test_symlink_traversal() {
 
     // /lib/config.txt should resolve through lib -> /etc to /etc/config.txt.
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/lib/config.txt", None, true)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/lib/config.txt", None, true)),
         "stat(/lib/config.txt)",
     );
     assert!(
@@ -610,11 +648,11 @@ fn test_dotdot_traversal() {
 
     // /bin/tools/../shell should resolve to /bin/shell.
     let stat_direct = expect_ok(
-        with_vfs(|vfs| vfs.stat("/bin/shell", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/bin/shell", None, false)),
         "stat(/bin/shell) direct",
     );
     let stat_dotdot = expect_ok(
-        with_vfs(|vfs| vfs.stat("/bin/tools/../shell", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/bin/tools/../shell", None, false)),
         "stat(/bin/tools/../shell)",
     );
     assert!(
@@ -633,7 +671,7 @@ fn test_dotdot_traversal() {
         "resolve /bin/tools as working directory",
     );
     let stat_relative = expect_ok(
-        with_vfs(|vfs| vfs.stat("../shell", Some(working_dir), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("../shell", Some(working_dir), false)),
         "stat ../shell from /bin/tools",
     );
     assert!(
@@ -643,11 +681,11 @@ fn test_dotdot_traversal() {
 
     // /etc/.. should resolve to root.
     let stat_root = expect_ok(
-        with_vfs(|vfs| vfs.stat("/", None, false)),
-        "stat(/)",
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/", None, false)),
+        "metadata for /",
     );
     let stat_up = expect_ok(
-        with_vfs(|vfs| vfs.stat("/etc/..", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/..", None, false)),
         "stat(/etc/..)",
     );
     assert!(
@@ -657,7 +695,7 @@ fn test_dotdot_traversal() {
 
     // /../.. should stay at root (cannot go above root).
     let stat_overflow = expect_ok(
-        with_vfs(|vfs| vfs.stat("/../..", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/../..", None, false)),
         "stat(/../..)",
     );
     assert!(
@@ -688,7 +726,7 @@ fn test_create_file() {
 
     // Verify the file exists and is a File.
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/var/log/test.log", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/var/log/test.log", None, false)),
         "stat /var/log/test.log after create",
     );
     assert!(
@@ -732,7 +770,7 @@ fn test_create_directory() {
     );
 
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/bin/utils", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/bin/utils", None, false)),
         "stat /bin/utils after create",
     );
     assert!(
@@ -774,7 +812,7 @@ fn test_create_symlink() {
 
     // Without following, it should be a Symlink.
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/etc/cfg", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/cfg", None, false)),
         "stat /etc/cfg no follow",
     );
     assert!(
@@ -784,7 +822,7 @@ fn test_create_symlink() {
 
     // With following, it should resolve to /etc/config.txt - a File.
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/etc/cfg", None, true)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/cfg", None, true)),
         "stat /etc/cfg follow",
     );
     assert!(
@@ -831,14 +869,14 @@ fn test_rename() {
 
     // Old name should be gone.
     expect_err(
-        with_vfs(|vfs| vfs.stat("/etc/hosts.txt", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/hosts.txt", None, false)),
         FileSystemError::NotFound,
         "stat old name after rename",
     );
 
     // New name should exist and be a File with the same content.
     let stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/etc/hosts.cfg", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/hosts.cfg", None, false)),
         "stat /etc/hosts.cfg after rename",
     );
     assert!(
@@ -878,12 +916,12 @@ fn test_rename() {
         "rename hosts.cfg relative to /etc",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("/etc/hosts.cfg", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/hosts.cfg", None, false)),
         FileSystemError::NotFound,
         "stat old name after relative rename",
     );
     let relative_stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/etc/hosts.relative", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/hosts.relative", None, false)),
         "stat new name after relative rename",
     );
     assert!(
@@ -898,7 +936,7 @@ fn test_rename() {
     // Move a file between directories and back. The inode and content must
     // survive both moves, and the old name must disappear after each one.
     let debug_stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/bin/tools/debug", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/bin/tools/debug", None, false)),
         "stat /bin/tools/debug before cross-directory rename",
     );
     expect_ok(
@@ -906,12 +944,12 @@ fn test_rename() {
         "move /bin/tools/debug to /var/log/debug",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("/bin/tools/debug", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/bin/tools/debug", None, false)),
         FileSystemError::NotFound,
         "stat old name after cross-directory rename",
     );
     let moved_stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/var/log/debug", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/var/log/debug", None, false)),
         "stat /var/log/debug after cross-directory rename",
     );
     assert!(
@@ -934,12 +972,12 @@ fn test_rename() {
         "restore /bin/tools/debug after cross-directory rename",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("/var/log/debug", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/var/log/debug", None, false)),
         FileSystemError::NotFound,
         "stat moved name after restoring /bin/tools/debug",
     );
     let restored_stat = expect_ok(
-        with_vfs(|vfs| vfs.stat("/bin/tools/debug", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/bin/tools/debug", None, false)),
         "stat /bin/tools/debug after restoring cross-directory rename",
     );
     assert!(
@@ -965,7 +1003,7 @@ fn test_unlink() {
 
     // The path should now return NotFound.
     expect_err(
-        with_vfs(|vfs| vfs.stat("/bin/tools/debug", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/bin/tools/debug", None, false)),
         FileSystemError::NotFound,
         "stat after unlink",
     );
@@ -978,6 +1016,85 @@ fn test_unlink() {
     );
 
     sprintln!("[VFS TEST] unlink ... PASS");
+}
+
+/// Checks successful unlink after failed eager reclamation and cleanup retry.
+///
+/// Each isolated fixture has no registered open handles. A targeted one-shot
+/// free failure must be consumed during unlink, leaving the removed inode
+/// available for explicit cleanup. Both regular files and dangling symlinks
+/// exercise the non-directory reclamation path.
+///
+/// # Panics
+///
+/// Panics if unlink reports the reclamation error, preserves the name, loses
+/// the retryable inode, skips eager reclamation, or repeats a completed free.
+fn test_unlink_reclamation_retry() {
+    sprintln!("[VFS TEST] unlink reclamation retry ...");
+
+    for symlink in [false, true] {
+        let mut vfs = new_stub_vfs();
+        let path = "/etc/unlink-retry";
+        let inode = if symlink {
+            expect_ok(
+                vfs.create_symlink(path, "/missing-unlink-target", None),
+                "create unlink retry symlink",
+            )
+        } else {
+            expect_ok(
+                vfs.create_file(path, Permissions::all_permissive(), None),
+                "create unlink retry file",
+            )
+        };
+
+        assert_eq!(inode.stat().link_count, 1);
+        super::fail_next_free_for(
+            inode.filesystem.instance_id(),
+            inode.inode_number,
+        );
+
+        expect_ok(
+            vfs.unlink(path, None),
+            "unlink succeeds despite eager free failure",
+        );
+        expect_err(
+            vfs.inode_metadata_by_path(path, None, false),
+            FileSystemError::NotFound,
+            "failed eager free leaves name removed",
+        );
+        assert_eq!(inode.stat().link_count, 0);
+
+        let backing = expect_ok(
+            inode.filesystem.load_inode(inode.inode_number),
+            "failed eager free preserves backing inode",
+        );
+        assert_eq!(backing.stat().link_count, 0);
+        drop(backing);
+
+        // This must succeed on the first cleanup call. An implementation
+        // that skipped eager free would still have the failure armed.
+        assert_eq!(
+            expect_ok(
+                vfs.reclaim_unlinked_inodes(),
+                "retry failed eager reclamation",
+            ),
+            1,
+        );
+        expect_err(
+            inode.filesystem.load_inode(inode.inode_number),
+            FileSystemError::NotFound,
+            "cleanup retry frees backing inode",
+        );
+        assert_eq!(
+            expect_ok(
+                vfs.reclaim_unlinked_inodes(),
+                "cleanup after successful retry",
+            ),
+            0,
+        );
+    }
+
+    sprintln!("[VFS TEST] unlink reclamation retry ... PASS");
 }
 
 /// Verifies that unlink preserves data for independent open handles, rejects
@@ -1000,7 +1117,7 @@ fn test_posix_deferred_unlink() {
         "resolve /etc before deferred unlink",
     );
     expect_ok(
-        with_vfs(|vfs| vfs.stat("config.txt", Some(Arc::clone(&etc_dir)), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("config.txt", Some(Arc::clone(&etc_dir)), false)),
         "load config.txt in retained /etc wrapper",
     );
     let first = expect_ok(
@@ -1020,7 +1137,7 @@ fn test_posix_deferred_unlink() {
 
     // The path should now be gone from the namespace.
     expect_err(
-        with_vfs(|vfs| vfs.stat("/etc/config.txt", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/config.txt", None, false)),
         FileSystemError::NotFound,
         "stat after deferred unlink",
     );
@@ -1111,7 +1228,7 @@ fn test_posix_deferred_unlink() {
         "unlink file relative to /var/log",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("/var/log/deferred-relative.tmp", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/var/log/deferred-relative.tmp", None, false)),
         FileSystemError::NotFound,
         "stat after relative deferred unlink",
     );
@@ -1150,7 +1267,7 @@ fn test_retained_directory_namespace() {
         "retain /var/log for namespace checks",
     );
     expect_ok(
-        with_vfs(|vfs| vfs.stat("kernel.log", Some(Arc::clone(&log_dir)), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("kernel.log", Some(Arc::clone(&log_dir)), false)),
         "visit a child through retained /var/log before mutation",
     );
 
@@ -1161,11 +1278,11 @@ fn test_retained_directory_namespace() {
         "create file through a fresh path",
     );
     let relative = expect_ok(
-        with_vfs(|vfs| vfs.stat("wrapper-new.tmp", Some(Arc::clone(&log_dir)), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("wrapper-new.tmp", Some(Arc::clone(&log_dir)), false)),
         "find created file through retained wrapper",
     );
     let absolute = expect_ok(
-        with_vfs(|vfs| vfs.stat("/var/log/wrapper-new.tmp", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/var/log/wrapper-new.tmp", None, false)),
         "find created file through fresh path",
     );
     assert!(relative.inode_number == created.inode_number
@@ -1179,16 +1296,16 @@ fn test_retained_directory_namespace() {
         "rename file through fresh paths",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("wrapper-new.tmp", Some(Arc::clone(&log_dir)), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("wrapper-new.tmp", Some(Arc::clone(&log_dir)), false)),
         FileSystemError::NotFound,
         "old name through retained wrapper after rename",
     );
     let renamed = expect_ok(
-        with_vfs(|vfs| vfs.stat("wrapper-renamed.tmp", Some(Arc::clone(&log_dir)), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("wrapper-renamed.tmp", Some(Arc::clone(&log_dir)), false)),
         "new name through retained wrapper after rename",
     );
     let fresh_renamed = expect_ok(
-        with_vfs(|vfs| vfs.stat("/var/log/wrapper-renamed.tmp", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/var/log/wrapper-renamed.tmp", None, false)),
         "new name through fresh path after rename",
     );
     assert!(renamed.inode_number == created.inode_number
@@ -1200,12 +1317,12 @@ fn test_retained_directory_namespace() {
         "unlink file through fresh path",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("wrapper-renamed.tmp", Some(log_dir), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("wrapper-renamed.tmp", Some(log_dir), false)),
         FileSystemError::NotFound,
         "unlinked name through retained wrapper",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("/var/log/wrapper-renamed.tmp", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/var/log/wrapper-renamed.tmp", None, false)),
         FileSystemError::NotFound,
         "unlinked name through fresh path",
     );
@@ -1231,7 +1348,7 @@ fn test_mount_wrapper_consistency() {
         "retain /etc before mount",
     );
     expect_ok(
-        with_vfs(|vfs| vfs.stat("hosts.cfg", Some(Arc::clone(&etc_dir)), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("hosts.cfg", Some(Arc::clone(&etc_dir)), false)),
         "visit a child through retained /etc before covering it",
     );
 
@@ -1271,7 +1388,7 @@ fn test_mount_wrapper_consistency() {
         && fresh.filesystem.instance_id() != etc_dir.inode.filesystem.instance_id(),
         "[VFS TEST] FAIL - wrappers see different mounted instances");
     expect_err(
-        with_vfs(|vfs| vfs.stat("hosts.cfg", Some(Arc::clone(&etc_dir)), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("hosts.cfg", Some(Arc::clone(&etc_dir)), false)),
         FileSystemError::NotFound,
         "retained host hides covered children while mounted",
     );
@@ -1299,20 +1416,20 @@ fn test_mount_wrapper_consistency() {
     );
     close_file(&busy_handle);
 
-    // A failed driver flush must leave both mount indexes intact. The stub
-    // injects one failure for this mounted instance, then permits a retry.
+    // A failed driver teardown must leave both mount indexes intact. The
+    // stub injects one failure for this instance, then permits a retry.
     super::fail_next_unmount_for(visible_root.filesystem.instance_id());
     expect_err(
         with_vfs(|vfs| vfs.unmount("/etc", None)),
         FileSystemError::DiskWriteError,
-        "unmount with a simulated flush failure",
+        "unmount with a simulated teardown failure",
     );
     expect_ok(
-        with_vfs(|vfs| vfs.stat("/etc/bin/shell", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/bin/shell", None, false)),
         "fresh path still enters mount after failed unmount",
     );
     expect_ok(
-        with_vfs(|vfs| vfs.stat("bin/shell", Some(Arc::clone(&etc_dir)), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("bin/shell", Some(Arc::clone(&etc_dir)), false)),
         "retained host still enters mount after failed unmount",
     );
     let parent_after_failure = expect_ok(
@@ -1335,7 +1452,7 @@ fn test_mount_wrapper_consistency() {
         "retry unmount /etc through fresh path",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("/etc/bin/shell", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/bin/shell", None, false)),
         FileSystemError::NotFound,
         "covered /etc restored after unmount",
     );
@@ -1347,7 +1464,7 @@ fn test_mount_wrapper_consistency() {
         "mount through retained host",
     );
     expect_ok(
-        with_vfs(|vfs| vfs.stat("bin/shell", Some(Arc::clone(&etc_dir)), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("bin/shell", Some(Arc::clone(&etc_dir)), false)),
         "retained host sees remount",
     );
     expect_ok(
@@ -1355,7 +1472,7 @@ fn test_mount_wrapper_consistency() {
         "unmount through retained host",
     );
     expect_ok(
-        with_vfs(|vfs| vfs.stat("hosts.cfg", Some(etc_dir), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("hosts.cfg", Some(etc_dir), false)),
         "retained host sees uncovered /etc again",
     );
 
@@ -1386,14 +1503,14 @@ fn test_moved_working_directory_parent() {
     );
 
     let moved = expect_ok(
-        with_vfs(|vfs| vfs.stat("/bin/log", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/bin/log", None, false)),
         "find moved directory through fresh path",
     );
     assert!(moved.inode_number == retained_log.inode.inode_number,
         "[VFS TEST] FAIL - moving /var/log changed its inode");
 
     let bin = expect_ok(
-        with_vfs(|vfs| vfs.stat("/bin", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/bin", None, false)),
         "stat expected new parent /bin",
     );
     let fresh_log = expect_ok(
@@ -1404,14 +1521,14 @@ fn test_moved_working_directory_parent() {
         "resolve moved directory through fresh path",
     );
     let fresh_parent = expect_ok(
-        with_vfs(|vfs| vfs.stat("..", Some(fresh_log), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("..", Some(fresh_log), false)),
         "resolve .. from fresh /bin/log wrapper",
     );
     assert!(fresh_parent.inode_number == bin.inode_number,
         "[VFS TEST] FAIL - fresh moved-directory parent is not /bin");
 
     let retained_parent = expect_ok(
-        with_vfs(|vfs| vfs.stat("..", Some(Arc::clone(&retained_log)), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("..", Some(Arc::clone(&retained_log)), false)),
         "resolve .. from retained moved-directory wrapper",
     );
     assert!(retained_parent.inode_number == bin.inode_number,
@@ -1423,11 +1540,11 @@ fn test_moved_working_directory_parent() {
         "restore /var/log after parent check",
     );
     let var = expect_ok(
-        with_vfs(|vfs| vfs.stat("/var", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/var", None, false)),
         "stat restored parent /var",
     );
     let restored_parent = expect_ok(
-        with_vfs(|vfs| vfs.stat("..", Some(retained_log), false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("..", Some(retained_log), false)),
         "resolve .. from retained wrapper after restoring /var/log",
     );
     assert!(restored_parent.inode_number == var.inode_number,
@@ -1460,7 +1577,7 @@ fn test_trailing_slash_paths() {
         "create_file with trailing slash",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("/var/log/trailing-file.tmp", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/var/log/trailing-file.tmp", None, false)),
         FileSystemError::NotFound,
         "file was not created after trailing-slash rejection",
     );
@@ -1490,7 +1607,7 @@ fn test_trailing_slash_paths() {
         "create_symlink with trailing slash",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("/etc/trailing-link", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/trailing-link", None, false)),
         FileSystemError::NotFound,
         "symlink was not created after trailing-slash rejection",
     );
@@ -1498,13 +1615,13 @@ fn test_trailing_slash_paths() {
     // The deferred-unlink test removed config.txt. The rename test restored
     // hosts.cfg, so it remains a live regular-file fixture here.
     let regular_file = expect_ok(
-        with_vfs(|vfs| vfs.stat("/etc/hosts.cfg", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/hosts.cfg", None, false)),
         "verify live regular-file fixture for trailing-slash checks",
     );
     assert!(regular_file.inode_type == InodeType::File,
         "[VFS TEST] FAIL - trailing-slash regular-file fixture is not a file");
     expect_err(
-        with_vfs(|vfs| vfs.stat("/etc/hosts.cfg/", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/hosts.cfg/", None, false)),
         FileSystemError::NotADirectory,
         "stat regular file with trailing slash",
     );
@@ -1535,17 +1652,17 @@ fn test_trailing_slash_paths() {
         "rename regular file to trailing-slash path",
     );
     expect_ok(
-        with_vfs(|vfs| vfs.stat("/etc/hosts.cfg", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/hosts.cfg", None, false)),
         "regular file remains after rejected trailing-slash mutations",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("/etc/trailing-renamed.txt", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/trailing-renamed.txt", None, false)),
         FileSystemError::NotFound,
         "rename destination was not created after trailing-slash rejection",
     );
 
     let linked_directory = expect_ok(
-        with_vfs(|vfs| vfs.stat("/lib/", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/lib/", None, false)),
         "stat symlink to directory with trailing slash",
     );
     assert!(linked_directory.inode_type == InodeType::Directory,
@@ -1557,7 +1674,7 @@ fn test_trailing_slash_paths() {
         "create symlink to live file for trailing-slash lookup",
     );
     expect_err(
-        with_vfs(|vfs| vfs.stat("/etc/trailing-file-link/", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/etc/trailing-file-link/", None, false)),
         FileSystemError::NotADirectory,
         "stat symlink to file with trailing slash",
     );
@@ -1573,7 +1690,7 @@ fn test_trailing_slash_paths() {
         "create_directory with trailing slash",
     );
     let directory = expect_ok(
-        with_vfs(|vfs| vfs.stat("/bin/trailing-dir/", None, false)),
+        with_vfs(|vfs| vfs.inode_metadata_by_path("/bin/trailing-dir/", None, false)),
         "stat directory with trailing slash",
     );
     assert!(directory.inode_type == InodeType::Directory,
@@ -1651,10 +1768,10 @@ fn test_hard_links() {
         expect_ok(vfs.rename(
             "/etc/hard-source", "/var/log/hard-alias", None,
         ), "rename between aliases is a no-op");
-        assert_eq!(expect_ok(vfs.stat(
+        assert_eq!(expect_ok(vfs.inode_metadata_by_path(
             "/etc/hard-source", None, false,
         ), "source survives same-inode rename").link_count, 2);
-        assert_eq!(expect_ok(vfs.stat(
+        assert_eq!(expect_ok(vfs.inode_metadata_by_path(
             "/var/log/hard-alias", None, false,
         ), "alias survives same-inode rename").link_count, 2);
 
@@ -2052,11 +2169,17 @@ fn test_namespace_name_protection() {
     let mut vfs = new_stub_vfs();
     let file = expect_ok(vfs.create_file("/etc/protected", Permissions::all_permissive(), None), "create protected file");
     expect_ok(vfs.create_hard_link("/etc/protected", "/var/alias", None, false), "create alias");
-    let first = expect_ok(vfs.open_with_namespace_protection("/etc/protected", AccessMode::ReadWrite,
-        None, NamespaceProtection::PROTECT_NAMES), "first protected open");
+    let first = expect_ok(vfs.open_with_options(
+        "/etc/protected", AccessMode::ReadWrite,
+        OpenOptions { contents_mode: OpenContentsMode::Preserve, append: false },
+        None, NamespaceProtection::PROTECT_NAMES,
+    ), "first protected open");
     let clone = first.clone();
-    let second = expect_ok(vfs.open_with_namespace_protection("/var/alias", AccessMode::ReadOnly,
-        None, NamespaceProtection::PROTECT_NAMES), "independent alias open");
+    let second = expect_ok(vfs.open_with_options(
+        "/var/alias", AccessMode::ReadOnly,
+        OpenOptions { contents_mode: OpenContentsMode::Preserve, append: false },
+        None, NamespaceProtection::PROTECT_NAMES,
+    ), "independent alias open");
     let ordinary = expect_ok(vfs.open("/var/alias", AccessMode::ReadWrite, None), "ordinary open alongside protection");
     assert_eq!(expect_ok(vfs.write(&ordinary, b"shared"), "ordinary write remains allowed"), 6);
     let mut buffer = [0u8; 6];
@@ -2104,11 +2227,17 @@ fn test_namespace_combined_protection() {
     let mut vfs = new_stub_vfs();
     let p = Permissions::all_permissive();
     expect_ok(vfs.create_file("/etc/protected", p, None), "create additive fixture");
-    let names = expect_ok(vfs.open_with_namespace_protection("/etc/protected", AccessMode::ReadOnly,
-        None, NamespaceProtection::PROTECT_NAMES), "name-only open");
+    let names = expect_ok(vfs.open_with_options(
+        "/etc/protected", AccessMode::ReadOnly,
+        OpenOptions { contents_mode: OpenContentsMode::Preserve, append: false },
+        None, NamespaceProtection::PROTECT_NAMES,
+    ), "name-only open");
     expect_ok(vfs.rename("/etc", "/settings", None), "name-only permits ancestor rename");
-    let ancestors = expect_ok(vfs.open_with_namespace_protection("/settings/protected", AccessMode::ReadOnly,
-        None, NamespaceProtection::PROTECT_ANCESTORS), "ancestor-only independent open");
+    let ancestors = expect_ok(vfs.open_with_options(
+        "/settings/protected", AccessMode::ReadOnly,
+        OpenOptions { contents_mode: OpenContentsMode::Preserve, append: false },
+        None, NamespaceProtection::PROTECT_ANCESTORS,
+    ), "ancestor-only independent open");
     expect_err(vfs.rename("/settings/protected", "/var/moved", None), FileSystemError::ResourceBusy, "name holder blocks direct movement");
     expect_err(vfs.rename("/settings", "/settings2", None), FileSystemError::ResourceBusy, "ancestor holder blocks parent movement");
     expect_ok(vfs.close(&names), "release only names");
@@ -2120,8 +2249,11 @@ fn test_namespace_combined_protection() {
     expect_ok(vfs.create_hard_link("/storage/moved", "/settings2/alias", None, false), "create alias on another chain");
     assert_eq!(NamespaceProtection::PROTECT_FULL,
         NamespaceProtection::PROTECT_NAMES | NamespaceProtection::PROTECT_ANCESTORS);
-    let full = expect_ok(vfs.open_with_namespace_protection("/storage/moved", AccessMode::ReadOnly,
-        None, NamespaceProtection::PROTECT_FULL), "full open");
+    let full = expect_ok(vfs.open_with_options(
+        "/storage/moved", AccessMode::ReadOnly,
+        OpenOptions { contents_mode: OpenContentsMode::Preserve, append: false },
+        None, NamespaceProtection::PROTECT_FULL,
+    ), "full open");
     expect_err(vfs.rename("/storage", "/storage2", None), FileSystemError::ResourceBusy, "full protects opened ancestry");
     expect_err(vfs.unlink("/settings2/alias", None), FileSystemError::ResourceBusy, "full protects other alias name");
     expect_ok(vfs.rename("/settings2", "/settings3", None), "full does not protect other alias ancestry");
@@ -2148,8 +2280,11 @@ fn test_namespace_symlinks_and_mounts() {
     let p = Permissions::all_permissive();
     let target = expect_ok(vfs.create_file("/var/log/target", p.clone(), None), "create symlink target");
     expect_ok(vfs.create_symlink("/etc/entry", "../var/log/target", None), "relative final symlink");
-    let handle = expect_ok(vfs.open_with_namespace_protection("/etc/entry", AccessMode::ReadOnly,
-        None, NamespaceProtection::PROTECT_FULL), "protected open through final symlink");
+    let handle = expect_ok(vfs.open_with_options(
+        "/etc/entry", AccessMode::ReadOnly,
+        OpenOptions { contents_mode: OpenContentsMode::Preserve, append: false },
+        None, NamespaceProtection::PROTECT_FULL,
+    ), "protected open through final symlink");
     assert!(Arc::ptr_eq(&handle.file.inode, &target));
     expect_err(vfs.rename("/var/log", "/var/log2", None), FileSystemError::ResourceBusy, "actual target parent protected");
     expect_err(vfs.mount("stubfs", Arc::new(StubBlockDevice), "/var", None), FileSystemError::ResourceBusy, "actual ancestor cannot be covered");
@@ -2158,10 +2293,16 @@ fn test_namespace_symlinks_and_mounts() {
     expect_ok(vfs.close(&handle), "close symlink-resolved handle");
     expect_ok(vfs.rename("/var/log", "/var/log2", None), "target parent released");
     expect_ok(vfs.create_symlink("/settings/loop", "loop", None), "create loop");
-    expect_err(vfs.open_with_namespace_protection("/settings/loop", AccessMode::ReadOnly,
-        None, NamespaceProtection::PROTECT_FULL), FileSystemError::TooManySymlinks, "failed protected symlink open");
-    expect_err(vfs.open_with_namespace_protection("/settings", AccessMode::ReadOnly,
-        None, NamespaceProtection::PROTECT_FULL), FileSystemError::NotAFile, "directory open rejected");
+    expect_err(vfs.open_with_options(
+        "/settings/loop", AccessMode::ReadOnly,
+        OpenOptions { contents_mode: OpenContentsMode::Preserve, append: false },
+        None, NamespaceProtection::PROTECT_FULL,
+    ), FileSystemError::TooManySymlinks, "failed protected symlink open");
+    expect_err(vfs.open_with_options(
+        "/settings", AccessMode::ReadOnly,
+        OpenOptions { contents_mode: OpenContentsMode::Preserve, append: false },
+        None, NamespaceProtection::PROTECT_FULL,
+    ), FileSystemError::NotAFile, "directory open rejected");
     expect_ok(vfs.rename("/settings", "/settings2", None), "failed opens leave ancestry unprotected");
 
     // Relative resolution through an intermediate symlink must capture the
@@ -2169,16 +2310,22 @@ fn test_namespace_symlinks_and_mounts() {
     expect_ok(vfs.create_symlink("/settings2/bridge", "/var/log2", None), "intermediate directory symlink");
     let base = expect_ok(vfs.resolve_dir_with_budget("/settings2", None,
         crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH), "relative open base");
-    let relative = expect_ok(vfs.open_with_namespace_protection("bridge/target", AccessMode::ReadOnly,
-        Some(base), NamespaceProtection::PROTECT_FULL), "relative intermediate-symlink open");
+    let relative = expect_ok(vfs.open_with_options(
+        "bridge/target", AccessMode::ReadOnly,
+        OpenOptions { contents_mode: OpenContentsMode::Preserve, append: false },
+        Some(base), NamespaceProtection::PROTECT_FULL,
+    ), "relative intermediate-symlink open");
     assert!(Arc::ptr_eq(&relative.file.inode, &target));
     expect_err(vfs.rename("/var/log2", "/var/log3", None), FileSystemError::ResourceBusy, "relative target ancestry protected");
     expect_err(vfs.unlink("/var/log2/target", None), FileSystemError::ResourceBusy, "relative target name protected");
     expect_ok(vfs.close(&relative), "close relative protected open");
 
     expect_ok(vfs.mount("stubfs", Arc::new(StubBlockDevice), "/bin/tools", None), "mount protected-open fixture");
-    let mounted = expect_ok(vfs.open_with_namespace_protection("/bin/tools/etc/config.txt", AccessMode::ReadOnly,
-        None, NamespaceProtection::PROTECT_FULL), "full open inside mount");
+    let mounted = expect_ok(vfs.open_with_options(
+        "/bin/tools/etc/config.txt", AccessMode::ReadOnly,
+        OpenOptions { contents_mode: OpenContentsMode::Preserve, append: false },
+        None, NamespaceProtection::PROTECT_FULL,
+    ), "full open inside mount");
     let host_file = expect_ok(vfs.resolve("/settings2/config.txt", None, false), "host inode-number peer");
     assert_eq!(host_file.inode_number, mounted.file.inode.inode_number);
     assert_ne!(host_file.filesystem.instance_id(), mounted.file.inode.filesystem.instance_id());
@@ -2204,8 +2351,11 @@ fn test_namespace_close_retry() {
     sprintln!("[VFS TEST] namespace close retry ...");
     let mut vfs = new_stub_vfs();
     let inode = expect_ok(vfs.create_file("/etc/retry", Permissions::all_permissive(), None), "create retry file");
-    let handle = expect_ok(vfs.open_with_namespace_protection("/etc/retry", AccessMode::ReadWrite,
-        None, NamespaceProtection::PROTECT_ANCESTORS), "open ancestor-only retry file");
+    let handle = expect_ok(vfs.open_with_options(
+        "/etc/retry", AccessMode::ReadWrite,
+        OpenOptions { contents_mode: OpenContentsMode::Preserve, append: false },
+        None, NamespaceProtection::PROTECT_ANCESTORS,
+    ), "open ancestor-only retry file");
     let clone = handle.clone();
     assert_eq!(expect_ok(vfs.write(&handle, b"keep"), "write before unlink"), 4);
     expect_ok(vfs.unlink("/etc/retry", None), "ancestor-only permits unlink");
@@ -2452,8 +2602,11 @@ fn test_replacement_rejections() {
     }
     expect_err(vfs.rename("/etc/file\0", "/etc/new", None), FileSystemError::InvalidPath, "NUL source rejected");
     expect_err(vfs.rename("/etc/file", "/etc/new\0", None), FileSystemError::InvalidPath, "NUL destination rejected");
-    let protected = expect_ok(vfs.open_with_namespace_protection("/etc/file", AccessMode::ReadOnly,
-        None, NamespaceProtection::PROTECT_NAMES), "protected replacement source");
+    let protected = expect_ok(vfs.open_with_options(
+        "/etc/file", AccessMode::ReadOnly,
+        OpenOptions { contents_mode: OpenContentsMode::Preserve, append: false },
+        None, NamespaceProtection::PROTECT_NAMES,
+    ), "protected replacement source");
     let other = replacement_file(&mut vfs, "/etc/other", b"other");
     expect_err(vfs.rename("/etc/file", "/etc/other", None), FileSystemError::ResourceBusy, "source protection");
     expect_err(vfs.rename("/etc/other", "/etc/file", None), FileSystemError::ResourceBusy, "destination protection");
@@ -2598,4 +2751,1417 @@ fn test_replacement_reclamation() {
     expect_ok(vfs.unmount("/bin/tools", None), "retry unmount reclaims displaced inode");
     expect_err(victim.filesystem.load_inode(victim.inode_number), FileSystemError::NotFound, "unmount freed displaced storage");
     sprintln!("[VFS TEST] replacement reclamation ... PASS");
+}
+
+/// Checks both create-and-open modes on new and existing regular files.
+///
+/// A second ordinary open must retain the created file's contents and
+/// canonical identity. Exclusive creation rejects every occupied final name
+/// without changing the existing file or directory.
+///
+/// # Panics
+///
+/// Panics if registration, content preservation, identity, or exclusivity
+/// differs from the stated contract.
+fn test_open_or_create_basic() {
+    sprintln!("[VFS TEST] create-and-open basic ...");
+    let mut vfs = new_stub_vfs();
+    let path = "/etc/opened-on-create";
+    let created = expect_ok(vfs.open_or_create(
+        path, AccessMode::ReadWrite, CreateMode::IfMissing,
+        Permissions::all_permissive(), None,
+    ), "create and open missing file");
+    assert_eq!(expect_ok(vfs.write(&created, b"keep"), "write created file"), 4);
+    expect_ok(vfs.close(&created), "close created file");
+
+    let reopened = expect_ok(vfs.open_or_create(
+        path, AccessMode::ReadOnly, CreateMode::IfMissing,
+        Permissions::all_permissive(), None,
+    ), "ordinary create-and-open existing file");
+    assert!(Arc::ptr_eq(&created.file.inode, &reopened.file.inode));
+    let mut contents = [0u8; 4];
+    assert_eq!(expect_ok(vfs.read(&reopened, &mut contents),
+        "read existing contents"), 4);
+    assert_eq!(&contents, b"keep");
+    expect_err(vfs.open_or_create(
+        path, AccessMode::ReadWrite, CreateMode::Exclusive,
+        Permissions::all_permissive(), None,
+    ), FileSystemError::AlreadyExists, "exclusive existing file");
+    expect_err(vfs.open_or_create(
+        "/etc", AccessMode::ReadWrite, CreateMode::Exclusive,
+        Permissions::all_permissive(), None,
+    ), FileSystemError::AlreadyExists, "exclusive existing directory");
+    expect_ok(vfs.close(&reopened), "close reopened file");
+
+    let exclusive = expect_ok(vfs.open_or_create(
+        "/etc/exclusive-new", AccessMode::ReadWrite,
+        CreateMode::Exclusive, Permissions::all_permissive(), None,
+    ), "exclusive create missing file");
+    let ordinary = expect_ok(vfs.open("/etc/exclusive-new",
+        AccessMode::ReadOnly, None), "ordinary open of exclusive creation");
+    assert!(Arc::ptr_eq(&exclusive.file.inode, &ordinary.file.inode));
+    expect_ok(vfs.close(&ordinary), "close ordinary open");
+    expect_ok(vfs.close(&exclusive), "close exclusive creation");
+    sprintln!("[VFS TEST] create-and-open basic ... PASS");
+}
+
+/// Checks final-symlink creation and one shared traversal budget.
+///
+/// Relative and absolute dangling targets are created in their resolved
+/// directories. A parent symlink and sixteen final symlinks together exceed
+/// the same budget that permits the sixteen final links alone.
+///
+/// # Panics
+///
+/// Panics if symlink creation targets, exclusive rejection, loop handling,
+/// parent resolution, or budget accounting differ from the contract.
+fn test_open_or_create_symlinks() {
+    sprintln!("[VFS TEST] create-and-open symlinks ...");
+    let mut vfs = new_stub_vfs();
+    expect_ok(vfs.create_symlink("/etc/absolute-link", "/var/created-absolute", None),
+        "absolute dangling symlink");
+    expect_err(vfs.open_or_create(
+        "/etc/absolute-link", AccessMode::ReadWrite,
+        CreateMode::Exclusive, Permissions::all_permissive(), None,
+    ), FileSystemError::AlreadyExists, "exclusive dangling symlink");
+    expect_err(vfs.inode_metadata_by_path("/var/created-absolute", None, false),
+        FileSystemError::NotFound, "exclusive did not create target");
+    let absolute = expect_ok(vfs.open_or_create(
+        "/etc/absolute-link", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), "create through absolute symlink");
+    let target = expect_ok(vfs.resolve("/var/created-absolute", None, false),
+        "resolve created absolute target");
+    assert!(Arc::ptr_eq(&absolute.file.inode, &target));
+    expect_ok(vfs.close(&absolute), "close absolute target");
+    let live = expect_ok(vfs.open_or_create(
+        "/etc/absolute-link", AccessMode::ReadOnly,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), "ordinary creation opens existing symlink target");
+    assert!(Arc::ptr_eq(&live.file.inode, &target));
+    expect_ok(vfs.close(&live), "close live symlink target");
+
+    expect_ok(vfs.create_symlink("/etc/relative-link", "../var/created-relative", None),
+        "relative dangling symlink");
+    expect_ok(vfs.create_symlink("/etc/chain-link", "relative-link", None),
+        "chained symlink");
+    let relative = expect_ok(vfs.open_or_create(
+        "/etc/chain-link", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), "create through chained relative symlinks");
+    assert!(Arc::ptr_eq(&relative.file.inode,
+        &expect_ok(vfs.resolve("/var/created-relative", None, false),
+            "resolve created relative target")));
+    expect_ok(vfs.close(&relative), "close relative target");
+    expect_err(vfs.open_or_create(
+        "/etc/relative-link", AccessMode::ReadOnly,
+        CreateMode::Exclusive, Permissions::all_permissive(), None,
+    ), FileSystemError::AlreadyExists, "exclusive live symlink");
+
+    expect_err(vfs.open_or_create(
+        "/missing-parent/file", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), FileSystemError::NotFound, "missing parent remains absent");
+    expect_err(vfs.open_or_create(
+        "/etc/config.txt/child", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), FileSystemError::NotADirectory, "non-directory parent rejected");
+    expect_err(vfs.open_or_create(
+        "/etc/trailing/", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), FileSystemError::NotADirectory, "trailing slash rejects file creation");
+
+    for index in 0..16 {
+        let link = format!("/etc/budget-{}", index);
+        let next = if index == 15 {
+            "/etc/budget-file".into()
+        } else {
+            format!("/etc/budget-{}", index + 1)
+        };
+        expect_ok(vfs.create_symlink(&link, &next, None),
+            "create symlink budget chain");
+    }
+    let budget_file = expect_ok(vfs.open_or_create(
+        "/etc/budget-0", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), "sixteen final symlinks fit budget");
+    expect_ok(vfs.close(&budget_file), "close budget chain target");
+    expect_ok(vfs.create_symlink("/etc/parent-alias", "/etc", None),
+        "symlink in parent path");
+    expect_err(vfs.open_or_create(
+        "/etc/parent-alias/budget-0", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), FileSystemError::TooManySymlinks,
+        "parent and final symlinks share budget");
+    expect_ok(vfs.create_symlink("/etc/loop-a", "/etc/loop-b", None),
+        "first loop link");
+    expect_ok(vfs.create_symlink("/etc/loop-b", "/etc/loop-a", None),
+        "second loop link");
+    expect_err(vfs.open_or_create(
+        "/etc/loop-a", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), FileSystemError::TooManySymlinks, "symlink loop is bounded");
+
+    expect_ok(vfs.mount("stubfs", Arc::new(StubBlockDevice),
+        "/bin/tools", None), "mount create-and-open target");
+    expect_ok(vfs.create_symlink("/etc/mounted-link",
+        "/bin/tools/etc/mounted-created", None),
+        "link to mounted destination");
+    let mounted = expect_ok(vfs.open_or_create(
+        "/etc/mounted-link", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), "create through link into mounted instance");
+    let mounted_target = expect_ok(vfs.resolve(
+        "/bin/tools/etc/mounted-created", None, false,
+    ), "resolve mounted created target");
+    assert!(Arc::ptr_eq(&mounted.file.inode, &mounted_target));
+    expect_ok(vfs.close(&mounted), "close mounted target");
+    expect_ok(vfs.unmount("/bin/tools", None), "unmount create-and-open target");
+    sprintln!("[VFS TEST] create-and-open symlinks ... PASS");
+}
+
+/// Checks pre-commit creation errors and successful retry.
+///
+/// A staged driver failure leaves both the directory entry and the next
+/// inode slot untouched, allowing a retry to use that same slot.
+///
+/// # Panics
+///
+/// Panics if a failed create publishes a name or inode, advances the slot,
+/// or prevents a successful retry.
+fn test_open_or_create_failures() {
+    sprintln!("[VFS TEST] create-and-open failures ...");
+    let mut vfs = new_stub_vfs();
+    let baseline = expect_ok(vfs.create_file(
+        "/etc/create-baseline", Permissions::all_permissive(), None,
+    ), "create failure baseline");
+    let next_inode_number = baseline.inode_number + 1;
+    super::fail_next_create_for(baseline.filesystem.instance_id());
+    expect_err(vfs.open_or_create(
+        "/etc/create-retry", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), FileSystemError::DiskWriteError, "staged creation failure");
+    expect_err(vfs.resolve("/etc/create-retry", None, false),
+        FileSystemError::NotFound, "failed create left name absent");
+    expect_err(baseline.filesystem.load_inode(next_inode_number),
+        FileSystemError::NotFound, "failed create left backing inode absent");
+    let retry = expect_ok(vfs.open_or_create(
+        "/etc/create-retry", AccessMode::ReadWrite,
+        CreateMode::IfMissing, Permissions::all_permissive(), None,
+    ), "retry creation");
+    assert_eq!(retry.file.inode.inode_number, next_inode_number);
+    expect_ok(vfs.close(&retry), "close retry creation");
+
+    sprintln!("[VFS TEST] create-and-open failures ... PASS");
+}
+
+/// Checks that truncating through a hard-link alias updates the shared file.
+///
+/// # Panics
+///
+/// Panics if the inode changes identity, backing or live data survives, or
+/// truncation resets an existing handle's offset.
+fn test_open_truncate_shared_inode() {
+    sprintln!("[VFS TEST] truncate at open, shared inode ...");
+    let mut vfs = new_stub_vfs();
+    let path = "/etc/truncate-file";
+    let alias = "/etc/truncate-alias";
+    let original = expect_ok(vfs.open_or_create(
+        path, AccessMode::ReadWrite, CreateMode::Exclusive,
+        Permissions::all_permissive(), None,
+    ), "create truncation target");
+    assert_eq!(expect_ok(vfs.write(&original, b"old!"), "seed data"), 4);
+    expect_ok(vfs.create_hard_link(path, alias, None, false), "link target");
+    let inode = &original.file.inode;
+    let before = inode.stat();
+
+    let truncated = expect_ok(vfs.open_with_options(
+        alias, AccessMode::ReadWrite,
+        OpenOptions { contents_mode: OpenContentsMode::Truncate, append: false },
+        None, NamespaceProtection::NONE,
+    ), "truncate through alias");
+    assert!(Arc::ptr_eq(inode, &truncated.file.inode));
+    let after = expect_ok(vfs.inode_metadata_by_path(path, None, false), "stat original name");
+    assert_eq!(after, expect_ok(vfs.inode_metadata_by_path(alias, None, false), "stat alias"));
+    assert_eq!(after.size, 0);
+    assert_eq!(after.link_count, 2);
+    assert_eq!(after.permissions, before.permissions);
+    assert_eq!(after.timestamps.created, before.timestamps.created);
+    assert_eq!(after.timestamps.accessed, before.timestamps.accessed);
+    assert_eq!(expect_ok(inode.filesystem.load_inode(inode.inode_number),
+        "load backing inode after truncate").stat().size, 0);
+
+    let mut contents = [0xff; 5];
+    assert_eq!(expect_ok(vfs.read(&truncated, &mut contents),
+        "new handle reads EOF"), 0);
+    assert_eq!(expect_ok(vfs.read(&original, &mut contents),
+        "old handle reads EOF"), 0);
+
+    // The old offset is four. Writing there must expose zeroes where the
+    // previous contents were, while the new handle still reads from zero.
+    assert_eq!(expect_ok(vfs.write(&original, b"x"), "write at old offset"), 1);
+    assert_eq!(expect_ok(vfs.read(&truncated, &mut contents),
+        "read gap and new byte"), contents.len());
+    assert_eq!(contents, [0, 0, 0, 0, b'x']);
+
+    expect_ok(vfs.close(&truncated), "close truncating open");
+    expect_ok(vfs.close(&original), "close original open");
+    sprintln!("[VFS TEST] truncate at open, shared inode ... PASS");
+}
+
+/// Checks how truncation combines with missing targets and exclusive creation.
+///
+/// # Panics
+///
+/// Panics if an exclusive open modifies an occupied name, an ordinary open
+/// creates a missing name, or a create-and-truncate selects the wrong target.
+fn test_open_truncate_creation() {
+    sprintln!("[VFS TEST] truncate at open, creation ...");
+    let mut vfs = new_stub_vfs();
+    let link = "/etc/truncate-link";
+    let target = "/etc/truncate-target";
+    expect_ok(vfs.create_symlink(link, "truncate-target", None),
+        "create dangling final link");
+
+    expect_err(vfs.open_with_options(
+        link, AccessMode::ReadWrite,
+        OpenOptions { contents_mode: OpenContentsMode::Truncate, append: false },
+        None, NamespaceProtection::NONE,
+    ), FileSystemError::NotFound, "truncate without create follows dangling link");
+    expect_err(vfs.open_or_create_with_options(
+        link, AccessMode::ReadWrite, CreateMode::Exclusive,
+        OpenOptions { contents_mode: OpenContentsMode::Truncate, append: false },
+        Permissions::all_permissive(), None,
+    ), FileSystemError::AlreadyExists, "exclusive rejects dangling final link");
+    expect_err(vfs.resolve(target, None, false),
+        FileSystemError::NotFound, "rejected opens leave target absent");
+
+    let created = expect_ok(vfs.open_or_create_with_options(
+        link, AccessMode::ReadWrite, CreateMode::IfMissing,
+        OpenOptions { contents_mode: OpenContentsMode::Truncate, append: false },
+        Permissions::all_permissive(), None,
+    ), "create the missing final target");
+    let target_inode = expect_ok(vfs.resolve(target, None, false),
+        "resolve target of creation");
+    assert!(Arc::ptr_eq(&created.file.inode, &target_inode));
+    assert_eq!(target_inode.stat().size, 0);
+    assert_eq!(expect_ok(vfs.write(&created, b"keep"), "seed final target"), 4);
+
+    expect_err(vfs.open_or_create_with_options(
+        target, AccessMode::ReadWrite, CreateMode::Exclusive,
+        OpenOptions { contents_mode: OpenContentsMode::Truncate, append: false },
+        Permissions::all_permissive(), None,
+    ), FileSystemError::AlreadyExists, "exclusive preserves occupied file");
+    let mut contents = [0; 4];
+    expect_ok(vfs.seek(&created, 0), "rewind existing target");
+    assert_eq!(expect_ok(vfs.read(&created, &mut contents),
+        "read data after exclusive rejection"), 4);
+    assert_eq!(&contents, b"keep");
+
+    let reopened = expect_ok(vfs.open_or_create_with_options(
+        link, AccessMode::WriteOnly, CreateMode::IfMissing,
+        OpenOptions { contents_mode: OpenContentsMode::Truncate, append: false },
+        Permissions::all_permissive(), None,
+    ), "truncate existing final target");
+    assert!(Arc::ptr_eq(&reopened.file.inode, &target_inode));
+    assert_eq!(target_inode.stat().size, 0);
+    expect_ok(vfs.seek(&created, 0), "rewind after truncating final target");
+    assert_eq!(expect_ok(vfs.read(&created, &mut contents),
+        "existing handle reads EOF"), 0);
+
+    expect_ok(vfs.close(&reopened), "close truncated target");
+    expect_ok(vfs.close(&created), "close created target");
+    sprintln!("[VFS TEST] truncate at open, creation ... PASS");
+}
+
+/// Checks existing inode protection and protection requested by the same open.
+///
+/// # Panics
+///
+/// Panics if a name-protected inode can be truncated, ancestor-only
+/// protection blocks truncation, or an open conflicts with its own tokens.
+fn test_open_truncate_protection() {
+    sprintln!("[VFS TEST] truncate at open, protection ...");
+    let mut vfs = new_stub_vfs();
+    let path = "/etc/truncate-protected";
+    let alias = "/var/truncate-protected-alias";
+    let original = expect_ok(vfs.open_or_create(
+        path, AccessMode::ReadWrite, CreateMode::Exclusive,
+        Permissions::all_permissive(), None,
+    ), "create protected truncation target");
+    assert_eq!(expect_ok(vfs.write(&original, b"keep"), "seed protected file"), 4);
+    expect_ok(vfs.create_hard_link(path, alias, None, false), "link protected file");
+    let before = original.file.inode.stat();
+
+    for protection in [
+        NamespaceProtection::PROTECT_NAMES,
+        NamespaceProtection::PROTECT_FULL,
+    ] {
+        let guard = expect_ok(vfs.open_with_options(
+            path, AccessMode::ReadOnly,
+            OpenOptions { contents_mode: OpenContentsMode::Preserve, append: false },
+            None, protection,
+        ), "protect original name and aliases");
+        expect_err(vfs.open_with_options(
+            path, AccessMode::ReadWrite,
+            OpenOptions { contents_mode: OpenContentsMode::Truncate, append: false },
+            None, NamespaceProtection::NONE,
+        ), FileSystemError::ResourceBusy, "reject truncation of protected file");
+        expect_err(vfs.open_or_create_with_options(
+            alias, AccessMode::ReadWrite, CreateMode::IfMissing,
+            OpenOptions { contents_mode: OpenContentsMode::Truncate, append: false },
+            Permissions::all_permissive(), None,
+        ), FileSystemError::ResourceBusy, "reject truncation through hard link");
+        assert_eq!(original.file.inode.stat(), before);
+        expect_ok(vfs.close(&guard), "release existing name protection");
+    }
+    let mut contents = [0; 4];
+    expect_ok(vfs.seek(&original, 0), "rewind after rejected truncations");
+    assert_eq!(expect_ok(vfs.read(&original, &mut contents),
+        "read data after rejected truncations"), 4);
+    assert_eq!(&contents, b"keep");
+
+    let ancestors = expect_ok(vfs.open_with_options(
+        path, AccessMode::ReadOnly,
+        OpenOptions { contents_mode: OpenContentsMode::Preserve, append: false },
+        None, NamespaceProtection::PROTECT_ANCESTORS,
+    ), "protect ancestors only");
+    let truncated = expect_ok(vfs.open_with_options(
+        path, AccessMode::ReadWrite,
+        OpenOptions { contents_mode: OpenContentsMode::Truncate, append: false },
+        None, NamespaceProtection::PROTECT_FULL,
+    ), "truncate with ancestor-only guard and acquire full protection");
+    assert_eq!(original.file.inode.stat().size, 0);
+    expect_err(vfs.open_with_options(
+        alias, AccessMode::WriteOnly,
+        OpenOptions { contents_mode: OpenContentsMode::Truncate, append: false },
+        None, NamespaceProtection::NONE,
+    ), FileSystemError::ResourceBusy, "truncating open holds name protection");
+    expect_ok(vfs.close(&truncated), "release full protection");
+    expect_ok(vfs.close(&ancestors), "release ancestor-only protection");
+    expect_ok(vfs.close(&original), "close original");
+    sprintln!("[VFS TEST] truncate at open, protection ... PASS");
+}
+
+/// Checks pre-commit truncation failures and a subsequent successful retry.
+///
+/// # Panics
+///
+/// Panics if a rejected truncating open changes data or metadata, leaks
+/// namespace protection or an open registration, or cannot be retried.
+fn test_open_truncate_failure() {
+    sprintln!("[VFS TEST] truncate at open, failures ...");
+    let mut vfs = new_stub_vfs();
+    let path = "/etc/truncate-failure";
+    let absent = "/etc/truncate-read-only-missing";
+    let original = expect_ok(vfs.open_or_create(
+        path, AccessMode::ReadWrite, CreateMode::Exclusive,
+        Permissions::all_permissive(), None,
+    ), "create failure target");
+    assert_eq!(expect_ok(vfs.write(&original, b"keep"), "seed failure target"), 4);
+    let inode = &original.file.inode;
+    let before = inode.stat();
+
+    super::fail_next_resize_for(inode);
+    expect_err(vfs.open_with_options(
+        path, AccessMode::ReadOnly,
+        OpenOptions { contents_mode: OpenContentsMode::Truncate, append: false },
+        None, NamespaceProtection::NONE,
+    ), FileSystemError::InvalidAccessMode, "read-only truncation rejected");
+    expect_err(vfs.open_or_create_with_options(
+        absent, AccessMode::ReadOnly, CreateMode::IfMissing,
+        OpenOptions { contents_mode: OpenContentsMode::Truncate, append: false },
+        Permissions::all_permissive(), None,
+    ), FileSystemError::InvalidAccessMode, "read-only truncation cannot create");
+    expect_err(vfs.resolve(absent, None, false),
+        FileSystemError::NotFound, "read-only rejection leaves name absent");
+    expect_err(vfs.open_with_options(
+        "/etc", AccessMode::ReadWrite,
+        OpenOptions { contents_mode: OpenContentsMode::Truncate, append: false },
+        None, NamespaceProtection::NONE,
+    ), FileSystemError::NotAFile, "directory truncation rejected");
+    expect_err(vfs.open_with_options(
+        path, AccessMode::ReadWrite,
+        OpenOptions { contents_mode: OpenContentsMode::Truncate, append: false },
+        None, NamespaceProtection::PROTECT_FULL,
+    ), FileSystemError::DiskWriteError, "injected driver truncate failure");
+
+    assert_eq!(inode.stat(), before);
+    assert_eq!(expect_ok(inode.filesystem.load_inode(inode.inode_number),
+        "load backing inode after failure").stat().size, before.size);
+    let mut contents = [0; 4];
+    expect_ok(vfs.seek(&original, 0), "rewind after failed truncate");
+    assert_eq!(expect_ok(vfs.read(&original, &mut contents),
+        "read original data after failure"), 4);
+    assert_eq!(&contents, b"keep");
+
+    // Moving the parent and unlinking the name require both temporary
+    // protection contributions from the failed open to have been released.
+    expect_ok(vfs.rename("/etc", "/etc-after-truncate-failure", None),
+        "rename parent after failed open");
+    let moved = "/etc-after-truncate-failure/truncate-failure";
+    let retry = expect_ok(vfs.open_with_options(
+        moved, AccessMode::ReadWrite,
+        OpenOptions { contents_mode: OpenContentsMode::Truncate, append: false },
+        None, NamespaceProtection::NONE,
+    ), "retry truncation");
+    assert!(Arc::ptr_eq(inode, &retry.file.inode));
+    assert_eq!(inode.stat().size, 0);
+    expect_ok(vfs.close(&retry), "close retry");
+    expect_ok(vfs.close(&original), "close original");
+    expect_ok(vfs.unlink(moved, None), "unlink after failed open and retry");
+    expect_err(inode.filesystem.load_inode(inode.inode_number),
+        FileSystemError::NotFound, "no leaked registration delays reclaim");
+    sprintln!("[VFS TEST] truncate at open, failures ... PASS");
+}
+
+/// Checks signed seek origins, shared handle offsets, and live file length.
+///
+/// # Panics
+///
+/// Panics if a seek returns the wrong position, modifies file metadata, or
+/// fails to observe truncation through another handle.
+fn test_seek_signed_positions() {
+    sprintln!("[VFS TEST] signed seek, positions ...");
+    let mut vfs = new_stub_vfs();
+    let path = "/etc/signed-seek";
+    let handle = expect_ok(vfs.open_or_create(
+        path, AccessMode::ReadWrite, CreateMode::Exclusive,
+        Permissions::all_permissive(), None,
+    ), "create signed-seek file");
+    assert_eq!(expect_ok(vfs.write(&handle, b"abcdef"), "seed file"), 6);
+    let clone = Arc::clone(&handle);
+    let other = expect_ok(vfs.open(path, AccessMode::ReadOnly, None),
+        "open same inode independently");
+
+    assert_eq!(expect_ok(vfs.seek_signed(&handle, 2, SeekOrigin::Start),
+        "seek from start"), 2);
+    assert_eq!(expect_ok(vfs.seek_signed(&clone, -1, SeekOrigin::Current),
+        "seek backwards using shared position"), 1);
+    let mut byte = [0];
+    assert_eq!(expect_ok(vfs.read(&handle, &mut byte),
+        "read at shared position"), 1);
+    assert_eq!(byte, [b'b']);
+    assert_eq!(expect_ok(vfs.seek_signed(&other, 0, SeekOrigin::Current),
+        "independent handle retains its position"), 0);
+
+    assert_eq!(expect_ok(vfs.seek_signed(&handle, -2, SeekOrigin::End),
+        "seek backwards from end"), 4);
+    assert_eq!(expect_ok(vfs.read(&handle, &mut byte), "read near EOF"), 1);
+    assert_eq!(byte, [b'e']);
+    let before = handle.file.inode.stat();
+    assert_eq!(expect_ok(vfs.seek_signed(&handle, 3, SeekOrigin::End),
+        "seek beyond EOF"), 9);
+    assert_eq!(handle.file.inode.stat(), before);
+    assert_eq!(expect_ok(vfs.read(&handle, &mut byte), "read beyond EOF"), 0);
+
+    let truncated = expect_ok(vfs.open_with_options(
+        path, AccessMode::WriteOnly,
+        OpenOptions { contents_mode: OpenContentsMode::Truncate, append: false },
+        None, NamespaceProtection::NONE,
+    ), "truncate via separate open");
+    assert_eq!(expect_ok(vfs.seek_signed(&handle, 0, SeekOrigin::Current),
+        "existing position survives truncation"), 9);
+    assert_eq!(expect_ok(vfs.seek_signed(&other, 0, SeekOrigin::End),
+        "seek from new EOF on an existing handle"), 0);
+
+    expect_ok(vfs.close(&truncated), "close truncating handle");
+    expect_ok(vfs.close(&other), "close independent handle");
+    expect_ok(vfs.close(&handle), "close shared handle");
+    sprintln!("[VFS TEST] signed seek, positions ... PASS");
+}
+
+/// Checks signed seek errors and the signed offset range.
+///
+/// # Panics
+///
+/// Panics if an invalid seek changes the offset, a valid boundary is
+/// rejected, or a closed handle can still seek.
+fn test_seek_signed_errors() {
+    sprintln!("[VFS TEST] signed seek, errors ...");
+    let mut vfs = new_stub_vfs();
+    let handle = expect_ok(vfs.open("/etc/config.txt", AccessMode::ReadOnly, None),
+        "open nonempty file for offset boundary checks");
+    expect_ok(vfs.seek_signed(&handle, 2, SeekOrigin::Start), "set initial offset");
+
+    expect_err(vfs.seek_signed(&handle, -1, SeekOrigin::Start),
+        FileSystemError::InvalidOffset, "reject negative absolute position");
+    expect_err(vfs.seek_signed(&handle, -3, SeekOrigin::Current),
+        FileSystemError::InvalidOffset, "reject relative position before start");
+    expect_err(vfs.seek_signed(&handle, i64::MIN, SeekOrigin::End),
+        FileSystemError::InvalidOffset, "reject position before start from EOF");
+    expect_err(vfs.seek_signed(&handle, i64::MAX, SeekOrigin::End),
+        FileSystemError::OffsetOverflow, "reject position above signed limit");
+    assert_eq!(expect_ok(vfs.seek_signed(&handle, 0, SeekOrigin::Current),
+        "errors preserve position"), 2);
+
+    assert_eq!(expect_ok(vfs.seek_signed(&handle, i64::MAX, SeekOrigin::Start),
+        "seek to largest signed position"), i64::MAX);
+    expect_err(vfs.seek_signed(&handle, 1, SeekOrigin::Current),
+        FileSystemError::OffsetOverflow, "reject overflow from largest position");
+    assert_eq!(expect_ok(vfs.seek_signed(&handle, 0, SeekOrigin::Current),
+        "overflow preserves largest position"), i64::MAX);
+
+    expect_ok(vfs.seek(&handle, u64::MAX), "set full-width unsigned position");
+    expect_err(vfs.seek_signed(&handle, i64::MAX, SeekOrigin::Current),
+        FileSystemError::OffsetOverflow, "reject sum above unsigned range");
+    assert_eq!(expect_ok(vfs.seek_signed(&handle, i64::MIN, SeekOrigin::Current),
+        "move from unsigned position back into signed range"), i64::MAX);
+
+    expect_ok(vfs.close(&handle), "close boundary handle");
+    expect_err(vfs.seek_signed(&handle, 0, SeekOrigin::Start),
+        FileSystemError::InvalidHandle, "reject seek on closed handle");
+    sprintln!("[VFS TEST] signed seek, errors ... PASS");
+}
+
+/// Checks append positioning through separate handles and a hard-link alias.
+///
+/// # Panics
+///
+/// Panics if append uses a saved offset, affects other opens' positions, or
+/// fails to use the new end of the file after truncation.
+fn test_append_writes() {
+    sprintln!("[VFS TEST] append, writes ...");
+    let mut vfs = new_stub_vfs();
+    let path = "/etc/append-file";
+    let alias = "/var/append-alias";
+    let append = OpenOptions {
+        contents_mode: OpenContentsMode::Preserve,
+        append: true,
+    };
+    let first = expect_ok(vfs.open_or_create_with_options(
+        path, AccessMode::ReadWrite, CreateMode::Exclusive,
+        append, Permissions::all_permissive(), None,
+    ), "create append file");
+    assert_eq!(expect_ok(vfs.write(&first, b"abc"), "write initial bytes"), 3);
+    expect_ok(vfs.create_hard_link(path, alias, None, false), "link append file");
+
+    let second = expect_ok(vfs.open_with_options(
+        alias, AccessMode::ReadWrite, append, None, NamespaceProtection::PROTECT_FULL,
+    ), "open alias for append with name protection");
+    assert_eq!(expect_ok(vfs.seek_signed(&second, 0, SeekOrigin::Current),
+        "append handle starts at zero"), 0);
+    expect_ok(vfs.seek(&first, 0), "rewind first append handle");
+    let clone = Arc::clone(&first);
+    assert_eq!(expect_ok(vfs.write(&clone, b"D"), "append after rewind"), 1);
+    assert_eq!(expect_ok(vfs.seek_signed(&first, 0, SeekOrigin::Current),
+        "clone updates the shared offset"), 4);
+
+    let mut byte = [0];
+    assert_eq!(expect_ok(vfs.read(&second, &mut byte),
+        "read uses the second handle's position"), 1);
+    assert_eq!(byte, [b'a']);
+    assert_eq!(expect_ok(vfs.write(&second, b"E"), "append through alias"), 1);
+    assert_eq!(expect_ok(vfs.seek_signed(&second, 0, SeekOrigin::Current),
+        "second append handle advances from the new EOF"), 5);
+    assert_eq!(expect_ok(vfs.seek_signed(&first, 0, SeekOrigin::Current),
+        "separate opens retain independent offsets"), 4);
+
+    let positional = expect_ok(vfs.open(path, AccessMode::ReadWrite, None),
+        "ordinary open of append file");
+    assert_eq!(expect_ok(vfs.write(&positional, b"Z"), "overwrite byte zero"), 1);
+    expect_ok(vfs.seek(&positional, 0), "rewind for contents check");
+    let mut contents = [0; 6];
+    assert_eq!(expect_ok(vfs.read(&positional, &mut contents),
+        "read both appends and positional write"), 5);
+    assert_eq!(&contents[..5], b"ZbcDE");
+
+    expect_ok(vfs.close(&second), "release name protection");
+    let truncated = expect_ok(vfs.open_with_options(
+        path, AccessMode::WriteOnly,
+        OpenOptions { contents_mode: OpenContentsMode::Truncate, append: true },
+        None, NamespaceProtection::NONE,
+    ), "truncate and open for append");
+    assert_eq!(expect_ok(vfs.write(&first, b"N"), "append at the shortened EOF"), 1);
+    assert_eq!(expect_ok(vfs.write(&truncated, b"T"), "append from truncating open"), 1);
+    expect_ok(vfs.seek(&positional, 0), "rewind after truncation");
+    assert_eq!(expect_ok(vfs.read(&positional, &mut contents),
+        "read appended bytes after truncation"), 2);
+    assert_eq!(&contents[..2], b"NT");
+
+    expect_ok(vfs.close(&truncated), "close truncating append handle");
+    expect_ok(vfs.close(&positional), "close positional handle");
+    expect_ok(vfs.close(&first), "close first append handle");
+    sprintln!("[VFS TEST] append, writes ... PASS");
+}
+
+/// Checks that an empty append or failed driver write preserves state.
+///
+/// # Panics
+///
+/// Panics if either operation changes the position, data, or metadata, or
+/// if retrying the failed append writes at the wrong offset.
+fn test_append_write_failure() {
+    sprintln!("[VFS TEST] append, write failure ...");
+    let mut vfs = new_stub_vfs();
+    let path = "/etc/append-retry";
+    let handle = expect_ok(vfs.open_or_create_with_options(
+        path, AccessMode::ReadWrite, CreateMode::Exclusive,
+        OpenOptions { contents_mode: OpenContentsMode::Preserve, append: true },
+        Permissions::all_permissive(), None,
+    ), "create append failure target");
+    assert_eq!(expect_ok(vfs.write(&handle, b"keep"), "seed failure target"), 4);
+    expect_ok(vfs.seek(&handle, 1), "seek before failed append");
+    let inode = &handle.file.inode;
+    let before = inode.stat();
+    super::fail_next_write_for(inode);
+
+    assert_eq!(expect_ok(vfs.write(&handle, b""), "empty append"), 0);
+    assert_eq!(expect_ok(vfs.seek_signed(&handle, 0, SeekOrigin::Current),
+        "empty append preserves position"), 1);
+    assert_eq!(inode.stat(), before);
+    expect_err(vfs.write(&handle, b"x"), FileSystemError::DiskWriteError,
+        "injected write failure");
+    assert_eq!(expect_ok(vfs.seek_signed(&handle, 0, SeekOrigin::Current),
+        "failed append preserves position"), 1);
+    assert_eq!(inode.stat(), before);
+
+    assert_eq!(expect_ok(vfs.write(&handle, b"y"), "retry append"), 1);
+    assert_eq!(expect_ok(vfs.seek_signed(&handle, 0, SeekOrigin::Current),
+        "retry advances from EOF"), 5);
+    expect_ok(vfs.seek(&handle, 0), "rewind retried append");
+    let mut contents = [0; 6];
+    assert_eq!(expect_ok(vfs.read(&handle, &mut contents), "read retried append"), 5);
+    assert_eq!(&contents[..5], b"keepy");
+
+    expect_ok(vfs.close(&handle), "close append failure target");
+    sprintln!("[VFS TEST] append, write failure ... PASS");
+}
+
+/// Verifies that `readlink` returns stored targets and preserves path errors.
+///
+/// The fixture's `/lib` link points to `/etc`. Reading through that alias
+/// exercises parent traversal, and a self-link exercises the final-component
+/// rule and the traversal limit when used as a parent.
+///
+/// # Panics
+///
+/// Panics if fixture setup fails or a target, path error, or metadata update
+/// differs from the expected result.
+fn test_readlink() {
+    sprintln!("[VFS TEST] readlink ...");
+    let mut vfs = new_stub_vfs();
+
+    let link = expect_ok(
+        vfs.create_symlink("/etc/dangling", "../var//missing", None),
+        "create relative dangling symlink",
+    );
+    // Seed a distinct access time so the check does not depend on clock ticks.
+    link.metadata.lock().timestamps.accessed = u64::MAX;
+    let before = link.stat();
+    assert!(!link.is_dirty());
+
+    assert_eq!(
+        expect_ok(vfs.readlink("/lib/dangling", None), "read through parent link"),
+        "../var//missing",
+    );
+    let after = link.stat();
+    assert_ne!(after.timestamps.accessed, before.timestamps.accessed);
+    assert_eq!(after.timestamps.modified, before.timestamps.modified);
+    assert!(link.is_dirty());
+
+    assert_eq!(
+        expect_ok(vfs.readlink("/lib", None), "read absolute target"),
+        "/etc",
+    );
+
+    expect_ok(
+        vfs.create_symlink("/etc/loop", "loop", None),
+        "create self-link",
+    );
+    assert_eq!(
+        expect_ok(vfs.readlink("/etc/loop", None), "read self-link"),
+        "loop",
+    );
+    expect_err(
+        vfs.readlink("/etc/loop/child", None),
+        FileSystemError::TooManySymlinks,
+        "self-link in parent path",
+    );
+
+    expect_err(
+        vfs.readlink("/etc/config.txt", None),
+        FileSystemError::NotASymlink,
+        "readlink on regular file",
+    );
+    expect_err(
+        vfs.readlink("/lib/", None),
+        FileSystemError::NotASymlink,
+        "trailing slash on link to directory",
+    );
+
+    expect_ok(
+        vfs.create_symlink("/etc/file-link", "config.txt", None),
+        "create link to regular file",
+    );
+    expect_err(
+        vfs.readlink("/etc/file-link/", None),
+        FileSystemError::NotADirectory,
+        "trailing slash on link to regular file",
+    );
+
+    sprintln!("[VFS TEST] readlink ... PASS");
+}
+
+/// Verifies that handle metadata follows the open inode across replacement.
+///
+/// A write-only handle retains the displaced inode after the destination
+/// name moves to the incoming inode. The handle continues to report the
+/// displaced inode's size and current link count. A successful close
+/// invalidates the retained handle clone.
+///
+/// # Panics
+///
+/// Panics if setup fails or metadata, file position, or handle validity
+/// differs from the expected result.
+fn test_inode_metadata_by_handle() {
+    sprintln!("[VFS TEST] inode metadata by handle ...");
+    let mut vfs = new_stub_vfs();
+    let old = replacement_file(&mut vfs, "/etc/old", b"old");
+    let incoming = replacement_file(&mut vfs, "/etc/incoming", b"replacement");
+    let handle = expect_ok(
+        vfs.open("/etc/old", AccessMode::WriteOnly, None),
+        "open write-only destination",
+    );
+    let retained = Arc::clone(&handle);
+    expect_ok(vfs.seek(&handle, 2), "set destination handle position");
+
+    let before = expect_ok(
+        vfs.inode_metadata_by_handle(&handle),
+        "get write-only handle metadata",
+    );
+    assert_eq!(before.inode_number, old.inode_number);
+    assert_eq!(before.size, 3);
+    assert_eq!(before.link_count, 1);
+
+    expect_ok(
+        vfs.rename("/etc/incoming", "/etc/old", None),
+        "replace open destination",
+    );
+
+    let displaced = expect_ok(
+        vfs.inode_metadata_by_handle(&handle),
+        "get displaced handle metadata",
+    );
+    assert_eq!(displaced.inode_number, before.inode_number);
+    assert_eq!(displaced.size, before.size);
+    assert_eq!(displaced.link_count, 0);
+
+    let replacement = expect_ok(vfs.inode_metadata_by_path("/etc/old", None, true), "get replacement metadata");
+    assert_eq!(replacement.inode_number, incoming.inode_number);
+    assert_eq!(replacement.size, 11);
+    assert_eq!(replacement.link_count, 1);
+
+    assert_eq!(
+        expect_ok(
+            vfs.seek_signed(&handle, 0, SeekOrigin::Current),
+            "get destination handle position",
+        ),
+        2,
+    );
+
+    expect_ok(vfs.close(&handle), "close displaced handle");
+    expect_err(
+        vfs.inode_metadata_by_handle(&retained),
+        FileSystemError::InvalidHandle,
+        "get metadata through retained clone after close",
+    );
+
+    sprintln!("[VFS TEST] inode metadata by handle ... PASS");
+}
+
+/// Verifies directory listings across rename, mount, and removal.
+///
+/// A final symlink selects the directory to list, and a dangling child
+/// symlink appears with its own identity. Saved entries remain readable
+/// after namespace changes, while each new listing reads the current state.
+///
+/// # Panics
+///
+/// Panics if fixture setup fails or the entries, access time, or path errors
+/// differ from the listing contract.
+fn test_list_directory() {
+    sprintln!("[VFS TEST] directory listing ...");
+    let mut vfs = new_stub_vfs();
+    let path = "/etc/listing";
+    let dir = expect_ok(
+        vfs.create_directory(path, Permissions::all_permissive(), None),
+        "create listing directory",
+    );
+    let child = expect_ok(
+        vfs.create_symlink("/etc/listing/link", "/missing", None),
+        "create dangling child link",
+    );
+    expect_ok(
+        vfs.create_symlink("/listing-link", path, None),
+        "create link to listing directory",
+    );
+
+    // Seed access time so the assertion is independent of clock ticks.
+    dir.metadata.lock().timestamps.accessed = u64::MAX;
+    let snapshot = expect_ok(vfs.list_directory("/listing-link", None), "list through symlink");
+    assert_eq!(snapshot.len(), 1);
+    assert_eq!(snapshot[0].name, "link");
+    assert_eq!(snapshot[0].inode_number, child.inode_number);
+    assert_eq!(snapshot[0].entry_type, DirectoryEntryType::Symlink);
+    assert_ne!(dir.stat().timestamps.accessed, u64::MAX);
+    assert!(dir.is_dirty());
+
+    expect_ok(
+        vfs.rename("/etc/listing/link", "/etc/listing/renamed", None),
+        "rename listed child",
+    );
+    let fresh = expect_ok(vfs.list_directory(path, None), "list after rename");
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(fresh[0].name, "renamed");
+    assert_eq!(snapshot[0].name, "link");
+    expect_ok(vfs.unlink("/etc/listing/renamed", None), "unlink listed child");
+
+    let budget = crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH;
+    let retained = expect_ok(
+        vfs.resolve_dir_with_budget(path, None, budget),
+        "retain host directory",
+    );
+    expect_ok(
+        vfs.mount("stubfs", Arc::new(StubBlockDevice), path, None),
+        "mount over listing directory",
+    );
+    let parent = expect_ok(vfs.list_directory("/etc", None), "list mount parent");
+    let host = parent.iter().find(|entry| entry.name == "listing")
+        .expect("mount host entry missing");
+    assert_eq!(host.inode_number, dir.inode_number);
+    assert_eq!(host.entry_type, DirectoryEntryType::Directory);
+
+    let mounted = expect_ok(
+        vfs.list_directory(".", Some(Arc::clone(&retained))),
+        "list mounted root relative to retained host",
+    );
+    expect_ok(vfs.unmount(path, None), "unmount while listing is retained");
+    assert!(mounted.iter().any(|entry| entry.name == "etc"));
+    let uncovered = expect_ok(vfs.list_directory(path, None), "list uncovered host");
+    assert!(uncovered.is_empty());
+
+    expect_ok(vfs.remove_directory(path, None), "remove retained host");
+    expect_err(
+        vfs.list_directory(".", Some(retained)),
+        FileSystemError::NotFound,
+        "list detached working directory",
+    );
+    expect_err(
+        vfs.list_directory("/etc/config.txt", None),
+        FileSystemError::NotADirectory,
+        "list regular file",
+    );
+
+    sprintln!("[VFS TEST] directory listing ... PASS");
+}
+
+/// Checks the shared name comparison and case-only rename contract.
+///
+/// A failed spelling change preserves the published name. Distinct hard links
+/// continue to name the same inode and keep their individual spellings.
+///
+/// # Panics
+///
+/// Panics if lookup, mutation, or listing violates the filename contract.
+fn test_filename_case() {
+    sprintln!("[VFS TEST] filename case ...");
+    let mut vfs = new_stub_vfs();
+    let file = expect_ok(vfs.create_file("/etc/README", Permissions::all_permissive(), None),
+        "create uppercase entry");
+
+    let opened = expect_ok(vfs.open_or_create(
+        "/ETC/readme", AccessMode::ReadOnly, CreateMode::IfMissing,
+        Permissions::all_permissive(), None,
+    ), "open by alternate spelling");
+    assert!(Arc::ptr_eq(&file, &opened.file.inode));
+    expect_err(vfs.open_or_create(
+        "/etc/reADme", AccessMode::ReadWrite, CreateMode::Exclusive,
+        Permissions::all_permissive(), None,
+    ), FileSystemError::AlreadyExists, "reject alternate spelling on create");
+    expect_err(vfs.create_directory("/etc/ReadMe", Permissions::all_permissive(), None),
+        FileSystemError::AlreadyExists, "case collision across entry types");
+    expect_err(vfs.create_hard_link("/etc/README", "/etc/ReadMe", None, false),
+        FileSystemError::AlreadyExists, "case collision for hard link");
+
+    expect_ok(vfs.create_hard_link("/etc/rEaDmE", "/etc/Manual", None, false),
+        "create a separate hard link");
+    expect_ok(vfs.rename("/etc/rEaDmE", "/etc/MANUAL", None),
+        "rename between distinct hard links is a no-op");
+
+    super::fail_next_rename_for(file.filesystem.instance_id());
+    expect_err(vfs.rename("/etc/rEaDmE", "/ETC/readme", None),
+        FileSystemError::DiskWriteError, "case-only rename reaches the driver");
+    let listing = expect_ok(vfs.list_directory("/etc", None), "list after failure");
+    assert!(listing.iter().any(|entry| entry.name == "README"));
+
+    expect_ok(vfs.rename("/etc/rEaDmE", "/ETC/readme", None),
+        "change the stored spelling");
+    let listing = expect_ok(vfs.list_directory("/ETC", None), "list after rename");
+    assert!(listing.iter().any(|entry| entry.name == "readme"));
+    assert!(!listing.iter().any(|entry| entry.name == "README"));
+    assert!(listing.iter().any(|entry| entry.name == "Manual"));
+    let resolved = expect_ok(vfs.resolve("/ETC/ReadMe", None, false),
+        "resolve new spelling case-insensitively");
+    assert!(Arc::ptr_eq(&file, &resolved));
+    assert_eq!(file.metadata.lock().link_count, 2);
+    let backing = expect_ok(file.filesystem.load_inode(file.inode_number),
+        "read backing link count");
+    assert_eq!(backing.metadata.lock().link_count, 2);
+
+    expect_ok(vfs.unlink("/etc/README", None), "unlink using alternate spelling");
+    expect_err(vfs.resolve("/etc/readme", None, false),
+        FileSystemError::NotFound, "case-only entry is gone");
+    expect_ok(vfs.close(&opened), "close handle opened before rename");
+
+    let displaced = expect_ok(vfs.create_file("/etc/Alternate", Permissions::all_permissive(), None),
+        "create a distinct destination inode");
+    expect_ok(vfs.rename("/etc/MANUAL", "/etc/alternate", None),
+        "replace a different entry found under alternate spelling");
+    let resolved = expect_ok(vfs.resolve("/etc/ALTERNATE", None, false),
+        "resolve replacement");
+    assert!(Arc::ptr_eq(&file, &resolved));
+    assert_eq!(displaced.metadata.lock().link_count, 0);
+
+    expect_ok(vfs.rename("/ETC", "/Etc", None),
+        "case-only rename of a nonempty directory");
+    let root = expect_ok(vfs.list_directory("/", None), "list root");
+    assert!(root.iter().any(|entry| entry.name == "Etc"));
+    sprintln!("[VFS TEST] filename case ... PASS");
+}
+
+/// Checks literal punctuation, reserved names, and exact byte boundaries.
+///
+/// Repeated separators make it possible to reach the pathname limit without
+/// creating a deep directory tree. Symlink traversal also checks the expanded
+/// path length once the target and remaining components are combined.
+///
+/// # Panics
+///
+/// Panics if valid names fail or invalid names and lengths are accepted.
+fn test_filename_limits() {
+    sprintln!("[VFS TEST] filename limits ...");
+    let mut vfs = new_stub_vfs();
+
+    let literal = "/etc/A\\b\". ";
+    let file = expect_ok(vfs.create_file(literal, Permissions::all_permissive(), None),
+        "create name with literal backslash, quote, and trailing space");
+    let resolved = expect_ok(vfs.resolve("/ETC/a\\B\". ", None, false),
+        "resolve name with literal punctuation");
+    assert!(Arc::ptr_eq(&file, &resolved));
+
+    let utf8_file = expect_ok(
+        vfs.create_file("/etc/caf\u{e9}.txt", Permissions::all_permissive(), None),
+        "create a UTF-8 name",
+    );
+    let resolved = expect_ok(vfs.resolve("/ETC/CAF\u{e9}.TXT", None, false),
+        "resolve UTF-8 name with folding of ASCII letters");
+    assert!(Arc::ptr_eq(&utf8_file, &resolved));
+    expect_err(vfs.resolve("/etc/CAF\u{c9}.TXT", None, false),
+        FileSystemError::NotFound, "non-ASCII case variants match literally");
+
+    for path in ["/etc/.", "/etc/..", "/etc/a\0b", "/etc/a\nb", "/etc/a\x7fb"] {
+        expect_err(vfs.create_file(path, Permissions::all_permissive(), None),
+            FileSystemError::InvalidPath, "reject reserved or control name");
+    }
+
+    let component = format!("/etc/{}", "x".repeat(255));
+    expect_ok(vfs.create_file(&component, Permissions::all_permissive(), None),
+        "accept a 255-byte name");
+    let oversized_component = format!("{}x", component);
+    expect_err(vfs.create_file(&oversized_component, Permissions::all_permissive(), None),
+        FileSystemError::InvalidPath, "reject a 256-byte name");
+
+    let path = format!("{}x", "/".repeat(1023));
+    expect_ok(vfs.create_file(&path, Permissions::all_permissive(), None),
+        "accept a 1024-byte pathname");
+    expect_ok(vfs.resolve(&path, None, false), "resolve at the pathname limit");
+    let oversized_path = format!("/{}", path);
+    expect_err(vfs.create_file(&oversized_path, Permissions::all_permissive(), None),
+        FileSystemError::InvalidPath, "reject a 1025-byte creation pathname");
+    expect_err(vfs.resolve(&oversized_path, None, false),
+        FileSystemError::InvalidPath, "reject a 1025-byte lookup pathname");
+
+    let target = format!("{}etc", "/".repeat(1020));
+    expect_ok(vfs.create_symlink("/long-target", &target, None),
+        "create a link whose target fits the limit");
+    expect_ok(vfs.list_directory("/long-target", None), "follow the target");
+    expect_err(vfs.resolve("/long-target/config.txt", None, true),
+        FileSystemError::InvalidPath, "reject path exceeding limit after expansion");
+    sprintln!("[VFS TEST] filename limits ... PASS");
+}
+
+/// Starts capture of sync boundaries for one filesystem instance.
+///
+/// # Arguments
+///
+/// * `instance_id` - Instance selected by the next sync test operation.
+fn capture_sync_events(instance_id: u64) {
+    *super::SYNC_EVENTS.lock() = Some((instance_id, alloc::vec::Vec::new()));
+}
+
+/// Ends capture and returns the recorded driver boundaries.
+///
+/// # Returns
+///
+/// Returns the events for the selected instance in driver-call order.
+///
+/// # Panics
+///
+/// Panics if a test ends capture without starting it.
+fn take_sync_events() -> alloc::vec::Vec<super::SyncEvent> {
+    super::SYNC_EVENTS.lock().take().expect("sync capture is active").1
+}
+
+/// Checks root, mounted, symlink, and relative-path volume selection.
+///
+/// Root sync must leave a separately mounted instance's metadata dirty. A
+/// flush must run even when the selected instance has no dirty VFS inodes.
+///
+/// # Panics
+///
+/// Panics if selection or flush behavior violates the volume sync contract.
+fn test_volume_sync_selection() {
+    use super::SyncEvent;
+    sprintln!("[VFS TEST] volume sync selection ...");
+    let mut vfs = new_stub_vfs();
+    let root = expect_ok(vfs.resolve("/", None, true), "root identity");
+    expect_ok(vfs.mount("stubfs", Arc::new(StubBlockDevice), "/var", None),
+        "mount second volume");
+    let mounted = expect_ok(vfs.resolve("/var", None, true), "mounted identity");
+    let opened = expect_ok(vfs.open("/etc/config.txt", AccessMode::ReadWrite, None),
+        "open root file during sync");
+    expect_ok(vfs.write(&opened, b"sync"), "dirty root file");
+    mounted.metadata.lock().dirty = true;
+    capture_sync_events(root.filesystem.instance_id());
+    expect_ok(vfs.sync_volume("/", None), "sync root with an open file");
+    let events = take_sync_events();
+    assert!(events.contains(&SyncEvent::Inode(opened.file.inode.inode_number)));
+    assert_eq!(events.last(), Some(&SyncEvent::Flush));
+    assert!(!opened.file.inode.is_dirty());
+    assert!(mounted.is_dirty());
+
+    capture_sync_events(root.filesystem.instance_id());
+    expect_ok(vfs.sync_volume("/etc/config.txt", None), "sync by file path");
+    assert_eq!(take_sync_events(), alloc::vec![SyncEvent::Flush]);
+
+    expect_ok(vfs.create_symlink("/selected-volume", "/var", None),
+        "link to mounted root");
+    capture_sync_events(mounted.filesystem.instance_id());
+    expect_ok(vfs.sync_volume("/selected-volume", None), "follow selection symlink");
+    assert_eq!(take_sync_events(),
+        alloc::vec![SyncEvent::Inode(mounted.inode_number), SyncEvent::Flush]);
+    assert!(!mounted.is_dirty());
+
+    let working = expect_ok(vfs.resolve_dir_with_budget(
+        "/var", None,
+        crate::file_system::virtual_fs::resolver::MAX_SYMLINK_DEPTH,
+    ), "mounted working directory");
+    capture_sync_events(mounted.filesystem.instance_id());
+    expect_ok(vfs.sync_volume("etc/config.txt", Some(working)),
+        "select relative to a working directory");
+    assert_eq!(take_sync_events(), alloc::vec![SyncEvent::Flush]);
+
+    capture_sync_events(root.filesystem.instance_id());
+    expect_err(vfs.sync_volume("/missing", None), FileSystemError::NotFound,
+        "missing path cannot select a volume");
+    assert!(take_sync_events().is_empty());
+    expect_ok(vfs.close(&opened), "close root file");
+    sprintln!("[VFS TEST] volume sync selection ... PASS");
+}
+
+/// Checks dirty flag ownership across metadata and flush failures.
+///
+/// A failed inode handoff stays dirty and prevents the flush phase. A failed
+/// flush can leave VFS metadata clean, and retry must still call the driver.
+///
+/// # Panics
+///
+/// Panics if a failed sync loses retry work or a retry skips volume flush.
+fn test_volume_sync_retry() {
+    use super::SyncEvent;
+    sprintln!("[VFS TEST] volume sync retry ...");
+    let mut vfs = new_stub_vfs();
+    let root = expect_ok(vfs.resolve("/", None, true), "root identity");
+    let instance_id = root.filesystem.instance_id();
+    expect_ok(vfs.sync_volume("/", None), "baseline sync");
+    root.metadata.lock().dirty = true;
+    *super::FAIL_SYNC_INODE_ONCE_FOR.lock() = Some((instance_id, root.inode_number));
+    capture_sync_events(instance_id);
+    expect_err(vfs.sync_volume("/", None), FileSystemError::DiskWriteError,
+        "failed inode handoff");
+    assert_eq!(take_sync_events(), alloc::vec![SyncEvent::Inode(root.inode_number)]);
+    assert!(root.is_dirty());
+
+    capture_sync_events(instance_id);
+    expect_ok(vfs.sync_volume("/", None), "retry inode handoff");
+    assert_eq!(take_sync_events(),
+        alloc::vec![SyncEvent::Inode(root.inode_number), SyncEvent::Flush]);
+    assert!(!root.is_dirty());
+
+    root.metadata.lock().dirty = true;
+    *super::FAIL_SYNC_VOLUME_ONCE_FOR.lock() = Some(instance_id);
+    capture_sync_events(instance_id);
+    expect_err(vfs.sync_volume("/", None), FileSystemError::DiskWriteError,
+        "failed volume flush after accepted metadata");
+    assert_eq!(take_sync_events(),
+        alloc::vec![SyncEvent::Inode(root.inode_number), SyncEvent::Flush]);
+    assert!(!root.is_dirty());
+
+    capture_sync_events(instance_id);
+    expect_ok(vfs.sync_volume("/", None), "retry flush with clean inode flags");
+    assert_eq!(take_sync_events(), alloc::vec![SyncEvent::Flush]);
+    let file = expect_ok(vfs.resolve("/etc/config.txt", None, true),
+        "second inode for partial progress");
+    root.metadata.lock().dirty = true;
+    file.metadata.lock().dirty = true;
+    capture_sync_events(instance_id);
+    expect_ok(vfs.sync_volume("/", None), "observe inode pass order");
+    let order = take_sync_events();
+    assert_eq!(order.len(), 3);
+    let last_inode = match &order[1] {
+        SyncEvent::Inode(number) => *number,
+        _ => panic!("second sync event must hand off inode metadata"),
+    };
+
+    root.metadata.lock().dirty = true;
+    file.metadata.lock().dirty = true;
+    *super::FAIL_SYNC_INODE_ONCE_FOR.lock() = Some((instance_id, last_inode));
+    capture_sync_events(instance_id);
+    expect_err(vfs.sync_volume("/", None), FileSystemError::DiskWriteError,
+        "fail after another inode was accepted");
+    assert_eq!(take_sync_events().as_slice(), &order[..2]);
+    assert_eq!(root.is_dirty(), root.inode_number == last_inode);
+    assert_eq!(file.is_dirty(), file.inode_number == last_inode);
+
+    capture_sync_events(instance_id);
+    expect_ok(vfs.sync_volume("/", None), "retry only outstanding metadata");
+    assert_eq!(take_sync_events(),
+        alloc::vec![SyncEvent::Inode(last_inode), SyncEvent::Flush]);
+    sprintln!("[VFS TEST] volume sync retry ... PASS");
+}
+
+/// Checks that unmount completes sync before teardown and preserves retry state.
+///
+/// Each failed phase must preserve the mounted namespace. Repeated attempts
+/// finish pending flush work before making the underlying host visible.
+///
+/// # Panics
+///
+/// Panics if teardown runs before successful sync or an error detaches the mount.
+fn test_volume_sync_unmount() {
+    use super::SyncEvent;
+    sprintln!("[VFS TEST] volume sync unmount ...");
+    let mut vfs = new_stub_vfs();
+    expect_ok(vfs.mount("stubfs", Arc::new(StubBlockDevice), "/var", None),
+        "mount sync fixture");
+    let mounted = expect_ok(vfs.resolve("/var", None, true), "mounted identity");
+    let instance_id = mounted.filesystem.instance_id();
+    expect_ok(vfs.sync_volume("/var", None), "baseline mounted sync");
+    mounted.metadata.lock().dirty = true;
+    *super::FAIL_SYNC_INODE_ONCE_FOR.lock() = Some((instance_id, mounted.inode_number));
+    capture_sync_events(instance_id);
+    expect_err(vfs.unmount("/var", None), FileSystemError::DiskWriteError,
+        "inode error prevents teardown");
+    assert_eq!(take_sync_events(), alloc::vec![SyncEvent::Inode(mounted.inode_number)]);
+    assert!(mounted.is_dirty());
+
+    *super::FAIL_SYNC_VOLUME_ONCE_FOR.lock() = Some(instance_id);
+    capture_sync_events(instance_id);
+    expect_err(vfs.unmount("/var", None), FileSystemError::DiskWriteError,
+        "flush error prevents teardown");
+    assert_eq!(take_sync_events(),
+        alloc::vec![SyncEvent::Inode(mounted.inode_number), SyncEvent::Flush]);
+    assert!(!mounted.is_dirty());
+    let still_mounted = expect_ok(vfs.resolve("/var", None, true), "mount survives errors");
+    assert!(Arc::ptr_eq(&mounted, &still_mounted));
+
+    super::fail_next_unmount_for(instance_id);
+    capture_sync_events(instance_id);
+    expect_err(vfs.unmount("/var", None), FileSystemError::DiskWriteError,
+        "teardown error preserves mount");
+    assert_eq!(take_sync_events(), alloc::vec![SyncEvent::Flush, SyncEvent::Unmount]);
+    let still_mounted = expect_ok(vfs.resolve("/var", None, true), "mount survives teardown error");
+    assert!(Arc::ptr_eq(&mounted, &still_mounted));
+
+    capture_sync_events(instance_id);
+    expect_ok(vfs.unmount("/var", None), "retry unmount");
+    assert_eq!(take_sync_events(), alloc::vec![SyncEvent::Flush, SyncEvent::Unmount]);
+    let host = expect_ok(vfs.resolve("/var", None, true), "uncovered host");
+    assert_ne!(host.filesystem.instance_id(), instance_id);
+    sprintln!("[VFS TEST] volume sync unmount ... PASS");
+}
+
+/// Checks shrinking, zero-filled extension, and unchanged handle positions.
+///
+/// Re-extension must never expose bytes discarded by an earlier shrink. A
+/// write from an offset beyond the resized end also zeroes the intervening gap.
+///
+/// # Panics
+///
+/// Panics if resize changes handle positions or violates shared file contents.
+fn test_resize_contents() {
+    sprintln!("[VFS TEST] resize contents ...");
+    let mut vfs = new_stub_vfs();
+    let original = expect_ok(vfs.open_or_create(
+        "/etc/resizable", AccessMode::ReadWrite, CreateMode::Exclusive,
+        Permissions::all_permissive(), None,
+    ), "create resize fixture");
+    expect_ok(vfs.write(&original, b"abcdef"), "seed resize fixture");
+    let cloned = Arc::clone(&original);
+    expect_ok(vfs.create_hard_link("/etc/resizable", "/etc/resize-alias", None, false),
+        "create resize alias");
+    let alias = expect_ok(vfs.open("/etc/resize-alias", AccessMode::ReadWrite, None),
+        "independent alias handle");
+    expect_ok(vfs.seek(&original, 9), "set offset beyond the end");
+    expect_ok(vfs.seek(&alias, 2), "set independent alias offset");
+
+    expect_ok(vfs.resize(&original, 3), "shrink to three bytes");
+    assert_eq!(alias.file.inode.stat().size, 3);
+    assert_eq!(expect_ok(vfs.seek_signed(&cloned, 0, SeekOrigin::Current),
+        "shared offset after shrink"), 9);
+    assert_eq!(expect_ok(vfs.seek_signed(&alias, 0, SeekOrigin::Current),
+        "independent offset after shrink"), 2);
+    let mut eof = [0; 1];
+    assert_eq!(expect_ok(vfs.read(&original, &mut eof), "read beyond resized end"), 0);
+
+    expect_ok(vfs.resize(&alias, 8), "extend after shrinking");
+    expect_ok(vfs.seek(&alias, 0), "rewind alias");
+    let mut bytes = [0xff; 8];
+    assert_eq!(expect_ok(vfs.read(&alias, &mut bytes), "read extended contents"), 8);
+    assert_eq!(&bytes, b"abc\0\0\0\0\0");
+    assert_eq!(expect_ok(vfs.seek_signed(&original, 0, SeekOrigin::Current),
+        "original offset after extension"), 9);
+
+    {
+        let mut metadata = original.file.inode.metadata.lock();
+        metadata.timestamps.modified = u64::MAX;
+        metadata.dirty = false;
+    }
+    expect_ok(vfs.resize(&original, 8), "resize to unchanged length");
+    assert_ne!(original.file.inode.stat().timestamps.modified, u64::MAX);
+    assert!(original.file.inode.is_dirty());
+
+    expect_ok(vfs.resize(&original, 0), "resize to zero");
+    assert_eq!(alias.file.inode.stat().size, 0);
+    assert_eq!(expect_ok(vfs.seek_signed(&alias, 0, SeekOrigin::Current),
+        "alias offset after zero resize"), 8);
+    expect_ok(vfs.write(&original, b"Z"), "write from the retained past-end offset");
+    expect_ok(vfs.seek(&alias, 0), "rewind after past-end write");
+    let mut bytes = [0xff; 10];
+    assert_eq!(expect_ok(vfs.read(&alias, &mut bytes), "read zero-filled gap"), 10);
+    assert_eq!(&bytes, b"\0\0\0\0\0\0\0\0\0Z");
+    expect_ok(vfs.close(&alias), "close independent alias");
+    expect_ok(vfs.close(&original), "close shared original handle");
+    sprintln!("[VFS TEST] resize contents ... PASS");
+}
+
+/// Checks access modes, name protection, append mode, and unlinked lifetimes.
+///
+/// A writable protected handle and a separate writable alias can both resize,
+/// including to zero. Truncation at open keeps its name protection check.
+///
+/// # Panics
+///
+/// Panics if resize misapplies protection or rejects a live unlinked file.
+fn test_resize_access() {
+    sprintln!("[VFS TEST] resize access ...");
+    let mut vfs = new_stub_vfs();
+    expect_ok(vfs.create_file("/etc/resize-access", Permissions::all_permissive(), None),
+        "create access fixture");
+    expect_ok(vfs.create_hard_link(
+        "/etc/resize-access", "/etc/resize-access-alias", None, false,
+    ), "create access alias");
+    let owner = expect_ok(vfs.open_with_options(
+        "/etc/resize-access", AccessMode::ReadWrite,
+        OpenOptions { contents_mode: OpenContentsMode::Preserve, append: true },
+        None, NamespaceProtection::PROTECT_FULL,
+    ), "protected append handle");
+    expect_ok(vfs.write(&owner, b"keep"), "seed protected file");
+    let writer = expect_ok(vfs.open("/etc/resize-access-alias", AccessMode::WriteOnly, None),
+        "separate write-only alias");
+    let reader = expect_ok(vfs.open("/etc/resize-access", AccessMode::ReadOnly, None),
+        "read-only handle");
+
+    let before = owner.file.inode.stat();
+    expect_err(vfs.resize(&reader, 0), FileSystemError::InvalidAccessMode,
+        "read-only handle cannot resize");
+    assert_eq!(owner.file.inode.stat(), before);
+    expect_ok(vfs.seek(&owner, 17), "append handle offset before resize");
+    expect_ok(vfs.resize(&owner, 10), "protected owner extends file");
+    expect_ok(vfs.resize(&writer, 3), "protected alias shrinks file");
+    expect_ok(vfs.resize(&writer, 0), "protected alias clears file");
+    expect_ok(vfs.resize(&owner, 0), "protected owner clears file");
+    assert_eq!(expect_ok(vfs.seek_signed(&owner, 0, SeekOrigin::Current),
+        "resize ignores append mode and offset"), 17);
+    expect_err(vfs.open_with_options(
+        "/etc/resize-access-alias", AccessMode::ReadWrite,
+        OpenOptions { contents_mode: OpenContentsMode::Truncate, append: false },
+        None, NamespaceProtection::NONE,
+    ), FileSystemError::ResourceBusy, "truncation at open still checks protection");
+
+    expect_ok(vfs.close(&owner), "release name and ancestor protection");
+    expect_err(vfs.resize(&owner, 1), FileSystemError::InvalidHandle,
+        "closed handle cannot resize");
+    expect_ok(vfs.unlink("/etc/resize-access", None), "unlink original name");
+    expect_ok(vfs.unlink("/etc/resize-access-alias", None), "unlink final alias");
+    expect_ok(vfs.resize(&writer, 7), "resize live unlinked file");
+    assert_eq!(reader.file.inode.stat().size, 7);
+    let mut bytes = [0xff; 7];
+    assert_eq!(expect_ok(vfs.read(&reader, &mut bytes), "read unlinked extension"), 7);
+    assert_eq!(bytes, [0; 7]);
+    expect_ok(vfs.close(&reader), "close reader");
+    expect_ok(vfs.close(&writer), "close final writer");
+    expect_err(owner.file.inode.filesystem.load_inode(owner.file.inode.inode_number),
+        FileSystemError::NotFound, "final close reclaims resized unlinked file");
+    sprintln!("[VFS TEST] resize access ... PASS");
+}
+
+/// Checks resize failure atomicity and representable length rejection.
+///
+/// Every injected failure must preserve bytes, backing length, canonical
+/// metadata, and offsets. The same request then succeeds on retry.
+///
+/// # Panics
+///
+/// Panics if a rejected resize changes visible state or cannot be retried.
+fn test_resize_failures() {
+    sprintln!("[VFS TEST] resize failures ...");
+    for length in [2, 12, 4, 0] {
+        let mut vfs = new_stub_vfs();
+        let handle = expect_ok(vfs.open_or_create(
+            "/etc/resize-failure", AccessMode::ReadWrite, CreateMode::Exclusive,
+            Permissions::all_permissive(), None,
+        ), "create failure fixture");
+        expect_ok(vfs.write(&handle, b"keep"), "seed failure fixture");
+        expect_ok(vfs.seek(&handle, 7), "set failure fixture offset");
+        expect_ok(vfs.sync_volume("/", None), "clear dirty metadata before failure");
+        let inode = &handle.file.inode;
+        let before = inode.stat();
+        super::fail_next_resize_for(inode);
+        expect_err(vfs.resize(&handle, length), FileSystemError::DiskWriteError,
+            "injected pre-commit resize failure");
+        assert_eq!(inode.stat(), before);
+        assert!(!inode.is_dirty());
+        assert_eq!(expect_ok(vfs.seek_signed(&handle, 0, SeekOrigin::Current),
+            "offset after failure"), 7);
+        let backing = expect_ok(inode.filesystem.load_inode(inode.inode_number),
+            "load backing length after failure");
+        assert_eq!(backing.stat().size, 4);
+        let mut bytes = [0; 4];
+        assert_eq!(expect_ok(inode.filesystem.read(inode, 0, &mut bytes),
+            "read backing data after failure"), 4);
+        assert_eq!(&bytes, b"keep");
+
+        expect_err(vfs.resize(&handle, u64::MAX), FileSystemError::FileTooLarge,
+            "reject unrepresentable backing length");
+        assert_eq!(inode.stat(), before);
+        assert!(!inode.is_dirty());
+        expect_ok(vfs.resize(&handle, length), "retry failed resize");
+        assert_eq!(inode.stat().size, length);
+        assert_eq!(expect_ok(vfs.seek_signed(&handle, 0, SeekOrigin::Current),
+            "offset after retry"), 7);
+        expect_ok(vfs.close(&handle), "close resize fixture");
+    }
+    sprintln!("[VFS TEST] resize failures ... PASS");
 }

@@ -344,6 +344,9 @@ pub struct FileHandle {
     /// a `WriteOnly` handle may not read. Write-lock operations are only valid
     /// on handles whose `access_mode` permits writing.
     pub access_mode: AccessMode,
+
+    /// Fixed at open. Each write selects the current inode size when set.
+    pub(super) append: bool,
 }
 
 /// Namespace contributions owned by one open-handle registration.
@@ -389,6 +392,7 @@ impl FileHandle {
     /// * `id`                   - Identifier assigned by the VFS to this open
     ///   handle.
     /// * `access_mode`          - The access rights granted to this handle.
+    /// * `append`               - Whether each write selects the file end.
     /// * `namespace_protection` - Tokens acquired under VFS serialization.
     ///   Abandoning construction releases them without driver I/O.
     ///
@@ -399,6 +403,7 @@ impl FileHandle {
         file: Arc<File>,
         id: u64,
         access_mode: AccessMode,
+        append: bool,
         namespace_protection: OpenNamespaceProtection,
     ) -> Self {
         Self {
@@ -410,6 +415,7 @@ impl FileHandle {
                 namespace_protection: Some(namespace_protection),
             }),
             access_mode,
+            append,
         }
     }
 

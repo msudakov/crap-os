@@ -4,9 +4,10 @@
 //! development to exercise the VFS layer before a real on-disk filesystem is
 //! available. It implements [`FileSystemDriver`] and [`FileSystemInstance`]
 //! with a hardcoded directory tree and no disk interaction.
-//! The VFS test harness can inject one-shot unmount, inode-free, and staged
-//! rename errors to check retry behavior without changing backing state on
-//! failure. Namespace protection is enforced by the VFS, not this driver.
+//! The VFS test harness can inject one-shot inode-sync, volume-flush, unmount,
+//! inode-free, staged creation, and staged rename errors to check retry behavior
+//! without changing backing state on failure. Namespace protection is enforced
+//! by the VFS.
 //!
 //! ## Hardcoded Tree
 //!
@@ -112,10 +113,89 @@ fn fail_next_unmount_for(instance_id: u64) {
     *FAIL_UNMOUNT_ONCE_FOR.lock() = Some(instance_id);
 }
 
+/// One-shot metadata handoff failure for one inode on one instance.
+static FAIL_SYNC_INODE_ONCE_FOR: SpinLock<Option<(u64, u64)>> = SpinLock::new(None);
+
+/// One-shot volume flush failure for one instance.
+static FAIL_SYNC_VOLUME_ONCE_FOR: SpinLock<Option<u64>> = SpinLock::new(None);
+
+/// Driver boundaries recorded while an instance is selected by a sync test.
+#[derive(Debug, PartialEq, Eq)]
+enum SyncEvent {
+    /// Generic metadata handoff for this inode number.
+    Inode(u64),
+    /// Volume data and metadata flush.
+    Flush,
+    /// Driver resource teardown.
+    Unmount,
+}
+
+/// Optional event capture keyed by instance so other volumes stay isolated.
+static SYNC_EVENTS: SpinLock<Option<(u64, Vec<SyncEvent>)>> = SpinLock::new(None);
+
+/// Records a driver boundary when the harness has selected this instance.
+///
+/// # Arguments
+///
+/// * `instance_id` - Instance receiving the driver call.
+/// * `event` - Boundary reached before any injected failure.
+fn record_sync_event(instance_id: u64, event: SyncEvent) {
+    let mut capture = SYNC_EVENTS.lock();
+    if let Some((selected, events)) = capture.as_mut() {
+        if *selected == instance_id {
+            events.push(event);
+        }
+    }
+}
+
 /// One-shot free failure keyed by filesystem instance and inode number.
 /// Untargeted frees leave the request armed, so independent mounts cannot
 /// accidentally consume another test's failure.
 static FAIL_FREE_ONCE_FOR: SpinLock<Option<(u64, u64)>> = SpinLock::new(None);
+
+/// One-shot write failure keyed by filesystem instance and inode number.
+static FAIL_WRITE_ONCE_FOR: SpinLock<Option<(u64, u64)>> = SpinLock::new(None);
+
+/// Arms a failure before the next write changes the selected backing file.
+///
+/// The serial boot harness consumes the request before its fixture ends.
+///
+/// # Arguments
+///
+/// * `inode` - The backing inode whose next write should fail.
+fn fail_next_write_for(inode: &Inode) {
+    *FAIL_WRITE_ONCE_FOR.lock() =
+        Some((inode.filesystem.instance_id(), inode.inode_number));
+}
+
+/// One-shot resize failure keyed by filesystem instance and inode number.
+static FAIL_RESIZE_ONCE_FOR: SpinLock<Option<(u64, u64)>> = SpinLock::new(None);
+
+/// Arms a resize failure before any backing data is changed.
+///
+/// The serial boot harness must consume the request before its fixture ends.
+///
+/// # Arguments
+///
+/// * `inode` - The backing inode whose next resize should fail.
+fn fail_next_resize_for(inode: &Inode) {
+    *FAIL_RESIZE_ONCE_FOR.lock() =
+        Some((inode.filesystem.instance_id(), inode.inode_number));
+}
+
+/// One-shot regular-file creation failure after validation and before commit.
+static FAIL_CREATE_ONCE_FOR: SpinLock<Option<u64>> = SpinLock::new(None);
+
+/// Arms a staged regular-file creation failure for one stub instance.
+///
+/// The serial boot harness must consume the request before its fixture ends.
+///
+/// # Arguments
+///
+/// * `instance_id` - Mounted instance whose next valid creation fails.
+fn fail_next_create_for(instance_id: u64) {
+    *FAIL_CREATE_ONCE_FOR.lock() = Some(instance_id);
+}
 
 /// Arms a single backing-storage free failure without modifying the target.
 ///
@@ -467,6 +547,15 @@ impl FileSystemInstance for StubFsInstance {
         self.id
     }
 
+    /// Reports the component size limit exercised by StubFS.
+    ///
+    /// # Returns
+    ///
+    /// Returns 255 bytes of name text.
+    fn max_name_bytes(&self) -> usize {
+        255
+    }
+
     fn block_size(&self) -> u32 {
         4096
     }
@@ -494,8 +583,25 @@ impl FileSystemInstance for StubFsInstance {
         Ok(Self::make_vfs_inode(&inodes[idx], instance_arc))
     }
 
-    fn sync_inode(&self, _inode: &Inode) -> Result<(), FileSystemError> {
-        // No disk to sync to; the in-memory state is always current.
+    /// Exercises metadata handoff and its retry boundary in the VFS.
+    ///
+    /// StubFS has no persistent metadata store. Event capture and failure
+    /// injection let tests observe the VFS dirty flag and flush ordering.
+    ///
+    /// # Arguments
+    ///
+    /// * `inode` - Canonical inode whose metadata the VFS is handing off.
+    ///
+    /// # Returns
+    ///
+    /// Returns an armed `DiskWriteError` once, or success.
+    fn sync_inode(&self, inode: &Inode) -> Result<(), FileSystemError> {
+        record_sync_event(self.id, SyncEvent::Inode(inode.inode_number));
+        let mut fail_for = FAIL_SYNC_INODE_ONCE_FOR.lock();
+        if *fail_for == Some((self.id, inode.inode_number)) {
+            *fail_for = None;
+            return Err(FileSystemError::DiskWriteError);
+        }
         Ok(())
     }
 
@@ -543,12 +649,13 @@ impl FileSystemInstance for StubFsInstance {
         directory: &Inode,
         name: &str,
     ) -> Result<DirectoryEntry, FileSystemError> {
+        DirectoryEntry::validate_name(name, self.max_name_bytes())?;
         let inodes = self.inodes.lock();
         let idx    = Self::find_inode_index(&inodes, directory.inode_number)?;
         let dir    = &inodes[idx];
 
         for (child_name, child_ino, child_type) in &dir.children {
-            if child_name == name {
+            if child_name.eq_ignore_ascii_case(name) {
                 return Ok(DirectoryEntry::new(
                     child_name.clone(),
                     *child_ino,
@@ -614,6 +721,14 @@ impl FileSystemInstance for StubFsInstance {
             .find(|(n, _)| *n == inode.inode_number)
             .ok_or(FileSystemError::NotFound)?;
 
+        {
+            let mut fail_for = FAIL_WRITE_ONCE_FOR.lock();
+            if *fail_for == Some((self.id, inode.inode_number)) {
+                *fail_for = None;
+                return Err(FileSystemError::DiskWriteError);
+            }
+        }
+
         let start   = offset as usize;
         let end     = start + buffer.len();
 
@@ -635,6 +750,63 @@ impl FileSystemInstance for StubFsInstance {
         Ok(buffer.len())
     }
 
+    /// Resizes regular-file data and publishes the backing byte length.
+    ///
+    /// Backing lookups, injected failure, and growth allocation precede logical
+    /// mutation. Reserving can change capacity while preserving file contents.
+    /// The final vector resize needs no allocation and zeroes every added byte.
+    ///
+    /// # Arguments
+    ///
+    /// * `inode` - Regular-file inode owned by this stub instance.
+    /// * `new_length` - Requested byte count, limited by vector addressing.
+    ///
+    /// # Returns
+    ///
+    /// Returns success after resizing, `FileTooLarge` above the vector size
+    /// range, `OutOfSpace` on allocation failure, `NotFound` for a missing
+    /// backing record, or the injected `DiskWriteError`. Errors preserve
+    /// data and backing metadata.
+    fn resize(&self, inode: &Inode, new_length: u64) -> Result<(), FileSystemError> {
+        let length = usize::try_from(new_length)
+            .map_err(|_| FileSystemError::FileTooLarge)?;
+        if length > isize::MAX as usize {
+            return Err(FileSystemError::FileTooLarge);
+        }
+
+        let mut file_data = self.file_data.lock();
+        let (_, data) = file_data
+            .iter_mut()
+            .find(|(number, _)| *number == inode.inode_number)
+            .ok_or(FileSystemError::NotFound)?;
+
+        let mut inodes = self.inodes.lock();
+        let index = Self::find_inode_index(&inodes, inode.inode_number)?;
+
+        {
+            let mut fail_for = FAIL_RESIZE_ONCE_FOR.lock();
+            if *fail_for == Some((self.id, inode.inode_number)) {
+                *fail_for = None;
+                return Err(FileSystemError::DiskWriteError);
+            }
+        }
+
+        if length > data.len() {
+            data.try_reserve_exact(length - data.len())
+                .map_err(|_| FileSystemError::OutOfSpace)?;
+        }
+
+        // All returned-error paths precede the content and length commit.
+        // Preserve the former zero-truncate behavior of releasing its buffer.
+        if length == 0 {
+            *data = Vec::new();
+        } else {
+            data.resize(length, 0);
+        }
+        inodes[index].size = new_length;
+        Ok(())
+    }
+
     fn create_file(
         &self,
         parent: &Inode,
@@ -642,34 +814,43 @@ impl FileSystemInstance for StubFsInstance {
         _permissions: Permissions,
         _timestamps: Timestamps,
     ) -> Result<Arc<Inode>, FileSystemError> {
-        let new_ino = {
-            let mut counter = self.next_inode.lock();
-            let n = *counter;
-            *counter += 1;
-            n
-        };
+        DirectoryEntry::validate_name(name, self.max_name_bytes())?;
+        let mut inodes = self.inodes.lock();
+        let parent_idx = Self::find_inode_index(&inodes, parent.inode_number)?;
+        if inodes[parent_idx].children.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(name)) {
+            return Err(FileSystemError::AlreadyExists);
+        }
+
+        let mut counter = self.next_inode.lock();
+        let new_ino = *counter;
+        let next_ino = new_ino.checked_add(1)
+            .ok_or(FileSystemError::OutOfInodes)?;
+        let backing = StubInode::new_file(new_ino, 0);
+        let inode = Self::make_vfs_inode(
+            &backing, Arc::clone(&parent.filesystem),
+        );
+        let entry_name = name.to_string();
 
         {
-            let mut inodes = self.inodes.lock();
-            // Reject if name already exists in parent.
-            let parent_idx = Self::find_inode_index(&inodes, parent.inode_number)?;
-            if inodes[parent_idx].children.iter().any(|(n, _, _)| n == name) {
-                return Err(FileSystemError::AlreadyExists);
+            let mut fail_for = FAIL_CREATE_ONCE_FOR.lock();
+            if *fail_for == Some(self.id) {
+                *fail_for = None;
+                return Err(FileSystemError::DiskWriteError);
             }
-            inodes[parent_idx].children.push((
-                name.to_string(),
-                new_ino,
-                DirectoryEntryType::File,
-            ));
-            inodes.push(StubInode::new_file(new_ino, 0));
         }
 
-        {
-            let mut file_data = self.file_data.lock();
-            file_data.push((new_ino, Vec::new()));
-        }
+        // All returned-error checks precede publication. Allocation failure
+        // follows the kernel allocator contract.
+        inodes[parent_idx].children.push((
+            entry_name, new_ino, DirectoryEntryType::File,
+        ));
+        inodes.push(backing);
+        *counter = next_ino;
+        drop(counter);
+        drop(inodes);
+        self.file_data.lock().push((new_ino, Vec::new()));
 
-        self.load_inode(new_ino)
+        Ok(inode)
     }
 
     fn create_directory(
@@ -679,6 +860,7 @@ impl FileSystemInstance for StubFsInstance {
         _permissions: Permissions,
         _timestamps: Timestamps,
     ) -> Result<Arc<Inode>, FileSystemError> {
+        DirectoryEntry::validate_name(name, self.max_name_bytes())?;
         let new_ino = {
             let mut counter = self.next_inode.lock();
             let n = *counter;
@@ -689,7 +871,7 @@ impl FileSystemInstance for StubFsInstance {
         {
             let mut inodes = self.inodes.lock();
             let parent_idx = Self::find_inode_index(&inodes, parent.inode_number)?;
-            if inodes[parent_idx].children.iter().any(|(n, _, _)| n == name) {
+            if inodes[parent_idx].children.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(name)) {
                 return Err(FileSystemError::AlreadyExists);
             }
             inodes[parent_idx].children.push((
@@ -710,6 +892,7 @@ impl FileSystemInstance for StubFsInstance {
         target: &str,
         _timestamps: Timestamps,
     ) -> Result<Arc<Inode>, FileSystemError> {
+        DirectoryEntry::validate_name(name, self.max_name_bytes())?;
         let new_ino = {
             let mut counter = self.next_inode.lock();
             let n = *counter;
@@ -720,7 +903,7 @@ impl FileSystemInstance for StubFsInstance {
         {
             let mut inodes = self.inodes.lock();
             let parent_idx = Self::find_inode_index(&inodes, parent.inode_number)?;
-            if inodes[parent_idx].children.iter().any(|(n, _, _)| n == name) {
+            if inodes[parent_idx].children.iter().any(|(n, _, _)| n.eq_ignore_ascii_case(name)) {
                 return Err(FileSystemError::AlreadyExists);
             }
             inodes[parent_idx].children.push((
@@ -763,6 +946,7 @@ impl FileSystemInstance for StubFsInstance {
         destination_parent: &Inode,
         destination_name: &str,
     ) -> Result<(), FileSystemError> {
+        DirectoryEntry::validate_name(destination_name, self.max_name_bytes())?;
         let mut inodes = self.inodes.lock();
         let source_idx = Self::find_inode_index(&inodes, source.inode_number)?;
         let destination_parent_idx =
@@ -784,7 +968,7 @@ impl FileSystemInstance for StubFsInstance {
             return Err(FileSystemError::NotFound);
         }
         if inodes[destination_parent_idx].children.iter()
-            .any(|(name, _, _)| name == destination_name)
+            .any(|(name, _, _)| name.eq_ignore_ascii_case(destination_name))
         {
             return Err(FileSystemError::AlreadyExists);
         }
@@ -822,10 +1006,11 @@ impl FileSystemInstance for StubFsInstance {
         parent: &Inode,
         name: &str,
     ) -> Result<(), FileSystemError> {
+        DirectoryEntry::validate_name(name, self.max_name_bytes())?;
         let mut inodes = self.inodes.lock();
         let parent_idx = Self::find_inode_index(&inodes, parent.inode_number)?;
         let pos = inodes[parent_idx].children.iter()
-            .position(|(n, _, _)| n == name)
+            .position(|(n, _, _)| n.eq_ignore_ascii_case(name))
             .ok_or(FileSystemError::NotFound)?;
         let target_number = inodes[parent_idx].children[pos].1;
         let target_idx = Self::find_inode_index(&inodes, target_number)?;
@@ -853,13 +1038,16 @@ impl FileSystemInstance for StubFsInstance {
     ///
     /// # Returns
     ///
-    /// Returns success after commit, a backing lookup/type/count error before
-    /// mutation, or one injected `DiskWriteError` after staging. Allocation
-    /// failure follows the existing kernel allocator contract.
+    /// Returns success after commit or a same-inode no-op. Name validation and
+    /// backing checks can fail before mutation, as can an injected
+    /// `DiskWriteError` after staging. Allocation failure follows the existing
+    /// kernel allocator contract.
     fn rename(
         &self, old_parent: &Inode, old_name: &str,
         new_parent: &Inode, new_name: &str,
     ) -> Result<(), FileSystemError> {
+        DirectoryEntry::validate_name(old_name, self.max_name_bytes())?;
+        DirectoryEntry::validate_name(new_name, self.max_name_bytes())?;
         let mut inodes = self.inodes.lock();
         let old_idx = Self::find_inode_index(&inodes, old_parent.inode_number)?;
         let new_idx = Self::find_inode_index(&inodes, new_parent.inode_number)?;
@@ -867,20 +1055,31 @@ impl FileSystemInstance for StubFsInstance {
             || inodes[new_idx].inode_type != InodeType::Directory
         { return Err(FileSystemError::NotADirectory); }
         let source_pos = inodes[old_idx].children.iter()
-            .position(|(name, _, _)| name == old_name)
+            .position(|(name, _, _)| name.eq_ignore_ascii_case(old_name))
             .ok_or(FileSystemError::NotFound)?;
-        let (_, source_number, source_type) = &inodes[old_idx].children[source_pos];
+        let (source_name, source_number, source_type) =
+            &inodes[old_idx].children[source_pos];
         let source_number = *source_number;
         let source_type = *source_type;
         // Validate backing source existence before staging, even though no
         // separate parent record needs to be updated by this driver.
         Self::find_inode_index(&inodes, source_number)?;
-        let displaced = match inodes[new_idx].children.iter()
-            .find(|(name, _, _)| name == new_name)
-        {
-            Some((_, number, _)) if *number == source_number => return Ok(()),
-            Some((_, number, _)) => {
-                let idx = Self::find_inode_index(&inodes, *number)?;
+        let destination_pos = inodes[new_idx].children.iter()
+            .position(|(name, _, _)| name.eq_ignore_ascii_case(new_name));
+        let displaced = match destination_pos {
+            Some(pos) if old_idx == new_idx && pos == source_pos => {
+                if source_name == new_name {
+                    return Ok(());
+                }
+                // Same entry with a new spelling. No backing link is removed.
+                None
+            }
+            Some(pos) => {
+                let number = inodes[new_idx].children[pos].1;
+                if number == source_number {
+                    return Ok(());
+                }
+                let idx = Self::find_inode_index(&inodes, number)?;
                 let source_directory = source_type == DirectoryEntryType::Directory;
                 let destination_directory = inodes[idx].inode_type == InodeType::Directory;
                 if source_directory && !destination_directory {
@@ -902,12 +1101,12 @@ impl FileSystemInstance for StubFsInstance {
         let mut old_children = inodes[old_idx].children.clone();
         old_children.remove(source_pos);
         let new_children = if old_idx == new_idx {
-            old_children.retain(|(name, _, _)| name != new_name);
+            old_children.retain(|(name, _, _)| !name.eq_ignore_ascii_case(new_name));
             old_children.push(new_entry);
             None
         } else {
             let mut children = inodes[new_idx].children.clone();
-            children.retain(|(name, _, _)| name != new_name);
+            children.retain(|(name, _, _)| !name.eq_ignore_ascii_case(new_name));
             children.push(new_entry);
             Some(children)
         };
@@ -956,6 +1155,23 @@ impl FileSystemInstance for StubFsInstance {
         Ok(())
     }
 
+    /// Exercises the volume flush boundary without performing disk I/O.
+    ///
+    /// Failure injection is independent of inode handoff and unmount.
+    ///
+    /// # Returns
+    ///
+    /// Returns an armed `DiskWriteError` once, or success.
+    fn sync_volume(&self) -> Result<(), FileSystemError> {
+        record_sync_event(self.id, SyncEvent::Flush);
+        let mut fail_for = FAIL_SYNC_VOLUME_ONCE_FOR.lock();
+        if *fail_for == Some(self.id) {
+            *fail_for = None;
+            return Err(FileSystemError::DiskWriteError);
+        }
+        Ok(())
+    }
+
     /// Completes unmount, unless the test harness armed a one-shot failure.
     ///
     /// A simulated failure leaves this instance usable for a later retry.
@@ -964,6 +1180,7 @@ impl FileSystemInstance for StubFsInstance {
     ///
     /// Returns `Err(DiskWriteError)` once for an armed instance, or `Ok(())`.
     fn unmount(&self) -> Result<(), FileSystemError> {
+        record_sync_event(self.id, SyncEvent::Unmount);
         // Exercise the VFS retry path without releasing any instance state.
         let mut fail_for = FAIL_UNMOUNT_ONCE_FOR.lock();
         if *fail_for == Some(self.id) {
@@ -971,8 +1188,8 @@ impl FileSystemInstance for StubFsInstance {
             return Err(FileSystemError::DiskWriteError);
         }
 
-        // Nothing to flush; the stub retains its in-memory state until the
-        // last reference to this instance is dropped.
+        // VFS volume sync has completed. Backing memory stays owned by this
+        // instance until its last reference is dropped.
         Ok(())
     }
 }

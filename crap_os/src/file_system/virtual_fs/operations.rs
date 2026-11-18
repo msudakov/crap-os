@@ -188,7 +188,7 @@ impl VirtualFileSystem {
         };
 
         if options.contents_mode == OpenContentsMode::Truncate {
-            Self::truncate_for_open(&inode)?;
+            Self::resize_inode(&inode, 0)?;
         }
 
         Ok(self.register_open_handle(
@@ -357,7 +357,7 @@ impl VirtualFileSystem {
 
                     if options.contents_mode == OpenContentsMode::Truncate {
                         self.ensure_open_truncation_allowed(&inode, &key)?;
-                        Self::truncate_for_open(&inode)?;
+                        Self::resize_inode(&inode, 0)?;
                     }
                     inode
                 }
@@ -424,25 +424,32 @@ impl VirtualFileSystem {
         Ok(())
     }
 
-    /// Commits truncation immediately before registering the checked open.
+    /// Commits a checked resize and publishes the canonical length.
     ///
-    /// The caller holds global VFS serialization and has completed all
-    /// recoverable open checks and any requested token acquisition.
+    /// Handle resize and truncation at open share this backing operation.
+    /// The caller holds VFS serialization and has completed its own access,
+    /// protection, and lock checks before calling. Every successful resize,
+    /// including an unchanged length, updates modification time and marks the
+    /// metadata dirty. A returned driver error leaves canonical state intact.
     ///
     /// # Arguments
     ///
-    /// * `inode` - Canonical regular-file inode for the checked open.
+    /// * `inode`      - Canonical regular-file inode to resize.
+    /// * `new_length` - Requested length in bytes.
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` after updating the shared size and modification time.
-    /// A driver error preserves the file's data and metadata.
-    fn truncate_for_open(inode: &Inode) -> Result<(), FileSystemError> {
-        inode.filesystem.truncate_to_zero(inode)?;
+    /// Returns success after updating the shared size and modification time,
+    /// or the driver's error with data and metadata preserved.
+    fn resize_inode(
+        inode: &Inode,
+        new_length: u64
+    ) -> Result<(), FileSystemError> {
+        inode.filesystem.resize(inode, new_length)?;
 
         let now = current_timestamp();
         let mut metadata = inode.metadata.lock();
-        metadata.size = 0;
+        metadata.size = new_length;
         metadata.timestamps.modified = now;
         metadata.dirty = true;
 
@@ -618,6 +625,52 @@ impl VirtualFileSystem {
         self.touch_modified(&inode, new_end)?;
 
         Ok(bytes_written)
+    }
+
+    /// Sets an open regular file's length without changing handle positions.
+    ///
+    /// The caller holds VFS serialization. The handle state lock covers the
+    /// access checks and synchronous resize, serializing against close and
+    /// operations sharing this handle. Shrinking discards the tail, and
+    /// extension makes the added range read as zeroes. Every alias and open
+    /// handle observes the new length through the canonical inode.
+    ///
+    /// Namespace protection permits this content operation, including a
+    /// resize to zero. Truncation during open retains its separate protection
+    /// check. Append mode affects writes only and has no effect on resize.
+    ///
+    /// # Arguments
+    ///
+    /// * `handle`     - Registered writable handle whose file should be
+    ///   resized.
+    /// * `new_length` - Exact length in bytes, subject to driver limits.
+    ///
+    /// # Returns
+    ///
+    /// Returns success after resizing, `InvalidHandle` for a closed handle,
+    /// `InvalidAccessMode` without write access, or `FileLocked` when another
+    /// handle owns the exclusive write lock. Driver errors preserve contents,
+    /// length, timestamps, and every handle position.
+    pub fn resize(
+        &mut self,
+        handle: &FileHandle,
+        new_length: u64,
+    ) -> Result<(), FileSystemError> {
+        let state = handle.state.lock();
+
+        if state.closed {
+            return Err(FileSystemError::InvalidHandle);
+        }
+
+        if !handle.can_write() {
+            return Err(FileSystemError::InvalidAccessMode);
+        }
+
+        if handle.file.is_write_blocked(handle.id) {
+            return Err(FileSystemError::FileLocked);
+        }
+
+        Self::resize_inode(&handle.file.inode, new_length)
     }
 
     /// Closes one registered file handle and invalidates all of its `Arc`

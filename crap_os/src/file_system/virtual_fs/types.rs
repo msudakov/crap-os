@@ -70,6 +70,9 @@ pub enum FileSystemError {
     /// The filesystem has no free inode slots remaining.
     OutOfInodes,
 
+    /// The requested file length exceeds the driver's supported size range.
+    FileTooLarge,
+
     /// The requested path component or directory entry does not exist.
     NotFound,
 
@@ -323,8 +326,9 @@ impl NamespaceProtection {
 
     /// Rejects unlink, rename, direct move, and replacement of every entry
     /// naming the opened inode. Also rejects truncating opens of the inode
-    /// through any name. Additional hard links remain permitted and
-    /// immediately share this protection. Ancestors remain independently
+    /// through any name. Writes and handle-based resize, including resize to
+    /// zero, remain permitted by this protection. Additional hard links
+    /// immediately share name protection. Ancestors remain independently
     /// mutable.
     pub const PROTECT_NAMES: Self = Self(1);
 

@@ -49,7 +49,7 @@
 //!   in both directions.
 //!
 //! - [`operations`] - the file operation methods on [`vfs::VirtualFileSystem`]:
-//!   `open`, `open_or_create`, `read`, `write`, `close`, `seek`,
+//!   `open`, `open_or_create`, `read`, `write`, `resize`, `close`, `seek`,
 //!   `inode_metadata_by_path`, `inode_metadata_by_handle`, `list_directory`,
 //!   `create_file`, `create_directory`, `create_symlink`, `create_hard_link`,
 //!   `unlink`, `remove_directory`, and `rename`.

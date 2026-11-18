@@ -168,18 +168,18 @@ fn fail_next_write_for(inode: &Inode) {
         Some((inode.filesystem.instance_id(), inode.inode_number));
 }
 
-/// One-shot truncation failure keyed by filesystem instance and inode number.
-static FAIL_TRUNCATE_ONCE_FOR: SpinLock<Option<(u64, u64)>> = SpinLock::new(None);
+/// One-shot resize failure keyed by filesystem instance and inode number.
+static FAIL_RESIZE_ONCE_FOR: SpinLock<Option<(u64, u64)>> = SpinLock::new(None);
 
-/// Arms a truncation failure before any backing data is changed.
+/// Arms a resize failure before any backing data is changed.
 ///
 /// The serial boot harness must consume the request before its fixture ends.
 ///
 /// # Arguments
 ///
-/// * `inode` - The backing inode whose next truncation should fail.
-fn fail_next_truncate_for(inode: &Inode) {
-    *FAIL_TRUNCATE_ONCE_FOR.lock() =
+/// * `inode` - The backing inode whose next resize should fail.
+fn fail_next_resize_for(inode: &Inode) {
+    *FAIL_RESIZE_ONCE_FOR.lock() =
         Some((inode.filesystem.instance_id(), inode.inode_number));
 }
 
@@ -750,20 +750,30 @@ impl FileSystemInstance for StubFsInstance {
         Ok(buffer.len())
     }
 
-    /// Clears regular-file data and sets the backing inode length to zero.
+    /// Resizes regular-file data and publishes the backing byte length.
     ///
-    /// The caller holds VFS serialization. All backing lookups and failure
-    /// injection checks precede the mutation.
+    /// Backing lookups, injected failure, and growth allocation precede logical
+    /// mutation. Reserving can change capacity while preserving file contents.
+    /// The final vector resize needs no allocation and zeroes every added byte.
     ///
     /// # Arguments
     ///
     /// * `inode` - Regular-file inode owned by this stub instance.
+    /// * `new_length` - Requested byte count, limited by vector addressing.
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` after truncating, `NotFound` if a backing record
-    /// is missing, or `DiskWriteError` for the armed failure.
-    fn truncate_to_zero(&self, inode: &Inode) -> Result<(), FileSystemError> {
+    /// Returns success after resizing, `FileTooLarge` above the vector size
+    /// range, `OutOfSpace` on allocation failure, `NotFound` for a missing
+    /// backing record, or the injected `DiskWriteError`. Errors preserve
+    /// data and backing metadata.
+    fn resize(&self, inode: &Inode, new_length: u64) -> Result<(), FileSystemError> {
+        let length = usize::try_from(new_length)
+            .map_err(|_| FileSystemError::FileTooLarge)?;
+        if length > isize::MAX as usize {
+            return Err(FileSystemError::FileTooLarge);
+        }
+
         let mut file_data = self.file_data.lock();
         let (_, data) = file_data
             .iter_mut()
@@ -774,15 +784,26 @@ impl FileSystemInstance for StubFsInstance {
         let index = Self::find_inode_index(&inodes, inode.inode_number)?;
 
         {
-            let mut fail_for = FAIL_TRUNCATE_ONCE_FOR.lock();
+            let mut fail_for = FAIL_RESIZE_ONCE_FOR.lock();
             if *fail_for == Some((self.id, inode.inode_number)) {
                 *fail_for = None;
                 return Err(FileSystemError::DiskWriteError);
             }
         }
 
-        *data = Vec::new();
-        inodes[index].size = 0;
+        if length > data.len() {
+            data.try_reserve_exact(length - data.len())
+                .map_err(|_| FileSystemError::OutOfSpace)?;
+        }
+
+        // All returned-error paths precede the content and length commit.
+        // Preserve the former zero-truncate behavior of releasing its buffer.
+        if length == 0 {
+            *data = Vec::new();
+        } else {
+            data.resize(length, 0);
+        }
+        inodes[index].size = new_length;
         Ok(())
     }
 

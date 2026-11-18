@@ -471,21 +471,35 @@ pub trait FileSystemInstance: Send + Sync {
         buffer: &[u8],
     ) -> Result<usize, FileSystemError>;
 
-    /// Sets a regular file's backing length to zero.
+    /// Sets a regular file's backing length to the requested byte count.
     ///
     /// The caller holds VFS serialization and checks write access and lock
-    /// ownership. On success, the driver exposes empty data and a zero backing
-    /// length, and the VFS updates the canonical metadata. A returned error
-    /// must preserve the backing length and contents.
+    /// ownership. Shrinking discards bytes beyond the new end. Extension
+    /// preserves the existing prefix and makes all added bytes read as zeroes.
+    /// Previously discarded bytes must stay inaccessible after re-extension.
+    /// Zero length and unchanged length follow the same contract.
+    ///
+    /// The VFS publishes canonical size and modification time after success.
+    /// Every returned error must preserve backing contents and length. Native
+    /// drivers must stage fallible work before publishing the change, while
+    /// retaining any failed cleanup as driver-owned retry work. Durability is
+    /// completed separately through [`FileSystemInstance::sync_volume`].
     ///
     /// # Arguments
     ///
-    /// * `inode` - Regular-file inode owned by this instance.
+    /// * `inode`      - Regular-file inode owned by this instance.
+    /// * `new_length` - Exact requested length in bytes.
     ///
     /// # Returns
     ///
-    /// Returns `Ok(())` after the backing change, or a filesystem error.
-    fn truncate_to_zero(&self, inode: &Inode) -> Result<(), FileSystemError>;
+    /// Returns success after the backing change, `FileTooLarge` if the driver
+    /// cannot represent this length, `OutOfSpace` if growth cannot be
+    /// allocated, or another filesystem error preserving contents and length.
+    fn resize(
+        &self,
+        inode: &Inode,
+        new_length: u64
+    ) -> Result<(), FileSystemError>;
 
     // =========================================================================
     // Namespace Mutation

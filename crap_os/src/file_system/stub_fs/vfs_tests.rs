@@ -55,7 +55,8 @@
 //! 28. **Directory listing** - checks snapshots, symlinks, and mount visibility.
 //! 29. **Filenames** - checks case, spelling, path syntax, and byte limits.
 //! 30. **Volume sync** - checks selection, inode handoff, flush, and retries.
-//! 31. **Teardown** - releases the global VFS owner after the tests.
+//! 31. **Resize** - checks exact lengths, zero extension, access, and failures.
+//! 32. **Teardown** - releases the global VFS owner after the tests.
 
 extern crate alloc;
 
@@ -142,6 +143,9 @@ pub fn run_vfs_tests() {
     test_volume_sync_selection();
     test_volume_sync_retry();
     test_volume_sync_unmount();
+    test_resize_contents();
+    test_resize_access();
+    test_resize_failures();
     expect_ok(with_vfs(|vfs| vfs.reclaim_unlinked_inodes()), "final unlinked inode cleanup");
     teardown_vfs();
 
@@ -3158,7 +3162,7 @@ fn test_open_truncate_failure() {
     let inode = &original.file.inode;
     let before = inode.stat();
 
-    super::fail_next_truncate_for(inode);
+    super::fail_next_resize_for(inode);
     expect_err(vfs.open_with_options(
         path, AccessMode::ReadOnly,
         OpenOptions { contents_mode: OpenContentsMode::Truncate, append: false },
@@ -3986,4 +3990,178 @@ fn test_volume_sync_unmount() {
     let host = expect_ok(vfs.resolve("/var", None, true), "uncovered host");
     assert_ne!(host.filesystem.instance_id(), instance_id);
     sprintln!("[VFS TEST] volume sync unmount ... PASS");
+}
+
+/// Checks shrinking, zero-filled extension, and unchanged handle positions.
+///
+/// Re-extension must never expose bytes discarded by an earlier shrink. A
+/// write from an offset beyond the resized end also zeroes the intervening gap.
+///
+/// # Panics
+///
+/// Panics if resize changes handle positions or violates shared file contents.
+fn test_resize_contents() {
+    sprintln!("[VFS TEST] resize contents ...");
+    let mut vfs = new_stub_vfs();
+    let original = expect_ok(vfs.open_or_create(
+        "/etc/resizable", AccessMode::ReadWrite, CreateMode::Exclusive,
+        Permissions::all_permissive(), None,
+    ), "create resize fixture");
+    expect_ok(vfs.write(&original, b"abcdef"), "seed resize fixture");
+    let cloned = Arc::clone(&original);
+    expect_ok(vfs.create_hard_link("/etc/resizable", "/etc/resize-alias", None, false),
+        "create resize alias");
+    let alias = expect_ok(vfs.open("/etc/resize-alias", AccessMode::ReadWrite, None),
+        "independent alias handle");
+    expect_ok(vfs.seek(&original, 9), "set offset beyond the end");
+    expect_ok(vfs.seek(&alias, 2), "set independent alias offset");
+
+    expect_ok(vfs.resize(&original, 3), "shrink to three bytes");
+    assert_eq!(alias.file.inode.stat().size, 3);
+    assert_eq!(expect_ok(vfs.seek_signed(&cloned, 0, SeekOrigin::Current),
+        "shared offset after shrink"), 9);
+    assert_eq!(expect_ok(vfs.seek_signed(&alias, 0, SeekOrigin::Current),
+        "independent offset after shrink"), 2);
+    let mut eof = [0; 1];
+    assert_eq!(expect_ok(vfs.read(&original, &mut eof), "read beyond resized end"), 0);
+
+    expect_ok(vfs.resize(&alias, 8), "extend after shrinking");
+    expect_ok(vfs.seek(&alias, 0), "rewind alias");
+    let mut bytes = [0xff; 8];
+    assert_eq!(expect_ok(vfs.read(&alias, &mut bytes), "read extended contents"), 8);
+    assert_eq!(&bytes, b"abc\0\0\0\0\0");
+    assert_eq!(expect_ok(vfs.seek_signed(&original, 0, SeekOrigin::Current),
+        "original offset after extension"), 9);
+
+    {
+        let mut metadata = original.file.inode.metadata.lock();
+        metadata.timestamps.modified = u64::MAX;
+        metadata.dirty = false;
+    }
+    expect_ok(vfs.resize(&original, 8), "resize to unchanged length");
+    assert_ne!(original.file.inode.stat().timestamps.modified, u64::MAX);
+    assert!(original.file.inode.is_dirty());
+
+    expect_ok(vfs.resize(&original, 0), "resize to zero");
+    assert_eq!(alias.file.inode.stat().size, 0);
+    assert_eq!(expect_ok(vfs.seek_signed(&alias, 0, SeekOrigin::Current),
+        "alias offset after zero resize"), 8);
+    expect_ok(vfs.write(&original, b"Z"), "write from the retained past-end offset");
+    expect_ok(vfs.seek(&alias, 0), "rewind after past-end write");
+    let mut bytes = [0xff; 10];
+    assert_eq!(expect_ok(vfs.read(&alias, &mut bytes), "read zero-filled gap"), 10);
+    assert_eq!(&bytes, b"\0\0\0\0\0\0\0\0\0Z");
+    expect_ok(vfs.close(&alias), "close independent alias");
+    expect_ok(vfs.close(&original), "close shared original handle");
+    sprintln!("[VFS TEST] resize contents ... PASS");
+}
+
+/// Checks access modes, name protection, append mode, and unlinked lifetimes.
+///
+/// A writable protected handle and a separate writable alias can both resize,
+/// including to zero. Truncation at open keeps its name protection check.
+///
+/// # Panics
+///
+/// Panics if resize misapplies protection or rejects a live unlinked file.
+fn test_resize_access() {
+    sprintln!("[VFS TEST] resize access ...");
+    let mut vfs = new_stub_vfs();
+    expect_ok(vfs.create_file("/etc/resize-access", Permissions::all_permissive(), None),
+        "create access fixture");
+    expect_ok(vfs.create_hard_link(
+        "/etc/resize-access", "/etc/resize-access-alias", None, false,
+    ), "create access alias");
+    let owner = expect_ok(vfs.open_with_options(
+        "/etc/resize-access", AccessMode::ReadWrite,
+        OpenOptions { contents_mode: OpenContentsMode::Preserve, append: true },
+        None, NamespaceProtection::PROTECT_FULL,
+    ), "protected append handle");
+    expect_ok(vfs.write(&owner, b"keep"), "seed protected file");
+    let writer = expect_ok(vfs.open("/etc/resize-access-alias", AccessMode::WriteOnly, None),
+        "separate write-only alias");
+    let reader = expect_ok(vfs.open("/etc/resize-access", AccessMode::ReadOnly, None),
+        "read-only handle");
+
+    let before = owner.file.inode.stat();
+    expect_err(vfs.resize(&reader, 0), FileSystemError::InvalidAccessMode,
+        "read-only handle cannot resize");
+    assert_eq!(owner.file.inode.stat(), before);
+    expect_ok(vfs.seek(&owner, 17), "append handle offset before resize");
+    expect_ok(vfs.resize(&owner, 10), "protected owner extends file");
+    expect_ok(vfs.resize(&writer, 3), "protected alias shrinks file");
+    expect_ok(vfs.resize(&writer, 0), "protected alias clears file");
+    expect_ok(vfs.resize(&owner, 0), "protected owner clears file");
+    assert_eq!(expect_ok(vfs.seek_signed(&owner, 0, SeekOrigin::Current),
+        "resize ignores append mode and offset"), 17);
+    expect_err(vfs.open_with_options(
+        "/etc/resize-access-alias", AccessMode::ReadWrite,
+        OpenOptions { contents_mode: OpenContentsMode::Truncate, append: false },
+        None, NamespaceProtection::NONE,
+    ), FileSystemError::ResourceBusy, "truncation at open still checks protection");
+
+    expect_ok(vfs.close(&owner), "release name and ancestor protection");
+    expect_err(vfs.resize(&owner, 1), FileSystemError::InvalidHandle,
+        "closed handle cannot resize");
+    expect_ok(vfs.unlink("/etc/resize-access", None), "unlink original name");
+    expect_ok(vfs.unlink("/etc/resize-access-alias", None), "unlink final alias");
+    expect_ok(vfs.resize(&writer, 7), "resize live unlinked file");
+    assert_eq!(reader.file.inode.stat().size, 7);
+    let mut bytes = [0xff; 7];
+    assert_eq!(expect_ok(vfs.read(&reader, &mut bytes), "read unlinked extension"), 7);
+    assert_eq!(bytes, [0; 7]);
+    expect_ok(vfs.close(&reader), "close reader");
+    expect_ok(vfs.close(&writer), "close final writer");
+    expect_err(owner.file.inode.filesystem.load_inode(owner.file.inode.inode_number),
+        FileSystemError::NotFound, "final close reclaims resized unlinked file");
+    sprintln!("[VFS TEST] resize access ... PASS");
+}
+
+/// Checks resize failure atomicity and representable length rejection.
+///
+/// Every injected failure must preserve bytes, backing length, canonical
+/// metadata, and offsets. The same request then succeeds on retry.
+///
+/// # Panics
+///
+/// Panics if a rejected resize changes visible state or cannot be retried.
+fn test_resize_failures() {
+    sprintln!("[VFS TEST] resize failures ...");
+    for length in [2, 12, 4, 0] {
+        let mut vfs = new_stub_vfs();
+        let handle = expect_ok(vfs.open_or_create(
+            "/etc/resize-failure", AccessMode::ReadWrite, CreateMode::Exclusive,
+            Permissions::all_permissive(), None,
+        ), "create failure fixture");
+        expect_ok(vfs.write(&handle, b"keep"), "seed failure fixture");
+        expect_ok(vfs.seek(&handle, 7), "set failure fixture offset");
+        expect_ok(vfs.sync_volume("/", None), "clear dirty metadata before failure");
+        let inode = &handle.file.inode;
+        let before = inode.stat();
+        super::fail_next_resize_for(inode);
+        expect_err(vfs.resize(&handle, length), FileSystemError::DiskWriteError,
+            "injected pre-commit resize failure");
+        assert_eq!(inode.stat(), before);
+        assert!(!inode.is_dirty());
+        assert_eq!(expect_ok(vfs.seek_signed(&handle, 0, SeekOrigin::Current),
+            "offset after failure"), 7);
+        let backing = expect_ok(inode.filesystem.load_inode(inode.inode_number),
+            "load backing length after failure");
+        assert_eq!(backing.stat().size, 4);
+        let mut bytes = [0; 4];
+        assert_eq!(expect_ok(inode.filesystem.read(inode, 0, &mut bytes),
+            "read backing data after failure"), 4);
+        assert_eq!(&bytes, b"keep");
+
+        expect_err(vfs.resize(&handle, u64::MAX), FileSystemError::FileTooLarge,
+            "reject unrepresentable backing length");
+        assert_eq!(inode.stat(), before);
+        assert!(!inode.is_dirty());
+        expect_ok(vfs.resize(&handle, length), "retry failed resize");
+        assert_eq!(inode.stat().size, length);
+        assert_eq!(expect_ok(vfs.seek_signed(&handle, 0, SeekOrigin::Current),
+            "offset after retry"), 7);
+        expect_ok(vfs.close(&handle), "close resize fixture");
+    }
+    sprintln!("[VFS TEST] resize failures ... PASS");
 }

@@ -144,7 +144,7 @@ impl CpuTopology {
 /// `hardware_manager::parse_acpi` and then read-only for the kernel's lifetime.
 ///
 /// A `StaticSpinLock` is used to satisfy the `static` requirement, but after
-/// `init` is called this lock is never contended — callers should only ever
+/// `init` is called, this lock is never contended, and callers should only ever
 /// read through it. Write access is intentionally limited to the single `init`
 /// call in `_start`.
 pub static CPU_TOPOLOGY: StaticSpinLock<Option<CpuTopology>> =

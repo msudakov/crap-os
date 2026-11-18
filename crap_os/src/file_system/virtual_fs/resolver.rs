@@ -1,0 +1,722 @@
+//! # Virtual File System - Path Resolver
+//!
+//! This module implements the VFS path resolver: the algorithm that walks a
+//! path string component by component through driver directory listings
+//! and produces the [`super::inode::Inode`] or
+//! [`super::directory::Directory`] that the path refers to.
+//!
+//! The resolver is the most central piece of VFS logic. Every operation that
+//! accepts a path (e.g., to open a file, query metadata, or mount a volume)
+//! begins with a resolver call.
+//! 
+//! ## Algorithm Overview
+//!
+//! 1. Determine the starting directory: the global root for absolute paths
+//!    (those beginning with `/`), or `working_directory` for relative paths.
+//! 2. Split the path on `/`, discarding empty components produced by leading,
+//!    trailing, or consecutive separators.
+//! 3. For each component in order:
+//!    * `.`  - stay in the current directory and continue.
+//!    * `..` - move to the parent directory, crossing mount boundaries upward
+//!             if necessary.
+//!    * Any other name - look it up in a fresh driver child list, then act on
+//!      the result type (file, directory, or symlink).
+//! 4. After processing the final component, return the resolved inode (or
+//!    directory wrapper, depending on the entry point).
+//!
+//! ## Symlink Handling
+//!
+//! When the resolver encounters a symlink mid-path, it must follow it: the
+//! symlink's target path is read from the driver and spliced into the
+//! remaining resolution. If the target is absolute, resolution restarts from
+//! the global root. If relative, it continues from the directory containing
+//! the symlink.
+//!
+//! Symlinks at the final path component are handled based on the
+//! `follow_symlinks` flag passed by the caller. Operations that want the
+//! symlink object itself (e.g., reading or deleting the symlink) pass `false`;
+//! operations that want the symlink's target (e.g., opening a file through a
+//! symlink) pass `true`.
+//!
+//! To prevent infinite loops from circular symlink chains, the resolver
+//! carries a `symlink_budget` counter. Each symlink followed decrements the
+//! budget; when it reaches zero, the next symlink follow results in
+//! [`super::types::FileSystemError::TooManySymlinks`] being returned.
+//! The initial budget is [`MAX_SYMLINK_DEPTH`].
+//!
+//! ## Mount Boundary Crossing
+//!
+//! Downward crossing consults the VFS mount table by host filesystem and inode.
+//! Relative paths also check their starting directory, because a retained
+//! working-directory wrapper may have become a mount host.
+//!
+//! The Upward crossing (when the resolver handles `..` at the root of a mounted
+//! filesystem) is handled by consulting the `mounted_root_index` in
+//! [`super::vfs::VirtualFileSystem`], which maps mounted-root identities
+//! to host directory identities in O(1).
+
+#![allow(dead_code)]
+
+use alloc::format;
+use alloc::sync::Arc;
+use alloc::vec::Vec;
+use super::directory::Directory;
+use super::inode::Inode;
+use super::types::{DirectoryEntryType, FileSystemError, OpenFileKey};
+use super::vfs::VirtualFileSystem;
+
+/// Resolution result retaining the actual parent of a final regular file.
+///
+/// The parent comes from the same traversal and shared symlink budget that
+/// selected the inode. It is not the lexical parent of the original pathname.
+pub(super) struct ResolvedEntry {
+    /// Canonical inode selected by path resolution.
+    pub(super) inode: Arc<Inode>,
+
+    /// Actual containing directory for a regular-file result. Directories and
+    /// unfollowed symlinks use `None`; protected opens reject those types.
+    pub(super) file_parent: Option<Arc<Directory>>,
+}
+
+/// The maximum number of symlink hops the resolver will follow before
+/// returning [`super::types::FileSystemError::TooManySymlinks`].
+///
+/// Each symlink followed during resolution decrements an internal counter
+/// initialized to this value. The resolver returns `TooManySymlinks` only
+/// when another symlink must be followed with no budget remaining. A value of
+/// 16 is sufficient for all legitimate use cases (real symlink chains are
+/// rarely deeper than 3-4 hops) while being low enough to keep the worst-case
+/// recursive stack depth manageable.
+pub const MAX_SYMLINK_DEPTH: u8 = 16;
+
+/// Maximum bytes of path text, including separators.
+const MAX_PATH_BYTES: usize = 1024;
+
+/// Checks the bytes of a path before splitting or resolving it.
+///
+/// Empty paths and special components are interpreted by the caller.
+///
+/// # Arguments
+///
+/// * `path` - Path text without a string terminator.
+///
+/// # Returns
+///
+/// Returns success for a path within the byte limit and free of ASCII
+/// control bytes, or `InvalidPath` if either constraint fails.
+pub(super) fn validate_path(path: &str) -> Result<(), FileSystemError> {
+    if path.len() > MAX_PATH_BYTES
+        || path.bytes().any(|byte| byte.is_ascii_control())
+    {
+        return Err(FileSystemError::InvalidPath);
+    }
+    Ok(())
+}
+
+impl VirtualFileSystem {
+    /// Resolves `path` to the [`Inode`] it refers to.
+    ///
+    /// This is the primary entry point for path resolution. Every VFS
+    /// operation that accepts a path string calls this method first to
+    /// convert the path into an inode, then operates on the inode directly.
+    ///
+    /// Absolute paths (beginning with `/`) are resolved from the global root
+    /// directory. Relative paths are resolved from `working_directory`, or
+    /// from the global root if `working_directory` is `None`.
+    ///
+    /// The `follow_symlinks` flag controls behavior only when the final path
+    /// component is a symlink:
+    ///
+    /// * `true`  - the symlink is followed, and the target's inode is returned.
+    ///   Used by operations that want the object the symlink points to (e.g.,
+    ///   `open` or a metadata lookup that follows the final symlink).
+    /// * `false` - the symlink inode itself is returned without following.
+    ///   Used by operations that want the symlink object itself (e.g., delete,
+    ///   read symlink target).
+    ///
+    /// Symlinks encountered at non-final components are always followed,
+    /// regardless of this flag. A trailing slash also makes the preceding
+    /// component non-final, so it must resolve to a directory even when
+    /// `follow_symlinks` is `false`.
+    ///
+    /// # Arguments
+    ///
+    /// * `path`              - The path string to resolve. May be absolute or
+    ///   relative, and may contain `.`, `..`, and symlink components.
+    /// * `working_directory` - The starting directory for relative paths.
+    ///   `None` means use the global root.
+    /// * `follow_symlinks`   - Whether to follow a symlink at the final path
+    ///   component.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(Arc<Inode>)` for the inode the path refers to, or
+    /// `Err(FileSystemError)` if any component cannot be resolved, a symlink
+    /// loop is detected, or an I/O error occurs.
+    pub fn resolve(
+        &self,
+        path: &str,
+        working_directory: Option<Arc<Directory>>,
+        follow_symlinks: bool,
+    ) -> Result<Arc<Inode>, FileSystemError> {
+        self.resolve_with_budget(
+            path,
+            working_directory,
+            follow_symlinks,
+            MAX_SYMLINK_DEPTH,
+        )
+    }
+
+    /// Resolves `path` to the [`Directory`] wrapper for the terminal
+    /// directory component.
+    ///
+    /// Used internally by mount, unmount, and working-directory operations
+    /// that need the [`Directory`] wrapper rather than just the inode. The
+    /// path must resolve to a directory; resolving to a file or symlink
+    /// returns [`FileSystemError::NotADirectory`].
+    ///
+    /// # Arguments
+    ///
+    /// * `path`              - The path string to resolve.
+    /// * `working_directory` - The starting directory for relative paths.
+    ///   `None` means use the global root.
+    /// * `symlink_budget`    - The remaining number of symlink hops permitted.
+    ///   Pass [`MAX_SYMLINK_DEPTH`] for the initial call.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(Arc<Directory>)` for the directory wrapper at the end of
+    /// `path`, or `Err(FileSystemError)` if resolution fails or the terminal
+    /// component is not a directory.
+    pub fn resolve_dir_with_budget(
+        &self,
+        path: &str,
+        working_directory: Option<Arc<Directory>>,
+        symlink_budget: u8,
+    ) -> Result<Arc<Directory>, FileSystemError> {
+        let inode = self.resolve_with_budget(
+            path,
+            working_directory.clone(),
+            false,
+            symlink_budget,
+        )?;
+
+        if !inode.is_directory() {
+            return Err(FileSystemError::NotADirectory);
+        }
+
+        // Walk the path again to obtain the Directory wrapper for the terminal
+        // component. A separate wrapper may represent the same inode.
+        let mut remaining_budget = symlink_budget;
+        self.walk_to_directory(path, working_directory, &mut remaining_budget)
+    }
+
+    /// Resolves a path and discards its final regular-file parent context.
+    ///
+    /// Existing inode-only callers share the same traversal and symlink budget
+    /// as protected opens. No second lookup is needed to discard context.
+    ///
+    /// # Arguments
+    ///
+    /// * `path`              - Absolute or relative pathname to resolve.
+    /// * `working_directory` - Relative-path base, or root when absent.
+    /// * `follow_symlinks`   - Whether to follow a final symlink.
+    /// * `symlink_budget`    - Remaining permitted symlink traversals.
+    ///
+    /// # Returns
+    ///
+    /// Returns the canonical inode or the underlying resolution error.
+    fn resolve_with_budget(
+        &self,
+        path: &str,
+        working_directory: Option<Arc<Directory>>,
+        follow_symlinks: bool,
+        symlink_budget: u8,
+    ) -> Result<Arc<Inode>, FileSystemError> {
+        Ok(self.resolve_entry_with_budget(
+            path, working_directory, follow_symlinks, symlink_budget,
+        )?.inode)
+    }
+
+    /// Resolves a path while retaining final regular-file parent context.
+    ///
+    /// Symlink recursion returns the target's parent context directly, using
+    /// the same decremented budget. Existing inode-only resolution delegates
+    /// here and discards the parent rather than maintaining another walker.
+    ///
+    /// Called by [`VirtualFileSystem::resolve`] with [`MAX_SYMLINK_DEPTH`] as
+    /// the initial budget, and called recursively by itself each time a
+    /// symlink is followed, with a decremented budget. The recursion depth is
+    /// bounded by `symlink_budget` (at most [`MAX_SYMLINK_DEPTH`] frames deep).
+    ///
+    /// # Arguments
+    ///
+    /// * `path`              - The path string to resolve for this invocation.
+    ///   On a recursive call this is the symlink target path, possibly
+    ///   concatenated with remaining unresolved components.
+    /// * `working_directory` - The starting directory. For absolute paths this
+    ///   is ignored in favour of the global root. For relative paths, and for
+    ///   relative symlink targets, this is the directory from which resolution
+    ///   continues.
+    /// * `follow_symlinks`   - Whether to follow a symlink at the final
+    ///   component.
+    /// * `symlink_budget`    - The remaining number of symlink hops permitted
+    ///   before returning [`FileSystemError::TooManySymlinks`].
+    ///
+    /// # Returns
+    ///
+    /// Returns the canonical inode with `Some(parent)` for a regular file,
+    /// or with `None` for a directory or unfollowed symlink. Returns the
+    /// underlying error if resolution fails.
+    pub(super) fn resolve_entry_with_budget(
+        &self,
+        path: &str,
+        working_directory: Option<Arc<Directory>>,
+        follow_symlinks: bool,
+        symlink_budget: u8,
+    ) -> Result<ResolvedEntry, FileSystemError> {
+        validate_path(path)?;
+
+        if path.is_empty() {
+            return Err(FileSystemError::InvalidPath);
+        }
+
+        // Determine the starting directory. Absolute paths always start at
+        // the global root; relative paths start from the supplied working
+        // directory, falling back to root if `None` is provided.
+        let mut current: Arc<Directory> = if path.starts_with('/') {
+            Arc::clone(&self.root)
+        } else {
+            working_directory.unwrap_or_else(|| Arc::clone(&self.root))
+        };
+
+        // A retained working directory can become a mount host after it was
+        // acquired. Resolve relative paths in the visible mounted tree.
+        if !path.starts_with('/') {
+            let key = OpenFileKey::new(current.inode.filesystem.instance_id(),
+                current.inode.inode_number);
+            if let Some(mount_point) = self.mounts.get(&key) {
+                current = Arc::clone(&mount_point.mounted_root);
+            }
+        }
+
+        // Empty components between separators do not affect traversal. A
+        // trailing slash still requires the final named component to be a
+        // directory, so walk through a final `.` after that component.
+        let mut components: Vec<&str> = path
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .collect();
+
+        if path.ends_with('/') && !components.is_empty() {
+            components.push(".");
+        }
+
+        // If after filtering there are no components (e.g., path was `/` or
+        // `///`), the path refers to the current directory itself.
+        if components.is_empty() {
+            return Ok(ResolvedEntry {
+                inode: Arc::clone(&current.inode),
+                file_parent: None,
+            });
+        }
+
+        let last_index = components.len() - 1;
+
+        for (index, &component) in components.iter().enumerate() {
+            let is_last = index == last_index;
+
+            // `.` always refers to the current directory. No lookup needed;
+            // just continue to the next component. If this is the last
+            // component, the current directory's inode is the result.
+            if component == "." {
+                if is_last {
+                    return Ok(ResolvedEntry {
+                        inode: Arc::clone(&current.inode),
+                        file_parent: None,
+                    });
+                }
+                continue;
+            }
+
+            // `..` moves to the parent directory. Three cases apply:
+            if component == ".." {
+                if current.is_root() {
+                    // We are already at the global root; `..` is a no-op.
+                    if is_last {
+                        return Ok(ResolvedEntry {
+                            inode: Arc::clone(&current.inode),
+                            file_parent: None,
+                        });
+                    }
+                    continue;
+                }
+
+                // We are at the root of a mounted filesystem; check whether
+                // the current directory is a mounted root by looking up its
+                // filesystem and inode identity in the secondary index.
+                let current_key = OpenFileKey::new(
+                    current.inode.filesystem.instance_id(),
+                    current.inode.inode_number,
+                );
+                if let Some(&host_key) = self
+                    .mounted_root_index
+                    .get(&current_key)
+                {
+                    // This directory is a mounted root. Cross upward to the
+                    // host directory by retrieving it from the primary mount
+                    // table.
+                    let mount_point = self.mounts
+                        .get(&host_key)
+                        .ok_or(FileSystemError::InternalError)?;
+
+                    current = Arc::clone(&mount_point.host_directory);
+
+                    if is_last {
+                        return Ok(ResolvedEntry {
+                            inode: Arc::clone(&current.inode),
+                            file_parent: None,
+                        });
+                    }
+                    continue;
+                }
+
+                // A moved directory may have a retained wrapper with its old
+                // parent. Prefer the current parent recorded by the VFS.
+                current = if let Some(parent) = self.relocated_parents.get(
+                    &current_key) { Arc::clone(parent) }
+                else {
+                    current.parent()?
+                };
+
+                if is_last {
+                    return Ok(ResolvedEntry {
+                        inode: Arc::clone(&current.inode),
+                        file_parent: None,
+                    });
+                }
+                continue;
+            }
+
+            // The driver supplies a fresh entry for each lookup. No mutable
+            // access to the shared directory wrapper is needed.
+            let entry = current.lookup_child(component)?
+                .ok_or(FileSystemError::NotFound)?;
+            let entry_type = entry.entry_type;
+            let inode_number = entry.inode_number;
+
+            match entry_type {
+                DirectoryEntryType::File => {
+                    if !is_last {
+                        // A file in a non-terminal position means the caller
+                        // is trying to descend through a file as if it were a
+                        // directory, which is an error.
+                        return Err(FileSystemError::NotADirectory);
+                    }
+
+                    // Load the inode for the final file component and return
+                    // it.
+                    let inode = self.get_or_load_inode(
+                        &current.inode.filesystem, inode_number,
+                    )?;
+                    // Capture the actual target parent, including after
+                    // final-symlink recursion. No second path walk is needed.
+                    return Ok(ResolvedEntry {
+                        inode, file_parent: Some(Arc::clone(&current)),
+                    });
+                }
+
+                DirectoryEntryType::Directory => {
+                    // Load the child directory inode and wrap it in a
+                    // Directory so we can descend into it.
+                    let child_inode = self.get_or_load_inode(
+                        &current.inode.filesystem, inode_number,
+                    )?;
+
+                    let child_dir = Arc::new(Directory::new(
+                        child_inode,
+                        Arc::clone(&current),
+                    ));
+
+                    // The mount table is shared by all wrappers of this host.
+                    let child_key = OpenFileKey::new(
+                        child_dir.inode.filesystem.instance_id(),
+                        child_dir.inode.inode_number,
+                    );
+                    if let Some(mount_point) = self.mounts.get(&child_key) {
+                        current = Arc::clone(&mount_point.mounted_root);
+                    } else {
+                        current = child_dir;
+                    }
+
+                    if is_last {
+                        return Ok(ResolvedEntry {
+                            inode: Arc::clone(&current.inode),
+                            file_parent: None,
+                        });
+                    }
+                }
+
+                DirectoryEntryType::Symlink => {
+                    if is_last && !follow_symlinks {
+                        // The caller wants the symlink inode itself, not its
+                        // target. Load and return it directly.
+                        let inode = self.get_or_load_inode(
+                            &current.inode.filesystem, inode_number,
+                        )?;
+                        return Ok(ResolvedEntry { inode, file_parent: None });
+                    }
+
+                    // We need to follow the symlink. Deduct one hop from the
+                    // budget before proceeding.
+                    if symlink_budget == 0 {
+                        return Err(FileSystemError::TooManySymlinks);
+                    }
+                    let remaining_budget = symlink_budget - 1;
+
+                    // Read the symlink's target path from the driver.
+                    let symlink_inode = self.get_or_load_inode(
+                        &current.inode.filesystem, inode_number,
+                    )?;
+                    let target = current.inode.filesystem
+                        .read_symlink(&symlink_inode)?;
+
+                    validate_path(&target)?;
+
+                    // Build the effective path by appending any remaining
+                    // components after the symlink onto the target. E.g., if
+                    // if the path is `/foo/link/bar/baz`, and "link" resolves
+                    // to a symlink with target `../qux`, the effective path for
+                    // the recursive call is `../qux/bar/baz`.
+                    let effective_path = if index < last_index {
+                        let remaining: Vec<&str> =
+                            components[index + 1..].to_vec();
+                        let suffix = remaining.join("/");
+                        format!("{}/{}", target, suffix)
+                    } else {
+                        target
+                    };
+
+                    // Determine the base for relative symlink targets. A
+                    // relative target is resolved from the directory that
+                    // contains the symlink (i.e., `current`), not from the
+                    // caller's original working directory.
+                    let symlink_base = if effective_path.starts_with('/') {
+                        None  // Absolute target: resolver will use root.
+                    } else {
+                        Some(Arc::clone(&current))
+                    };
+
+                    // Recurse with the spliced path and decremented budget.
+                    return self.resolve_entry_with_budget(
+                        &effective_path,
+                        symlink_base,
+                        follow_symlinks,
+                        remaining_budget,
+                    );
+                }
+            }
+        }
+
+        // The loop exhausted all components without returning early. This
+        // happens only when `components` is non-empty but all components were
+        // consumed via the continue paths (i.e., the path consisted entirely
+        // of "." components). Return the current directory's inode.
+        Ok(ResolvedEntry {
+            inode: Arc::clone(&current.inode),
+            file_parent: None,
+        })
+    }
+
+    /// Walks `path` through the directory tree and returns the
+    /// [`Directory`] wrapper for the terminal component.
+    ///
+    /// [`VirtualFileSystem::resolve_dir_with_budget`] uses this helper to
+    /// obtain a [`Directory`] wrapper for mount and working-directory paths.
+    /// Create-and-open uses it to resolve a parent while retaining the
+    /// remaining symlink allowance for a possible final link. It duplicates
+    /// part of the inode resolver's walk but returns the wrapper.
+    ///
+    /// # Arguments
+    ///
+    /// * `path`              - The path string to walk. Must resolve to a
+    ///   directory.
+    /// * `working_directory` - The starting directory for relative paths.
+    ///   `None` means use the global root.
+    /// * `symlink_budget`    - Shared remaining symlink allowance, updated
+    ///   for every link followed during this traversal.
+    ///
+    /// # Returns
+    ///
+    /// Returns `Ok(Arc<Directory>)` for the directory at the end of `path`,
+    /// or `Err(FileSystemError)` if resolution fails or the terminal component
+    /// is not a directory.
+    pub(super) fn walk_to_directory(
+        &self,
+        path: &str,
+        working_directory: Option<Arc<Directory>>,
+        symlink_budget: &mut u8,
+    ) -> Result<Arc<Directory>, FileSystemError> {
+        validate_path(path)?;
+
+        if path.is_empty() {
+            return Err(FileSystemError::InvalidPath);
+        }
+
+        let mut current: Arc<Directory> = if path.starts_with('/') {
+            Arc::clone(&self.root)
+        } else {
+            working_directory.clone().unwrap_or_else(|| Arc::clone(&self.root))
+        };
+
+        // Apply a mount added after the caller retained its working directory.
+        if !path.starts_with('/') {
+            let key = OpenFileKey::new(current.inode.filesystem.instance_id(),
+                current.inode.inode_number);
+            if let Some(mount_point) = self.mounts.get(&key) {
+                current = Arc::clone(&mount_point.mounted_root);
+            }
+        }
+
+        let components: Vec<&str> = path
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .collect();
+
+        if components.is_empty() {
+            return Ok(current);
+        }
+
+        let last_index = components.len() - 1;
+
+        for (index, &component) in components.iter().enumerate() {
+            let is_last = index == last_index;
+
+            if component == "." {
+                if is_last {
+                    return Ok(current);
+                }
+                continue;
+            }
+
+            if component == ".." {
+                if current.is_root() {
+                    if is_last {
+                        return Ok(current);
+                    }
+                    continue;
+                }
+
+                let current_key = OpenFileKey::new(
+                    current.inode.filesystem.instance_id(),
+                    current.inode.inode_number,
+                );
+                if let Some(&host_key) = self
+                    .mounted_root_index
+                    .get(&current_key)
+                {
+                    let mount_point = self.mounts
+                        .get(&host_key)
+                        .ok_or(FileSystemError::InternalError)?;
+                    current = Arc::clone(&mount_point.host_directory);
+
+                    if is_last {
+                        return Ok(current);
+                    }
+                    continue;
+                }
+
+                // Use the moved directory's current parent for retained
+                // wrappers, falling back to the wrapper's original parent.
+                current = if let Some(parent) = self.relocated_parents.get(&current_key) {
+                    Arc::clone(parent)
+                } else {
+                    current.parent()?
+                };
+
+                if is_last {
+                    return Ok(current);
+                }
+                continue;
+            }
+
+            // Look up the child in a fresh driver snapshot.
+            let entry = current.lookup_child(component)?
+                .ok_or(FileSystemError::NotFound)?;
+            let entry_type = entry.entry_type;
+            let inode_number = entry.inode_number;
+
+            match entry_type {
+                DirectoryEntryType::File => {
+                    // A file in any position when we need a directory is an
+                    // error.
+                    return Err(FileSystemError::NotADirectory);
+                }
+
+                DirectoryEntryType::Directory => {
+                    let child_inode = self.get_or_load_inode(
+                        &current.inode.filesystem, inode_number,
+                    )?;
+
+                    let child_dir = Arc::new(Directory::new(
+                        child_inode,
+                        Arc::clone(&current),
+                    ));
+
+                    let child_key = OpenFileKey::new(
+                        child_dir.inode.filesystem.instance_id(),
+                        child_dir.inode.inode_number,
+                    );
+                    if let Some(mount_point) = self.mounts.get(&child_key) {
+                        current = Arc::clone(&mount_point.mounted_root);
+                    } else {
+                        current = child_dir;
+                    }
+
+                    if is_last {
+                        return Ok(current);
+                    }
+                }
+
+                DirectoryEntryType::Symlink => {
+                    if *symlink_budget == 0 {
+                        return Err(FileSystemError::TooManySymlinks);
+                    }
+                    *symlink_budget -= 1;
+
+                    let symlink_inode = self.get_or_load_inode(
+                        &current.inode.filesystem, inode_number,
+                    )?;
+
+                    let target = current.inode.filesystem
+                        .read_symlink(&symlink_inode)?;
+
+                    validate_path(&target)?;
+
+                    let effective_path = if index < last_index {
+                        let remaining: Vec<&str> =
+                            components[index + 1..].to_vec();
+                        let suffix = remaining.join("/");
+                        format!("{}/{}", target, suffix)
+                    } else {
+                        target
+                    };
+
+                    let symlink_base = if effective_path.starts_with('/') {
+                        None
+                    } else {
+                        Some(Arc::clone(&current))
+                    };
+
+                    return self.walk_to_directory(
+                        &effective_path,
+                        symlink_base,
+                        symlink_budget,
+                    );
+                }
+            }
+        }
+
+        Ok(current)
+    }
+}

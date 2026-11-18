@@ -15,6 +15,10 @@ mod task_scheduler;
 mod process_manager;
 mod crypto;
 mod tests;
+mod kernel_hashmap;
+mod file_system;
+
+use file_system::stub_fs::vfs_tests;
 
 use hardware_manager::FramebufferInfo;
 use memory_manager::{MemoryManager, GlobalHeapAllocator};
@@ -184,7 +188,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             );
         }
         if cpu_topology.bsp().is_none() {
-            panic!("BSP APIC ID {:#x} not found in MADT — firmware bug or struct layout mismatch", cpu_topology.bsp_apic_id);
+            panic!("BSP APIC ID {:#x} not found in MADT: firmware bug or struct layout mismatch", cpu_topology.bsp_apic_id);
         }
     }
 
@@ -193,7 +197,7 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
 
 
 
-    // Initialie kernel heap and pre-map 16 pages (64 KB)
+    // Initialize kernel heap and pre-map 16 pages (64 KB)
     globals::KERNEL_HEAP.heap.lock().init(16);
 
     // Initialize Global Descriptor Table
@@ -234,6 +238,30 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
         // Initialize HPET
         let mut hpet = globals::HPET.lock();
         *hpet = Some(hpet_info);
+
+        // Anchor wall-clock time from the CMOS RTC, paired with an HPET
+        // counter snapshot. This must happen while `rsdp_virt` is still valid
+        // and after the HPET main counter is confirmed running (which is
+        // guaranteed since `parse_hpet()`` already succeeded above).
+        let wall_clock = unsafe {
+            hardware_manager::read_rtc_epoch_anchor(
+                rsdp_virt, hpet.as_ref().unwrap())
+        };
+        {
+            let mut wc = globals::WALL_CLOCK.lock();
+            *wc = Some(wall_clock);
+        }
+        sprint_debug!(DebugLevel::INFO, "[INFO] Wall clock anchored from RTC");
+
+        // All ACPI-table consumers (MADT/APIC parsing, HPET table parsing, and
+        // the RTC's FADT century lookup) have now finished. Reclaim the
+        // EfiACPIReclaimMemory pages back to the PMM.
+        {
+            let mut mm_guard = globals::MEMORY_MANAGER.lock();
+            let mm = mm_guard.as_mut().unwrap();
+            mm.reclaim_acpi_memory(&memory_map);
+        }
+        sprint_debug!(DebugLevel::DEBUG, "[DEBUG] Reclaimed ACPI table memory");
 
         // Calculate the number of APIC timer ticks per millisecond
         let apic_ticks_per_ms = unsafe {
@@ -302,6 +330,15 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     tests::memory::test_heap_allocator();
     sprintln!("[+] All MM heap allocator tests passed!\n");
     fbprintln!("[+] All MM heap allocator tests passed!\n");*/
+
+    // Testing RTC and the wall clock
+    let epoch_timestamp = unsafe {
+        let hpet = globals::HPET.lock();
+        let wc = globals::WALL_CLOCK.lock();
+        wc.as_ref().unwrap().now(hpet.as_ref().unwrap())
+    };
+    fbprintln!("[+] Real time clock initialized: {}", epoch_timestamp);
+    sprintln!("[+] Real time clock initialized: {}", epoch_timestamp);
 
 
     // Create and initialize the System process
@@ -382,8 +419,10 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
             );
         }
     }
-    
 
+
+    // Testing VFS via Stub-FS
+    crate::vfs_tests::run_vfs_tests();
 
 
     // Signal the Task Scheduler that the kernel has completed its
@@ -397,18 +436,8 @@ pub extern "C" fn _start(boot_info: *const BootInfo) -> ! {
     // re-enable maskable hardware interrupts.
     unsafe { core::arch::asm!("sti", options(nomem, nostack)); }
 
-
-    //globals::PROCESS_MANAGER.print_processes();
-
     // Enter halt loop on the idle task
-    let mut count = 0;
     loop {
-        //crate::hardware_manager::sprint("+");
-        count += 1;
-        if count == 10 {
-            count = 0;
-            //globals::PROCESS_MANAGER.print_processes();
-        }
         unsafe { core::arch::asm!("hlt", options(nomem, nostack)); }
     } 
 }

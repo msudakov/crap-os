@@ -18,6 +18,8 @@ I wanted to learn more about and get some practice with Rust. As any sane person
 
 To install Rust compiler, needed targets, and dependencies:
 
+On Mac:
+
 ```
 brew install rust
 
@@ -41,6 +43,19 @@ build-std = ["core", "compiler_builtins"]
 
 [build]
 target = "SHARE/crap-os/crap_os/x86_64-crap_os.json"
+```
+
+On Windows:
+
+```
+Set-ExecutionPolicy Bypass -Scope Process -Force; [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.ServicePointManager]::SecurityProtocol -bor 3072; iex ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+
+choco install make
+
+rustup toolchain install nightly
+rustup default nightly
+rustup target add x86_64-unknown-none
+rustup component add rust-src
 ```
 
 To compile and link the kernel binary (will be at `target/release/kernel.bin`):

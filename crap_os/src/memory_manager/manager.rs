@@ -375,6 +375,22 @@ impl MemoryManager {
     pub fn free_page_count(&self) -> u64 {
         self.pmm.free_pages
     }
+
+    /// Frees ACPI `EfiACPIReclaimMemory` pages back to the PMM and removes
+    /// their direct-map mappings.
+    ///
+    /// Must only be called once every consumer of ACPI-table data (MADT/APIC
+    /// parsing, HPET table parsing, and the RTC's FADT century lookup) has
+    /// finished extracting what it needs, since this frees the physical memory
+    /// backing those tables.
+    ///
+    /// # Arguments
+    ///
+    /// * `memory_map` - The UEFI memory map with regions, types, and
+    ///   page counts.
+    pub fn reclaim_acpi_memory(&mut self, memory_map: &MemoryMapInfo) {
+        vmm::reclaim_acpi_memory(&mut self.pmm, memory_map);
+    }
 }
 
 // Implements unsafe Send for spinlock management

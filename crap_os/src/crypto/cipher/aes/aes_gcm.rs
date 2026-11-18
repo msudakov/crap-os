@@ -320,7 +320,7 @@ fn ctr_apply_keystream(
 ///
 /// Implements SP 800-38D paragraph 7.1 step 6:
 ///
-///   1. `H = AES_K(0^128)` — hash subkey.
+///   1. `H = AES_K(0^128)` - hash subkey.
 ///   2. GHASH over the ciphertext (no AAD in this implementation).
 ///   3. Final GHASH block: `len(A) || len(C)` as two 64-bit big-endian
 ///      integers. Since AAD is always empty, `len(A) = 0`.
@@ -502,7 +502,7 @@ pub fn decrypt(
     // Recompute tag over the raw ciphertext bytes (before decryption)
     let expected_tag = compute_tag(ct_bytes, &j0, &schedule);
 
-    // Constant-time tag comparison — must happen before decryption
+    // Constant-time tag comparison must happen before decryption
     if !constant_time_eq_16(received_tag, &expected_tag) {
         return Err(AesGcmError::AuthenticationFailure);
     }

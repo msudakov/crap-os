@@ -410,43 +410,46 @@ unsafe fn ioapic_write_redirect(irq: u8, value: u64) {
 /// Must be called before enabling the APIC, with interrupts disabled, to
 /// prevent any PIC interrupt from firing between PIC re-init and masking.
 pub unsafe fn disable_pic_8259() {
-    // ICW1: Begin initialization of both PICs
-    // 0x11 = ICW1_INIT (bit 4) | ICW1_ICW4 (bit 0): edge-triggered, cascade,
-    // expect ICW4 to follow. Sent to the command ports of both master and
-    // slave.
-    core::arch::asm!("out 0x20, al", in("al") 0x11u8);  // Master: start init
-    core::arch::asm!("out 0xA0, al", in("al") 0x11u8);  // Slave:  start init
+    unsafe {
+        // ICW1: Begin initialization of both PICs
+        // 0x11 = ICW1_INIT (bit 4) | ICW1_ICW4 (bit 0): edge-triggered,
+        // cascade, expect ICW4 to follow. Sent to the command ports of both
+        // master and slave.
+        core::arch::asm!("out 0x20, al", in("al") 0x11u8); // Master: start init
+        core::arch::asm!("out 0xA0, al", in("al") 0x11u8); // Slave:  start init
 
-    // ICW2: Set interrupt vector base for each PIC
-    // Maps master PIC IRQs 0–7  -> vectors 0x20–0x27 (harmless; we mask them).
-    // Maps slave PIC IRQs  8–15 -> vectors 0x28–0x2F (harmless; we mask them).
-    // These ranges are above the CPU exception vectors (0x00–0x1F) and do not
-    // conflict with our APIC assignments, so if a PIC interrupt fires before
-    // the mask is applied it will hit an unused IDT entry rather than an
-    // exception.
-    core::arch::asm!("out 0x21, al", in("al") 0x20u8);  // Master base: 0x20
-    core::arch::asm!("out 0xA1, al", in("al") 0x28u8);  // Slave  base: 0x28
+        // ICW2: Set interrupt vector base for each PIC
+        // Maps master PIC IRQs 0–7  -> vectors 0x20–0x27 (harmless; we mask
+        // them). Maps slave PIC IRQs  8–15 -> vectors 0x28–0x2F (harmless; we
+        // mask them). These ranges are above the CPU exception vectors
+        // (0x00–0x1F) and do not conflict with our APIC assignments, so if a
+        // PIC interrupt fires before the mask is applied it will hit an unused
+        // IDT entry rather than an exception.
+        core::arch::asm!("out 0x21, al", in("al") 0x20u8);  // Master base: 0x20
+        core::arch::asm!("out 0xA1, al", in("al") 0x28u8);  // Slave  base: 0x28
 
-    // ICW3: Configure cascade (master/slave connection)
-    // Master: bit mask indicating which IRQ line (IRQ 2) is connected to slave.
-    //   0x04 = 0b00000100: slave is on IRQ line 2.
-    // Slave:  its cascade identity (the IRQ line it is connected to on master).
-    //   0x02 = binary cascade identity 2.
-    core::arch::asm!("out 0x21, al", in("al") 0x04u8);  // Master: slave on IRQ2
-    core::arch::asm!("out 0xA1, al", in("al") 0x02u8);  // Slave: cascade ID=2
+        // ICW3: Configure cascade (master/slave connection)
+        // Master: bit mask indicating which IRQ line (IRQ 2) is connected to
+        //   slave. 0x04 = 0b00000100: slave is on IRQ line 2.
+        // Slave: its cascade identity (the IRQ line it is connected to on
+        //   master). 0x02 = binary cascade identity 2.
+        core::arch::asm!("out 0x21, al", in("al") 0x04u8);  // Master
+        core::arch::asm!("out 0xA1, al", in("al") 0x02u8);  // Slave
 
-    // ICW4: Set 8086/8088 operation mode
-    // 0x01 = 8086 mode (non-buffered, normal EOI, not special fully-nested).
-    // Required by modern x86 systems; 8085 mode (0x00) is for legacy hardware.
-    core::arch::asm!("out 0x21, al", in("al") 0x01u8);  // Master: 8086 mode
-    core::arch::asm!("out 0xA1, al", in("al") 0x01u8);  // Slave:  8086 mode
+        // ICW4: Set 8086/8088 operation mode
+        // 0x01 = 8086 mode (non-buffered, normal EOI, not special
+        // fully-nested). Required by modern x86 systems; 8085 mode (0x00) is
+        // for legacy hardware.
+        core::arch::asm!("out 0x21, al", in("al") 0x01u8);  // Master: 8086 mode
+        core::arch::asm!("out 0xA1, al", in("al") 0x01u8);  // Slave:  8086 mode
 
-    // OCW1: Mask all IRQ lines on both PICs
-    // Writing 0xFF to the data port masks all 8 IRQ lines of each PIC. After
-    // this, no 8259 interrupt will reach the CPU regardless of what hardware
-    // asserts an IRQ line.
-    core::arch::asm!("out 0x21, al", in("al") 0xFFu8);  // Master: mask all
-    core::arch::asm!("out 0xA1, al", in("al") 0xFFu8);  // Slave:  mask all
+        // OCW1: Mask all IRQ lines on both PICs
+        // Writing 0xFF to the data port masks all 8 IRQ lines of each PIC.
+        // After this, no 8259 interrupt will reach the CPU regardless of what
+        // hardware asserts an IRQ line.
+        core::arch::asm!("out 0x21, al", in("al") 0xFFu8);  // Master: mask all
+        core::arch::asm!("out 0xA1, al", in("al") 0xFFu8);  // Slave:  mask all
+    }
 }
 
 /// Performs the initial configuration of the Local APIC.

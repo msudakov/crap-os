@@ -11,7 +11,8 @@
 /// 
 /// # Arguments
 /// 
-/// * `task_id_u64` - Compressed `TaskId` value of the target task as a single u64.
+/// * `task_id_u64` - Compressed `TaskId` value of the target task as a single
+/// u64.
 pub fn task_killer(task_id_u64: u64) {
     crate::task_scheduler::scheduler::kill_task(task_id_u64);
 }
